@@ -1,6 +1,155 @@
 Release Notes
 =============
 
+2.1.21
+------
+
+* Fix ``iter_compatible_interpreters`` with ``path``. (#1110)
+  `PR #1110 <https://github.com/pantsbuild/pex/pull/1110>`_
+
+* Fix ``Requires-Python`` environment marker mapping. (#1105)
+  `PR #1105 <https://github.com/pantsbuild/pex/pull/1105>`_
+
+* Fix spurious ``InstalledDistribution`` env markers. (#1104)
+  `PR #1104 <https://github.com/pantsbuild/pex/pull/1104>`_
+
+* Deprecate ``-R``/``--resources-directory``. (#1103)
+  `PR #1103 <https://github.com/pantsbuild/pex/pull/1103>`_
+
+* Fix ResourceWarning for unclosed ``/dev/null``. (#1102)
+  `PR #1102 <https://github.com/pantsbuild/pex/pull/1102>`_
+
+* Fix runtime vendoring bytecode compilation races. (#1099)
+  `PR #1099 <https://github.com/pantsbuild/pex/pull/1099>`_
+
+2.1.20
+------
+
+This release improves interpreter discovery to prefer more recent patch versions, e.g. preferring
+Python 3.6.10 over 3.6.8.
+
+We recently regained access to the docsite, and https://pex.readthedocs.io/en/latest/ is now
+up-to-date.
+
+* Prefer more recent patch versions in interpreter discovery. (#1088)
+  `PR #1088 <https://github.com/pantsbuild/pex/pull/1088>`_
+
+* Fix ``--pex-python`` when it's the same as the current interpreter. (#1087)
+  `PR #1087 <https://github.com/pantsbuild/pex/pull/1087>`_
+
+* Fix `dir_hash` vs. bytecode compilation races. (#1080)
+  `PR #1080 <https://github.com/pantsbuild/pex/pull/1080>`_
+
+* Fix readthedocs doc generation. (#1081)
+  `PR #1081 <https://github.com/pantsbuild/pex/pull/1081>`_
+
+2.1.19
+------
+
+This release adds the ``--python-path`` option, which allows controlling the
+interpreter search paths when building a PEX.
+
+The release also removes ``--use-first-matching-interpreter``, which was a misfeature. If you want to use
+fewer interpreters when building a PEX, use more precise values for ``--interpreter-constraint`` and/or
+``--python-path``, or use ``--python`` or ``--platform``.
+
+* Add ``--python-path`` to change interpreter search paths when building a PEX. (#1077)
+  `PR #1077 <https://github.com/pantsbuild/pex/pull/1077>`_
+
+* Remove ``--use-first-matching-interpreter`` misfeature. (#1076)
+  `PR #1076 <https://github.com/pantsbuild/pex/pull/1076>`_
+
+* Encapsulate ``--inherit-path`` handling. (#1072)
+  `PR #1072 <https://github.com/pantsbuild/pex/pull/1072>`_
+
+2.1.18
+------
+
+This release brings official support for Python 3.9 and adds a new ``--tmpdir`` option to explicitly
+control the TMPDIR used by Pex and its subprocesses. The latter is useful when building PEXes in
+space-constrained environments in the face of large distributions.
+
+The release also fixes ``--cert`` and ``--client-cert`` so that they work with PEP-518 builds in
+addition to fixing bytecode compilation races in highly parallel environments.
+
+* Add a ``--tmpdir`` option to the Pex CLI. (#1068)
+  `PR #1068 <https://github.com/pantsbuild/pex/pull/1068>`_
+
+* Honor ``sys.executable`` unless macOS Framework. (#1065)
+  `PR #1065 <https://github.com/pantsbuild/pex/pull/1065>`_
+
+* Add Python 3.9 support. (#1064)
+  `PR #1064 <https://github.com/pantsbuild/pex/pull/1064>`_
+
+* Fix handling of ``--cert`` and ``--client-cert``. (#1063)
+  `PR #1063 <https://github.com/pantsbuild/pex/pull/1063>`_
+
+* Add atomic_directory exclusive mode. (#1062)
+  `PR #1062 <https://github.com/pantsbuild/pex/pull/1062>`_
+
+* Fix ``--cert`` for PEP-518 builds. (#1060)
+  `PR #1060 <https://github.com/pantsbuild/pex/pull/1060>`_
+
+2.1.17
+------
+
+This release fixes a bug in ``--resolve-local-platforms`` handling that made it unusable in 2.1.16
+(#1043) as well as fixing a long standing file handle leak (#1050) and a bug when running under
+macOS framework builds of Python (#1009).
+
+* Fix `--unzip` performance regression. (#1056)
+  `PR #1056 <https://github.com/pantsbuild/pex/pull/1056>`_
+
+* Fix resource leak in Pex self-isolation. (#1052)
+  `PR #1052 <https://github.com/pantsbuild/pex/pull/1052>`_
+
+* Fix use of `iter_compatible_interpreters`. (#1048)
+  `PR #1048 <https://github.com/pantsbuild/pex/pull/1048>`_
+
+* Do not rely on `sys.executable` being accurate. (#1049)
+  `PR #1049 <https://github.com/pantsbuild/pex/pull/1049>`_
+
+* slightly demystify the relationship between platforms and interpreters in the library API and CLI (#1047)
+  `PR #1047 <https://github.com/pantsbuild/pex/pull/1047>`_
+
+* Path filter for PythonInterpreter.iter_candidates. (#1046)
+  `PR #1046 <https://github.com/pantsbuild/pex/pull/1046>`_
+
+* Add type hints to `util.py` and `tracer.py` (#1044)
+  `PR #1044 <https://github.com/pantsbuild/pex/pull/1044>`_
+
+* Add type hints to variables.py and platforms.py (#1042)
+  `PR #1042 <https://github.com/pantsbuild/pex/pull/1042>`_
+
+* Add type hints to the remaining tests (#1040)
+  `PR #1040 <https://github.com/pantsbuild/pex/pull/1040>`_
+
+* Add type hints to most tests (#1036)
+  `PR #1036 <https://github.com/pantsbuild/pex/pull/1036>`_
+
+* Use MyPy via type comments (#1032)
+  `PR #1032 <https://github.com/pantsbuild/pex/pull/1032>`_
+
+2.1.16
+------
+
+This release fixes a bug in sys.path scrubbing / hermeticity (#1025)
+and a bug in the ``-D / --sources-directory`` and
+``-R / --resources-directory`` options whereby PEP-420 implicit
+(namespace) packages were not respected (#1021).
+
+* Improve UnsatisfiableInterpreterConstraintsError. (#1028)
+  `PR #1028 <https://github.com/pantsbuild/pants/pull/1028>`_
+
+* Scrub direct sys.path manipulations by .pth files. (#1026)
+  `PR #1026 <https://github.com/pantsbuild/pants/pull/1026>`_
+
+* PEX zips now contain directory entries. (#1022)
+  `PR #1022 <https://github.com/pantsbuild/pants/pull/1022>`_
+
+* Fix UnsatisfiableInterpreterConstraintsError. (#1024)
+  `PR #1024 <https://github.com/pantsbuild/pants/pull/1024>`_
+
 2.1.15
 ------
 

@@ -8,32 +8,39 @@ from __future__ import absolute_import
 
 import os
 from abc import ABCMeta
-from io import StringIO
 from sys import version_info as sys_version_info
+
+from pex.typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Optional, AnyStr, Text
+
 
 try:
     # Python 2.x
-    from ConfigParser import ConfigParser
+    from ConfigParser import ConfigParser as ConfigParser
 except ImportError:
     # Python 3.x
-    from configparser import ConfigParser
+    from configparser import ConfigParser as ConfigParser  # type: ignore[import, no-redef]
+
 
 AbstractClass = ABCMeta("AbstractClass", (object,), {})
 PY2 = sys_version_info[0] == 2
 PY3 = sys_version_info[0] == 3
 
-string = (str,) if PY3 else (str, unicode)
-unicode_string = (str,) if PY3 else (unicode,)
-bytes = (bytes,)
+string = (str,) if PY3 else (str, unicode)  # type: ignore[name-defined]
 
 if PY2:
-    from collections import Iterable, MutableSet
+    from collections import Iterable as Iterable
+    from collections import MutableSet as MutableSet
 else:
-    from collections.abc import Iterable, MutableSet
+    from collections.abc import Iterable as Iterable
+    from collections.abc import MutableSet as MutableSet
 
 if PY2:
 
     def to_bytes(st, encoding="utf-8"):
+        # type: (AnyStr, Text) -> bytes
         if isinstance(st, unicode):
             return st.encode(encoding)
         elif isinstance(st, bytes):
@@ -42,6 +49,7 @@ if PY2:
             raise ValueError("Cannot convert %s to bytes" % type(st))
 
     def to_unicode(st, encoding="utf-8"):
+        # type: (AnyStr, Text) -> Text
         if isinstance(st, unicode):
             return st
         elif isinstance(st, (str, bytes)):
@@ -53,6 +61,7 @@ if PY2:
 else:
 
     def to_bytes(st, encoding="utf-8"):
+        # type: (AnyStr, Text) -> bytes
         if isinstance(st, str):
             return st.encode(encoding)
         elif isinstance(st, bytes):
@@ -61,6 +70,7 @@ else:
             raise ValueError("Cannot convert %s to bytes." % type(st))
 
     def to_unicode(st, encoding="utf-8"):
+        # type: (AnyStr, Text) -> Text
         if isinstance(st, str):
             return st
         elif isinstance(st, bytes):
@@ -85,6 +95,7 @@ if PY3:
 
 
 else:
+    # This will result in `exec_function` being defined at runtime.
     eval(compile(_PY3_EXEC_FUNCTION, "<exec_function>", "exec"))
 
 if PY3:
@@ -100,32 +111,44 @@ if PY3:
 
 
 else:
-    from contextlib import nested
+    from contextlib import nested as nested
 
 
 if PY3:
     import urllib.parse as urlparse
-else:
-    import urlparse
 
+    from urllib.error import HTTPError as HTTPError
+    from urllib.request import build_opener as build_opener
+    from urllib.request import HTTPSHandler as HTTPSHandler
+    from urllib.request import ProxyHandler as ProxyHandler
+    from urllib.request import Request as Request
+else:
+    import urlparse as urlparse
+
+    from urllib2 import build_opener as build_opener
+    from urllib2 import HTTPError as HTTPError
+    from urllib2 import HTTPSHandler as HTTPSHandler
+    from urllib2 import ProxyHandler as ProxyHandler
+    from urllib2 import Request as Request
 
 if PY3:
-    from queue import Queue
+    from queue import Queue as Queue
 
     # The `os.sched_getaffinity` function appears to be supported on Linux but not OSX.
     if not hasattr(os, "sched_getaffinity"):
-        from os import cpu_count
+        from os import cpu_count as cpu_count
     else:
 
         def cpu_count():
+            # type: () -> Optional[int]
             # The set of CPUs accessible to the current process (pid 0).
             cpu_set = os.sched_getaffinity(0)
             return len(cpu_set)
 
 
 else:
-    from Queue import Queue
-    from multiprocessing import cpu_count
+    from Queue import Queue as Queue
+    from multiprocessing import cpu_count as cpu_count
 
 
 WINDOWS = os.name == "nt"

@@ -68,7 +68,7 @@ Or instead freeze your current virtualenv via requirements.txt and execute it an
 
 .. code-block:: bash
 
-    $ pex -r <(pip freeze) -o my_virtualenv.pex
+    $ pex $(pip freeze) -o my_virtualenv.pex
     $ deactivate
     $ ./my_virtualenv.pex
 
@@ -150,6 +150,12 @@ running ``tox --listenvs-all``, then invoke like this:
 .. code-block::
 
     $ tox -e format-run
+
+To run MyPy:
+
+.. code-block::
+
+    $ tox -e typecheck
 
 All of our tox test environments allow passthrough arguments, which can be helpful to run
 specific tests:

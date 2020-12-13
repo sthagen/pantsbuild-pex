@@ -13,6 +13,7 @@ from pex import resolver
 from pex.common import open_zip, temporary_dir
 from pex.compatibility import PY2, nested, to_bytes
 from pex.environment import PEXEnvironment
+from pex.inherit_path import InheritPath
 from pex.interpreter import PythonInterpreter
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
@@ -28,10 +29,15 @@ from pex.testing import (
     temporary_filename,
 )
 from pex.third_party.pkg_resources import Distribution
+from pex.typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 
 @contextmanager
 def yield_pex_builder(zip_safe=True, interpreter=None):
+    # type: (bool, Optional[PythonInterpreter]) -> Iterator[PEXBuilder]
     with nested(temporary_dir(), make_bdist("p1", zip_safe=zip_safe, interpreter=interpreter)) as (
         td,
         p1,
@@ -42,6 +48,7 @@ def yield_pex_builder(zip_safe=True, interpreter=None):
 
 
 def test_force_local():
+    # type: () -> None
     with nested(yield_pex_builder(), temporary_dir(), temporary_filename()) as (
         pb,
         pex_root,
@@ -51,10 +58,17 @@ def test_force_local():
         pb.build(pex_file)
 
         code_cache = PEXEnvironment._force_local(pex_file, pb.info)
+
         assert os.path.exists(pb.info.zip_unsafe_cache)
-        assert len(os.listdir(pb.info.zip_unsafe_cache)) == 1
-        assert [os.path.basename(code_cache)] == os.listdir(pb.info.zip_unsafe_cache)
-        assert set(os.listdir(code_cache)) == set([PexInfo.PATH, "__main__.py", "__main__.pyc"])
+        listing = set(os.listdir(pb.info.zip_unsafe_cache))
+
+        # The code_cache should be a write-locked directory.
+        assert len(listing) == 2
+        listing.remove(os.path.basename(code_cache))
+        lockfile = listing.pop()
+        assert os.path.isfile(os.path.join(pb.info.zip_unsafe_cache, lockfile))
+
+        assert set(os.listdir(code_cache)) == {PexInfo.PATH, "__main__.py", "__main__.pyc"}
 
         # idempotence
         assert PEXEnvironment._force_local(pex_file, pb.info) == code_cache
@@ -64,6 +78,7 @@ def assert_force_local_implicit_ns_packages_issues_598(
     interpreter=None, requirements=(), create_ns_packages=True
 ):
     def create_foo_bar_setup(name, **extra_args):
+        # type: (str, **Any) -> str
         setup_args = dict(name=name, version="0.0.1", packages=["foo", "foo.bar"])
         if create_ns_packages:
             setup_args.update(namespace_packages=["foo", "foo.bar"])
@@ -82,6 +97,7 @@ def assert_force_local_implicit_ns_packages_issues_598(
         )
 
     def with_foo_bar_ns_packages(content):
+        # type: (Dict[str, str]) -> Dict[str, str]
         ns_packages = (
             {
                 os.path.join(
@@ -143,16 +159,19 @@ def assert_force_local_implicit_ns_packages_issues_598(
     )
 
     def add_requirements(builder, cache):
+        # type: (PEXBuilder, str) -> None
         for resolved_dist in resolve(requirements, cache=cache, interpreter=builder.interpreter):
             builder.add_requirement(resolved_dist.requirement)
             builder.add_distribution(resolved_dist.distribution)
 
     def add_wheel(builder, content):
+        # type: (PEXBuilder, Dict[str, str]) -> None
         with temporary_content(content) as project:
             dist = WheelBuilder(project, interpreter=builder.interpreter).bdist()
             builder.add_dist_location(dist)
 
     def add_sources(builder, content):
+        # type: (PEXBuilder, Dict[str, str]) -> None
         with temporary_content(content) as project:
             for path in content.keys():
                 builder.add_source(os.path.join(project, path), path)
@@ -181,6 +200,7 @@ def assert_force_local_implicit_ns_packages_issues_598(
 
 @pytest.fixture
 def setuptools_requirement():
+    # type: () -> str
     # We use a very old version of setuptools to prove the point the user version is what is used
     # here and not the vendored version (when possible). A newer setuptools is needed though to work
     # with python 3.
@@ -188,28 +208,33 @@ def setuptools_requirement():
 
 
 def test_issues_598_explicit_any_interpreter(setuptools_requirement):
+    # type: (str) -> None
     assert_force_local_implicit_ns_packages_issues_598(
         requirements=[setuptools_requirement], create_ns_packages=True
     )
 
 
 def test_issues_598_explicit_missing_requirement():
+    # type: () -> None
     assert_force_local_implicit_ns_packages_issues_598(create_ns_packages=True)
 
 
 @pytest.fixture
 def python_35_interpreter():
+    # type: () -> PythonInterpreter
     # Python 3.5 supports implicit namespace packages.
     return PythonInterpreter.from_binary(ensure_python_interpreter(PY35))
 
 
 def test_issues_598_implicit(python_35_interpreter):
+    # type: (PythonInterpreter) -> None
     assert_force_local_implicit_ns_packages_issues_598(
         interpreter=python_35_interpreter, create_ns_packages=False
     )
 
 
 def test_issues_598_implicit_explicit_mixed(python_35_interpreter, setuptools_requirement):
+    # type: (PythonInterpreter, str) -> None
     assert_force_local_implicit_ns_packages_issues_598(
         interpreter=python_35_interpreter,
         requirements=[setuptools_requirement],
@@ -218,10 +243,12 @@ def test_issues_598_implicit_explicit_mixed(python_35_interpreter, setuptools_re
 
 
 def normalize(path):
+    # type: (str) -> str
     return os.path.normpath(os.path.realpath(path)).lower()
 
 
 def assert_dist_cache(zip_safe):
+    # type: (bool) -> None
     with nested(yield_pex_builder(zip_safe=zip_safe), temporary_dir(), temporary_filename()) as (
         pb,
         pex_root,
@@ -244,6 +271,7 @@ def assert_dist_cache(zip_safe):
 
 
 def test_write_zipped_internal_cache():
+    # type: () -> None
     assert_dist_cache(zip_safe=False)
 
     # Zip_safe pexes still always should have dists written to install cache, only the pex code (
@@ -252,6 +280,7 @@ def test_write_zipped_internal_cache():
 
 
 def test_load_internal_cache_unzipped():
+    # type: () -> None
     # Unzipped pexes should use distributions from the pex internal cache.
     with nested(yield_pex_builder(zip_safe=True), temporary_dir()) as (pb, pex_root):
         pb.info.pex_root = pex_root
@@ -275,7 +304,10 @@ _KNOWN_BAD_APPLE_INTERPRETER = (
     reason="Test requires known bad Apple interpreter {}".format(_KNOWN_BAD_APPLE_INTERPRETER),
 )
 def test_osx_platform_intel_issue_523():
+    # type: () -> None
+
     def bad_interpreter():
+        # type: () -> PythonInterpreter
         return PythonInterpreter.from_binary(_KNOWN_BAD_APPLE_INTERPRETER)
 
     with temporary_dir() as cache:
@@ -296,6 +328,7 @@ def test_osx_platform_intel_issue_523():
             pex = PEX(pex_file, interpreter=bad_interpreter())
 
             def run(args, **env):
+                # type: (Iterable[str], **str) -> Tuple[int, str, str]
                 pex_env = os.environ.copy()
                 pex_env["PEX_VERBOSE"] = "1"
                 pex_env.update(**env)
@@ -307,7 +340,7 @@ def test_osx_platform_intel_issue_523():
                     stderr=subprocess.PIPE,
                 )
                 stdout, stderr = process.communicate()
-                return process.returncode, stdout, stderr
+                return process.returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
 
             returncode, _, stderr = run(["-c", "import psutil"])
             assert 0 == returncode, "Process failed with exit code {} and stderr:\n{}".format(
@@ -320,13 +353,13 @@ def test_osx_platform_intel_issue_523():
                 "STDOUT:\n"
                 "{}\n"
                 "STDERR:\n"
-                "{}".format(stdout, stdout, stderr)
+                "{}".format(stdout, stderr)
             )
 
             returncode, stdout, stderr = run(
                 ["-c", "import pkg_resources; print(pkg_resources.get_supported_platform())"],
                 # Let the bad interpreter site-packages setuptools leak in.
-                PEX_INHERIT_PATH="1",
+                PEX_INHERIT_PATH=InheritPath.for_value(True).value,
             )
             assert 0 == returncode, "Process failed with exit code {} and stderr:\n{}".format(
                 returncode, stderr
@@ -335,10 +368,11 @@ def test_osx_platform_intel_issue_523():
             # Verify this worked along side the previously problematic pkg_resources-reported platform.
             release, _, _ = platform.mac_ver()
             major_minor = ".".join(release.split(".")[:2])
-            assert to_bytes("macosx-{}-intel".format(major_minor)) == stdout.strip()
+            assert "macosx-{}-intel".format(major_minor) == stdout.strip()
 
 
 def test_activate_extras_issue_615():
+    # type: () -> None
     with yield_pex_builder() as pb:
         for resolved_dist in resolver.resolve(["pex[requests]==1.6.3"], interpreter=pb.interpreter):
             pb.add_requirement(resolved_dist.requirement)
@@ -360,6 +394,7 @@ def test_activate_extras_issue_615():
 
 
 def assert_namespace_packages_warning(distribution, version, expected_warning):
+    # type: (str, str, bool) -> None
     requirement = "{}=={}".format(distribution, version)
     pb = PEXBuilder()
     for resolved_dist in resolver.resolve([requirement]):
@@ -382,42 +417,64 @@ def assert_namespace_packages_warning(distribution, version, expected_warning):
 
 
 def test_present_non_empty_namespace_packages_metadata_does_warn():
+    # type: () -> None
     assert_namespace_packages_warning("twitter.common.lang", "0.3.11", expected_warning=True)
 
 
 def test_present_but_empty_namespace_packages_metadata_does_not_warn():
+    # type: () -> None
     assert_namespace_packages_warning("pycodestyle", "2.5.0", expected_warning=False)
 
 
+def create_dist(
+    location,  # type: str
+    version="1.0.0",  # type: Optional[str]
+):
+    # type: (...) -> Distribution
+    # N.B.: version must be set simply so that __hash__ / __eq__ work correctly in the
+    # `pex.dist_metadata` module.
+    return Distribution(location=location, version=version)
+
+
 @pytest.mark.parametrize(
-    ("wheel_filename", "wheel_is_linux"),
+    ("wheel_distribution", "wheel_is_linux"),
     [
         pytest.param(
-            "llvmlite-0.29.0-cp35-cp35m-linux_x86_64.whl", True, id="without_build_tag_linux"
+            create_dist("llvmlite-0.29.0-cp35-cp35m-linux_x86_64.whl", "0.29.0"),
+            True,
+            id="without_build_tag_linux",
         ),
         pytest.param(
-            "llvmlite-0.29.0-1-cp35-cp35m-linux_x86_64.whl", True, id="with_build_tag_linux"
+            create_dist("llvmlite-0.29.0-1-cp35-cp35m-linux_x86_64.whl", "0.29.0"),
+            True,
+            id="with_build_tag_linux",
         ),
         pytest.param(
-            "llvmlite-0.29.0-cp35-cp35m-macosx_10.9_x86_64.whl", False, id="without_build_tag_osx"
+            create_dist("llvmlite-0.29.0-cp35-cp35m-macosx_10.9_x86_64.whl", "0.29.0"),
+            False,
+            id="without_build_tag_osx",
         ),
         pytest.param(
-            "llvmlite-0.29.0-1-cp35-cp35m-macosx_10.9_x86_64.whl", False, id="with_build_tag_osx"
+            create_dist("llvmlite-0.29.0-1-cp35-cp35m-macosx_10.9_x86_64.whl", "0.29.0"),
+            False,
+            id="with_build_tag_osx",
         ),
     ],
 )
 def test_can_add_handles_optional_build_tag_in_wheel(
-    python_35_interpreter, wheel_filename, wheel_is_linux
+    python_35_interpreter, wheel_distribution, wheel_is_linux
 ):
+    # type: (PythonInterpreter, str, bool) -> None
     pex_environment = PEXEnvironment(
         pex="", pex_info=PexInfo.default(python_35_interpreter), interpreter=python_35_interpreter
     )
     native_wheel = IS_LINUX and wheel_is_linux
-    assert pex_environment.can_add(Distribution(wheel_filename)) is native_wheel
+    assert pex_environment.can_add(wheel_distribution) is native_wheel
 
 
 def test_can_add_handles_invalid_wheel_filename(python_35_interpreter):
+    # type: (PythonInterpreter) -> None
     pex_environment = PEXEnvironment(
         pex="", pex_info=PexInfo.default(python_35_interpreter), interpreter=python_35_interpreter
     )
-    assert pex_environment.can_add(Distribution("pep427-invalid.whl")) is False
+    assert pex_environment.can_add(create_dist("pep427-invalid.whl")) is False

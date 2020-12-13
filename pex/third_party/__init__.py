@@ -11,6 +11,7 @@ import shutil
 import sys
 import zipfile
 from collections import OrderedDict, namedtuple
+from contextlib import closing
 
 
 # NB: All pex imports are performed lazily to play well with the un-imports performed by both the
@@ -362,9 +363,16 @@ def isolated():
 
         module = "pex"
 
+        # TODO(John Sirois): Unify with `pex.util.DistributionHelper.access_zipped_assets`.
         def recursive_copy(srcdir, dstdir):
             os.mkdir(dstdir)
             for entry_name in resource_listdir(module, srcdir):
+                if not entry_name:
+                    # The `resource_listdir` function returns a '' entry name for the directory
+                    # entry itself if it is either present on the filesystem or present as an
+                    # explicit zip entry. Since we only care about files and subdirectories at this
+                    # point, skip these entries.
+                    continue
                 # NB: Resource path components are always separated by /, on all systems.
                 src_entry = "{}/{}".format(srcdir, entry_name) if srcdir else entry_name
                 dst_entry = os.path.join(dstdir, entry_name)
@@ -372,7 +380,8 @@ def isolated():
                     recursive_copy(src_entry, dst_entry)
                 elif not entry_name.endswith(".pyc"):
                     with open(dst_entry, "wb") as fp:
-                        shutil.copyfileobj(resource_stream(module, src_entry), fp)
+                        with closing(resource_stream(module, src_entry)) as resource:
+                            shutil.copyfileobj(resource, fp)
 
         pex_path = os.path.join(vendor.VendorSpec.ROOT, "pex")
         with _tracer().timed("Hashing pex"):
@@ -380,7 +389,7 @@ def isolated():
         isolated_dir = os.path.join(ENV.PEX_ROOT, "isolated", dir_hash)
 
         with _tracer().timed("Isolating pex"):
-            with atomic_directory(isolated_dir) as chroot:
+            with atomic_directory(isolated_dir, exclusive=True) as chroot:
                 if chroot:
                     with _tracer().timed("Extracting pex to {}".format(isolated_dir)):
                         recursive_copy("", os.path.join(chroot, "pex"))
@@ -406,44 +415,44 @@ def import_prefix():
 def install(root=None, expose=None):
     """Installs the default :class:`VendorImporter` for PEX vendored code.
 
-  Any distributions listed in ``expose`` will also be exposed for direct import; ie:
-  ``install(expose=['setuptools'])`` would make both ``setuptools`` and ``wheel`` available for
-  import via ``from  pex.third_party import setuptools, wheel``, but only ``setuptools`` could be
-  directly imported via ``import setuptools``.
+    Any distributions listed in ``expose`` will also be exposed for direct import; ie:
+    ``install(expose=['setuptools'])`` would make both ``setuptools`` and ``wheel`` available for
+    import via ``from  pex.third_party import setuptools, wheel``, but only ``setuptools`` could be
+    directly imported via ``import setuptools``.
 
-  NB: Even when exposed, vendored code is not the same as the same un-vendored code and will
-  properly fail type-tests against un-vendored types. For example, in an interpreter that has
-  ``setuptools`` installed in its site-packages:
+    NB: Even when exposed, vendored code is not the same as the same un-vendored code and will
+    properly fail type-tests against un-vendored types. For example, in an interpreter that has
+    ``setuptools`` installed in its site-packages:
 
-  >>> from pkg_resources import Requirement
-  >>> orig_req = Requirement.parse('wheel==0.31.1')
-  >>> from pex import third_party
-  >>> third_party.install(expose=['setuptools'])
-  >>> import sys
-  >>> sys.modules.pop('pkg_resources')
-  <module 'pkg_resources' from '/home/jsirois/dev/pantsbuild/jsirois-pex/.tox/py27-repl/lib/python2.7/site-packages/pkg_resources/__init__.pyc'>  # noqa
-  >>> from pkg_resources import Requirement
-  >>> new_req = Requirement.parse('wheel==0.31.1')
-  >>> new_req == orig_req
-  False
-  >>> new_req == Requirement.parse('wheel==0.31.1')
-  True
-  >>> type(orig_req)
-  <class 'pkg_resources.Requirement'>
-  >>> type(new_req)
-  <class 'pex.vendor._vendored.setuptools.pkg_resources.Requirement'>
-  >>> from pex.third_party.pkg_resources import Requirement as PrefixedRequirement
-  >>> new_req == PrefixedRequirement.parse('wheel==0.31.1')
-  True
-  >>> sys.modules.pop('pkg_resources')
-  <module 'pex.vendor._vendored.setuptools.pkg_resources' from 'pex/vendor/_vendored/setuptools/pkg_resources/__init__.pyc'>  # noqa
-  >>> sys.modules.pop('pex.third_party.pkg_resources')
-  <module 'pex.vendor._vendored.setuptools.pkg_resources' from 'pex/vendor/_vendored/setuptools/pkg_resources/__init__.pyc'>  # noqa
-  >>>
+    >>> from pkg_resources import Requirement
+    >>> orig_req = Requirement.parse('wheel==0.31.1')
+    >>> from pex import third_party
+    >>> third_party.install(expose=['setuptools'])
+    >>> import sys
+    >>> sys.modules.pop('pkg_resources')
+    <module 'pkg_resources' from '/home/jsirois/dev/pantsbuild/jsirois-pex/.tox/py27-repl/lib/python2.7/site-packages/pkg_resources/__init__.pyc'>  # noqa
+    >>> from pkg_resources import Requirement
+    >>> new_req = Requirement.parse('wheel==0.31.1')
+    >>> new_req == orig_req
+    False
+    >>> new_req == Requirement.parse('wheel==0.31.1')
+    True
+    >>> type(orig_req)
+    <class 'pkg_resources.Requirement'>
+    >>> type(new_req)
+    <class 'pex.vendor._vendored.setuptools.pkg_resources.Requirement'>
+    >>> from pex.third_party.pkg_resources import Requirement as PrefixedRequirement
+    >>> new_req == PrefixedRequirement.parse('wheel==0.31.1')
+    True
+    >>> sys.modules.pop('pkg_resources')
+    <module 'pex.vendor._vendored.setuptools.pkg_resources' from 'pex/vendor/_vendored/setuptools/pkg_resources/__init__.pyc'>  # noqa
+    >>> sys.modules.pop('pex.third_party.pkg_resources')
+    <module 'pex.vendor._vendored.setuptools.pkg_resources' from 'pex/vendor/_vendored/setuptools/pkg_resources/__init__.pyc'>  # noqa
+    >>>
 
-  :param expose: A list of vendored distribution names to expose directly on the ``sys.path``.
-  :type expose: list of str
-  :raise: :class:`ValueError` if any distributions to expose cannot be found.
+    :param expose: A list of vendored distribution names to expose directly on the ``sys.path``.
+    :type expose: list of str
+    :raise: :class:`ValueError` if any distributions to expose cannot be found.
     """
     VendorImporter.install_vendored(prefix=import_prefix(), root=root, expose=expose)
 

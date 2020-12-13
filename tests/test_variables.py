@@ -10,10 +10,11 @@ from pex.common import temporary_dir
 from pex.pex_warnings import PEXWarning
 from pex.testing import environment_as
 from pex.util import named_temporary_file
-from pex.variables import Variables
+from pex.variables import NoValueError, Variables
 
 
 def test_process_pydoc():
+    # type: () -> None
     def thing():
         # no pydoc
         pass
@@ -32,6 +33,7 @@ def test_process_pydoc():
 
 
 def test_iter_help():
+    # type: () -> None
     for variable_name, variable_type, variable_text in Variables.iter_help():
         assert variable_name.startswith("PEX_")
         assert "\n" not in variable_type
@@ -39,15 +41,15 @@ def test_iter_help():
 
 
 def test_pex_bool_variables():
-    Variables(environ={})._get_bool("NOT_HERE", default=False) is False
-    Variables(environ={})._get_bool("NOT_HERE", default=True) is True
+    # type: () -> None
+    assert Variables(environ={})._maybe_get_bool("NOT_HERE") is None
+    with pytest.raises(NoValueError):
+        Variables(environ={})._get_bool("NOT_HERE")
 
     for value in ("0", "faLsE", "false"):
-        for default in (True, False):
-            Variables(environ={"HERE": value})._get_bool("HERE", default=default) is False
+        assert Variables(environ={"HERE": value})._get_bool("HERE") is False
     for value in ("1", "TrUe", "true"):
-        for default in (True, False):
-            Variables(environ={"HERE": value})._get_bool("HERE", default=default) is True
+        assert Variables(environ={"HERE": value})._get_bool("HERE") is True
     with pytest.raises(SystemExit):
         Variables(environ={"HERE": "garbage"})._get_bool("HERE")
 
@@ -57,25 +59,26 @@ def test_pex_bool_variables():
 
 
 def test_pex_string_variables():
-    Variables(environ={})._get_string("NOT_HERE") is None
-    Variables(environ={})._get_string("NOT_HERE", default="lolol") == "lolol"
-    Variables(environ={"HERE": "stuff"})._get_string("HERE") == "stuff"
-    Variables(environ={"HERE": "stuff"})._get_string("HERE", default="lolol") == "stuff"
+    # type: () -> None
+    assert Variables(environ={})._maybe_get_string("NOT_HERE") is None
+    with pytest.raises(NoValueError):
+        Variables(environ={})._get_string("NOT_HERE")
+    assert Variables(environ={"HERE": "stuff"})._get_string("HERE") == "stuff"
 
 
 def test_pex_get_int():
-    assert Variables()._get_int("HELLO") is None
-    assert Variables()._get_int("HELLO", default=42) == 42
-    assert Variables(environ={"HELLO": 23})._get_int("HELLO") == 23
-    assert Variables(environ={"HELLO": 23})._get_int("HELLO", default=42) == 23
-
+    # type: () -> None
+    with pytest.raises(NoValueError):
+        Variables()._get_int("HELLO")
+    assert Variables(environ={"HELLO": "23"})._get_int("HELLO") == 23
     with pytest.raises(SystemExit):
         assert Variables(environ={"HELLO": "welp"})._get_int("HELLO")
 
 
 def assert_pex_vars_hermetic():
+    # type: () -> None
     v = Variables()
-    assert os.environ == v.copy()
+    assert os.environ.copy() == v.copy()
 
     existing = os.environ.get("TEST")
     expected = (existing or "") + "different"
@@ -86,15 +89,18 @@ def assert_pex_vars_hermetic():
 
 
 def test_pex_vars_hermetic_no_pexrc():
+    # type: () -> None
     assert_pex_vars_hermetic()
 
 
 def test_pex_vars_hermetic():
+    # type: () -> None
     with environment_as(PEX_IGNORE_RCFILES="True"):
         assert_pex_vars_hermetic()
 
 
 def test_pex_get_kv():
+    # type: () -> None
     v = Variables(environ={})
     assert v._get_kv("HELLO") is None
     assert v._get_kv("=42") is None
@@ -103,6 +109,7 @@ def test_pex_get_kv():
 
 
 def test_pex_from_rc():
+    # type: () -> None
     with named_temporary_file(mode="w") as pexrc:
         pexrc.write("HELLO=42")
         pexrc.flush()
@@ -111,14 +118,16 @@ def test_pex_from_rc():
 
 
 def test_pexrc_precedence():
+    # type: () -> None
     with named_temporary_file(mode="w") as pexrc:
         pexrc.write("HELLO=FORTYTWO")
         pexrc.flush()
-        v = Variables(rc=pexrc.name, environ={"HELLO": 42})
+        v = Variables(rc=pexrc.name, environ={"HELLO": "42"})
         assert v._get_int("HELLO") == 42
 
 
 def test_rc_ignore():
+    # type: () -> None
     with named_temporary_file(mode="w") as pexrc:
         pexrc.write("HELLO=FORTYTWO")
         pexrc.flush()
@@ -127,23 +136,24 @@ def test_rc_ignore():
 
 
 def test_pex_vars_defaults_stripped():
+    # type: () -> None
     v = Variables(environ={})
-    stripped = v.strip_defaults()
 
     # bool
     assert v.PEX_ALWAYS_CACHE is not None
-    assert stripped.PEX_ALWAYS_CACHE is None
+    assert Variables.PEX_ALWAYS_CACHE.strip_default(v) is None
 
     # string
     assert v.PEX_PATH is not None
-    assert stripped.PEX_PATH is None
+    assert Variables.PEX_PATH.strip_default(v) is None
 
     # int
     assert v.PEX_VERBOSE is not None
-    assert stripped.PEX_VERBOSE is None
+    assert Variables.PEX_VERBOSE.strip_default(v) is None
 
 
 def test_pex_root_unwriteable():
+    # type: () -> None
     with temporary_dir() as td:
         pex_root = os.path.realpath(os.path.join(td, "pex_root"))
         os.mkdir(pex_root, 0o444)
@@ -157,6 +167,7 @@ def test_pex_root_unwriteable():
         message = log[0].message
         assert isinstance(message, PEXWarning)
         assert pex_root in str(message)
+        assert env.PEX_ROOT is not None
         assert env.PEX_ROOT in str(message)
 
         assert (

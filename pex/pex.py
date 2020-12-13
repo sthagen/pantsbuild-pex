@@ -4,35 +4,36 @@
 from __future__ import absolute_import, print_function
 
 import os
+import re
 import sys
+import warnings
 from distutils import sysconfig
 from site import USER_SITE
+from types import ModuleType
 
 import pex.third_party.pkg_resources as pkg_resources
 from pex import third_party
 from pex.bootstrap import Bootstrap
 from pex.common import die
+from pex.compatibility import PY3
 from pex.environment import PEXEnvironment
 from pex.executor import Executor
 from pex.finders import get_entry_point_from_console_script, get_script_from_distributions
+from pex.inherit_path import InheritPath
 from pex.interpreter import PythonInterpreter
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
 from pex.third_party.pkg_resources import EntryPoint, WorkingSet, find_distributions
 from pex.tracer import TRACER
+from pex.typing import TYPE_CHECKING
 from pex.util import iter_pth_paths, named_temporary_file
-from pex.variables import ENV
+from pex.variables import ENV, Variables
 
+if TYPE_CHECKING:
+    from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Tuple, TypeVar
 
-class DevNull(object):
-    def __init__(self):
-        pass
-
-    def write(self, *args, **kw):
-        pass
-
-    def flush(self):
-        pass
+    _K = TypeVar("_K")
+    _V = TypeVar("_V")
 
 
 class PEX(object):  # noqa: T000
@@ -64,25 +65,37 @@ class PEX(object):  # noqa: T000
                 if key.startswith("PEX_"):
                     del env[key]
 
-    def __init__(self, pex=sys.argv[0], interpreter=None, env=ENV, verify_entry_point=False):
+    def __init__(
+        self,
+        pex=sys.argv[0],  # type: str
+        interpreter=None,  # type: Optional[PythonInterpreter]
+        env=ENV,  # type: Variables
+        verify_entry_point=False,  # type: bool
+    ):
+        # type: (...) -> None
         self._pex = pex
         self._interpreter = interpreter or PythonInterpreter.get()
         self._pex_info = PexInfo.from_pex(self._pex)
         self._pex_info_overrides = PexInfo.from_env(env=env)
         self._vars = env
-        self._envs = []
-        self._working_set = None
+        self._envs = []  # type: List[PEXEnvironment]
+        self._working_set = None  # type: Optional[WorkingSet]
         if verify_entry_point:
             self._do_entry_point_verification()
+
+    def pex_info(self):
+        # type: () -> PexInfo
+        pex_info = self._pex_info.copy()
+        pex_info.update(self._pex_info_overrides)
+        pex_info.merge_pex_path(self._vars.PEX_PATH)
+        return pex_info
 
     def _activate(self):
         if not self._working_set:
             working_set = WorkingSet([])
 
             # set up the local .pex environment
-            pex_info = self._pex_info.copy()
-            pex_info.update(self._pex_info_overrides)
-            pex_info.merge_pex_path(self._vars.PEX_PATH)
+            pex_info = self.pex_info()
             self._envs.append(PEXEnvironment(self._pex, pex_info, interpreter=self._interpreter))
             # N.B. by this point, `pex_info.pex_path` will contain a single pex path
             # merged from pex_path in `PEX-INFO` and `PEX_PATH` set in the environment.
@@ -111,16 +124,21 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def _extras_paths(cls):
+        # type: () -> Iterator[str]
         standard_lib = sysconfig.get_python_lib(standard_lib=True)
 
         try:
-            makefile = sysconfig.parse_makefile(sysconfig.get_makefile_filename())
+            makefile = sysconfig.parse_makefile(  # type: ignore[attr-defined]
+                sysconfig.get_makefile_filename()
+            )
         except (AttributeError, IOError):
             # This is not available by default in PyPy's distutils.sysconfig or it simply is
             # no longer available on the system (IOError ENOENT)
             makefile = {}
 
-        extras_paths = filter(None, makefile.get("EXTRASPATH", "").split(":"))
+        extras_paths = filter(
+            None, makefile.get("EXTRASPATH", "").split(":")
+        )  # type: Iterable[str]
         for path in extras_paths:
             yield os.path.join(standard_lib, path)
 
@@ -144,6 +162,7 @@ class PEX(object):  # noqa: T000
 
     @staticmethod
     def _get_site_packages():
+        # type: () -> Set[str]
         try:
             from site import getsitepackages
 
@@ -153,6 +172,7 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def site_libs(cls):
+        # type: () -> Set[str]
         site_libs = cls._get_site_packages()
         site_libs.update(
             [
@@ -168,11 +188,13 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def _tainted_path(cls, path, site_libs):
+        # type: (str, Iterable[str]) -> bool
         paths = frozenset([path, os.path.realpath(path)])
         return any(path.startswith(site_lib) for site_lib in site_libs for path in paths)
 
     @classmethod
     def minimum_sys_modules(cls, site_libs, modules=None):
+        # type: (Iterable[str], Optional[Mapping[str, ModuleType]]) -> Mapping[str, ModuleType]
         """Given a set of site-packages paths, return a "clean" sys.modules.
 
         When importing site, modules within sys.modules have their __path__'s populated with
@@ -194,24 +216,25 @@ class PEX(object):  # noqa: T000
                 TRACER.log("Dropping %s" % (module_name,), V=3)
                 continue
 
+            module_path = getattr(module, "__path__", None)
             # Untainted non-packages (builtin modules) need no further special handling and can stay.
-            if not hasattr(module, "__path__"):
+            if module_path is None:
                 new_modules[module_name] = module
                 continue
 
             # Unexpected objects, e.g. PEP 420 namespace packages, should just be dropped.
-            if not isinstance(module.__path__, list):
+            if not isinstance(module_path, list):
                 TRACER.log("Dropping %s" % (module_name,), V=3)
                 continue
 
             # Drop tainted package paths.
-            for k in reversed(range(len(module.__path__))):
-                if cls._tainted_path(module.__path__[k], site_libs):
-                    TRACER.log("Scrubbing %s.__path__: %s" % (module_name, module.__path__[k]), V=3)
-                    module.__path__.pop(k)
+            for k in reversed(range(len(module_path))):
+                if cls._tainted_path(module_path[k], site_libs):
+                    TRACER.log("Scrubbing %s.__path__: %s" % (module_name, module_path[k]), V=3)
+                    module_path.pop(k)
 
             # The package still contains untainted path elements, so it can stay.
-            if module.__path__:
+            if module_path:
                 new_modules[module_name] = module
 
         return new_modules
@@ -221,6 +244,7 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def stash_pythonpath(cls):
+        # type: () -> Optional[str]
         pythonpath = os.environ.pop(cls._PYTHONPATH, None)
         if pythonpath is not None:
             os.environ[cls._STASHED_PYTHONPATH] = pythonpath
@@ -228,6 +252,7 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def unstash_pythonpath(cls):
+        # type: () -> Optional[str]
         pythonpath = os.environ.pop(cls._STASHED_PYTHONPATH, None)
         if pythonpath is not None:
             os.environ[cls._PYTHONPATH] = pythonpath
@@ -235,13 +260,17 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def minimum_sys_path(cls, site_libs, inherit_path):
+        # type: (Iterable[str], InheritPath.Value) -> Tuple[List[str], Mapping[str, Any]]
         scrub_paths = OrderedSet()
         site_distributions = OrderedSet()
         user_site_distributions = OrderedSet()
 
         def all_distribution_paths(path):
+            # type: (Optional[str]) -> Iterable[str]
+            if path is None:
+                return ()
             locations = set(dist.location for dist in find_distributions(path))
-            return set([path]) | locations | set(os.path.realpath(path) for path in locations)
+            return {path} | locations | set(os.path.realpath(path) for path in locations)
 
         for path_element in sys.path:
             if cls._tainted_path(path_element, site_libs):
@@ -252,8 +281,9 @@ class PEX(object):  # noqa: T000
 
         user_site_distributions.update(all_distribution_paths(USER_SITE))
 
-        if inherit_path == "false":
-            scrub_paths = site_distributions | user_site_distributions
+        if inherit_path == InheritPath.FALSE:
+            scrub_paths = OrderedSet(site_distributions)
+            scrub_paths.update(user_site_distributions)
             for path in user_site_distributions:
                 TRACER.log("Scrubbing from user site: %s" % path)
             for path in site_distributions:
@@ -274,13 +304,13 @@ class PEX(object):  # noqa: T000
                     V=2,
                 )
 
-            if inherit_path == "false":
+            if inherit_path == InheritPath.FALSE:
                 for path in user_pythonpath:
                     TRACER.log("Scrubbing user PYTHONPATH element: %s" % path)
-            elif inherit_path == "prefer":
+            elif inherit_path == InheritPath.PREFER:
                 TRACER.log("Prepending user PYTHONPATH: %s" % os.pathsep.join(user_pythonpath))
                 scrubbed_sys_path = user_pythonpath + scrubbed_sys_path
-            elif inherit_path == "fallback":
+            elif inherit_path == InheritPath.FALLBACK:
                 TRACER.log("Appending user PYTHONPATH: %s" % os.pathsep.join(user_pythonpath))
                 scrubbed_sys_path = scrubbed_sys_path + user_pythonpath
 
@@ -301,12 +331,13 @@ class PEX(object):  # noqa: T000
 
     @classmethod
     def minimum_sys(cls, inherit_path):
+        # type: (InheritPath.Value) -> Tuple[List[str], Mapping[str, Any], Mapping[str, ModuleType]]
         """Return the minimum sys necessary to run this interpreter, a la python -S.
 
         :returns: (sys.path, sys.path_importer_cache, sys.modules) tuple of a
           bare python installation.
         """
-        site_libs = set(cls.site_libs())
+        site_libs = cls.site_libs()
         for site_lib in site_libs:
             TRACER.log("Found site-library: %s" % site_lib)
         for extras_path in cls._extras_paths():
@@ -331,13 +362,16 @@ class PEX(object):  # noqa: T000
     # Thar be dragons -- when this function exits, the interpreter is potentially in a wonky state
     # since the patches here (minimum_sys_modules for example) actually mutate global state.
     def patch_sys(self, inherit_path):
+        # type: (InheritPath.Value) -> None
         """Patch sys with all site scrubbed."""
 
         def patch_dict(old_value, new_value):
+            # type: (Dict[_K, _V], Mapping[_K, _V]) -> None
             old_value.clear()
             old_value.update(new_value)
 
         def patch_all(path, path_importer_cache, modules):
+            # type: (List[str], Mapping[str, Any], Mapping[str, ModuleType]) -> None
             sys.path[:] = path
             patch_dict(sys.path_importer_cache, path_importer_cache)
             patch_dict(sys.modules, modules)
@@ -404,35 +438,55 @@ class PEX(object):  # noqa: T000
                 profiler.print_stats(sort=pex_profile_sort)
 
     def path(self):
+        # type: () -> str
         """Return the path this PEX was built at."""
         return self._pex
 
     def execute(self):
+        # type: () -> None
         """Execute the PEX.
 
         This function makes assumptions that it is the last function called by the interpreter.
         """
         teardown_verbosity = self._vars.PEX_TEARDOWN_VERBOSE
+
+        # N.B.: This is set in `__main__.py` of the executed PEX by `PEXBuilder` when we've been
+        # executed from within a PEX zip file in `--unzip` mode.  We replace `sys.argv[0]` to avoid
+        # confusion and allow the user code we hand off to to provide useful messages and fully
+        # valid re-execs that always re-directed through the PEX file.
+        sys.argv[0] = os.environ.pop("__PEX_EXE__", sys.argv[0])
+
         try:
             pex_inherit_path = self._vars.PEX_INHERIT_PATH
-            if pex_inherit_path == "false":
+            if pex_inherit_path == InheritPath.FALSE:
                 pex_inherit_path = self._pex_info.inherit_path
             self.patch_sys(pex_inherit_path)
             working_set = self._activate()
             self.patch_pkg_resources(working_set)
-            exit_code = self._wrap_coverage(self._wrap_profiling, self._execute)
+            if self._vars.PEX_TOOLS:
+                try:
+                    from pex.tools import main as tools
+                except ImportError as e:
+                    die(
+                        "This PEX was not built with tools (Re-build the PEX file with "
+                        "`pex --include-tools ...`): {}".format(e)
+                    )
+
+                exit_code = tools.main(pex=self, pex_prog_path=sys.argv[0])
+            else:
+                exit_code = self._wrap_coverage(self._wrap_profiling, self._execute)
             if exit_code:
                 sys.exit(exit_code)
         except Exception:
-            # Allow the current sys.excepthook to handle this app exception before we tear things down in
-            # finally, then reraise so that the exit status is reflected correctly.
+            # Allow the current sys.excepthook to handle this app exception before we tear things
+            # down in finally, then reraise so that the exit status is reflected correctly.
             sys.excepthook(*sys.exc_info())
             raise
         except SystemExit as se:
             # Print a SystemExit error message, avoiding a traceback in python3.
             # This must happen here, as sys.stderr is about to be torn down
-            if not isinstance(se.code, int) and se.code is not None:
-                print(se.code, file=sys.stderr)
+            if not isinstance(se.code, int) and se.code is not None:  # type: ignore[unreachable]
+                print(se.code, file=sys.stderr)  # type: ignore[unreachable]
             raise
         finally:
             # squash all exceptions on interpreter teardown -- the primary type here are
@@ -440,17 +494,22 @@ class PEX(object):  # noqa: T000
             #   http://stackoverflow.com/questions/2572172/referencing-other-modules-in-atexit
             if not teardown_verbosity:
                 sys.stderr.flush()
-                sys.stderr = DevNull()
+                sys.stderr = open(os.devnull, "w")
+                if PY3:
+                    # Python 3 warns about unclosed resources. In this case we intentionally do not
+                    # close `/dev/null` since we want all stderr to flow there until the latest
+                    # stages of Python interpreter shutdown when the Python runtime will `del` the
+                    # open file and thus finally close the underlying file descriptor. As such,
+                    # suppress the warning.
+                    warnings.filterwarnings(
+                        action="ignore",
+                        message=r"unclosed file {}".format(re.escape(str(sys.stderr))),
+                        category=ResourceWarning,
+                    )
                 sys.excepthook = lambda *a, **kw: None
 
     def _execute(self):
         force_interpreter = self._vars.PEX_INTERPRETER
-
-        # N.B.: This is set in `__main__.py` of the executed PEX by `PEXBuilder` when we've been
-        # executed from within a PEX zip file in `--unzip` mode.  We replace `sys.argv[0]` to avoid
-        # confusion and allow the user code we hand off to to provide useful messages and fully valid
-        # re-execs that always re-directed through the PEX file.
-        sys.argv[0] = os.environ.pop("__PEX_EXE__", sys.argv[0])
 
         self._clean_environment(strip_pex_env=self._pex_info.strip_pex_env)
 

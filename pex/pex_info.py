@@ -10,9 +10,16 @@ from pex import pex_warnings
 from pex.common import can_write_dir, open_zip, safe_mkdtemp
 from pex.compatibility import PY2
 from pex.compatibility import string as compatibility_string
+from pex.inherit_path import InheritPath
 from pex.orderedset import OrderedSet
-from pex.variables import ENV
+from pex.typing import TYPE_CHECKING, cast
+from pex.variables import ENV, Variables
 from pex.version import __version__ as pex_version
+
+if TYPE_CHECKING:
+    from pex.interpreter import PythonInterpreter
+
+    from typing import Any, Dict, Mapping, Optional, Text, Union
 
 
 # TODO(wickman) Split this into a PexInfoBuilder/PexInfo to ensure immutability.
@@ -51,7 +58,14 @@ class PexInfo(object):
 
     @classmethod
     def make_build_properties(cls, interpreter=None):
-        from .interpreter import PythonInterpreter
+        # This lazy import is currently needed for performance reasons. At PEX runtime PexInfo is
+        # read in the bootstrap to see if the PEX should run in `--unzip` mode. If so, it must
+        # re-exec itself to run against its unzipped contents. Since `make_build_properties` is only
+        # used at PEX buildtime and the transitive imports of PythonInterpreter are large and slow,
+        # we avoid this import cost for runtime-only use.
+        #
+        # See: https://github.com/pantsbuild/pex/issues/1054
+        from pex.interpreter import PythonInterpreter
 
         pi = interpreter or PythonInterpreter.get()
         plat = pi.platform
@@ -65,6 +79,7 @@ class PexInfo(object):
 
     @classmethod
     def default(cls, interpreter=None):
+        # type: (Optional[PythonInterpreter]) -> PexInfo
         pex_info = {
             "requirements": [],
             "distributions": {},
@@ -74,6 +89,7 @@ class PexInfo(object):
 
     @classmethod
     def from_pex(cls, pex):
+        # type: (str) -> PexInfo
         if os.path.isfile(pex):
             with open_zip(pex) as zf:
                 pex_info = zf.read(cls.PATH)
@@ -84,26 +100,29 @@ class PexInfo(object):
 
     @classmethod
     def from_json(cls, content):
+        # type: (Union[bytes, Text]) -> PexInfo
         if isinstance(content, bytes):
             content = content.decode("utf-8")
         return cls(info=json.loads(content))
 
     @classmethod
     def from_env(cls, env=ENV):
-        supplied_env = env.strip_defaults()
-        zip_safe = (
-            None if supplied_env.PEX_FORCE_LOCAL is None else not supplied_env.PEX_FORCE_LOCAL
-        )
-        unzip = None if supplied_env.PEX_UNZIP is None else supplied_env.PEX_UNZIP
+        # type: (Variables) -> PexInfo
+        pex_force_local = Variables.PEX_FORCE_LOCAL.strip_default(env)
+        zip_safe = None if pex_force_local is None else not pex_force_local
+
+        pex_inherit_path = Variables.PEX_INHERIT_PATH.strip_default(env)
+        inherit_path = None if pex_inherit_path is None else pex_inherit_path.value
+
         pex_info = {
-            "pex_root": supplied_env.PEX_ROOT,
-            "entry_point": supplied_env.PEX_MODULE,
-            "script": supplied_env.PEX_SCRIPT,
+            "pex_root": Variables.PEX_ROOT.strip_default(env),
+            "entry_point": env.PEX_MODULE,
+            "script": env.PEX_SCRIPT,
             "zip_safe": zip_safe,
-            "unzip": unzip,
-            "inherit_path": supplied_env.PEX_INHERIT_PATH,
-            "ignore_errors": supplied_env.PEX_IGNORE_ERRORS,
-            "always_write_cache": supplied_env.PEX_ALWAYS_CACHE,
+            "unzip": Variables.PEX_UNZIP.strip_default(env),
+            "inherit_path": inherit_path,
+            "ignore_errors": Variables.PEX_IGNORE_ERRORS.strip_default(env),
+            "always_write_cache": Variables.PEX_ALWAYS_CACHE.strip_default(env),
         }
         # Filter out empty entries not explicitly set in the environment.
         return cls(info=dict((k, v) for (k, v) in pex_info.items() if v is not None))
@@ -123,6 +142,7 @@ class PexInfo(object):
         raise ValueError("Malformed PEX requirement: %r" % (requirement_tuple,))
 
     def __init__(self, info=None):
+        # type: (Optional[Mapping[str, Any]]) -> None
         """Construct a new PexInfo.
 
         This should not be used directly.
@@ -132,9 +152,7 @@ class PexInfo(object):
             raise ValueError(
                 "PexInfo can only be seeded with a dict, got: " "%s of type %s" % (info, type(info))
             )
-        self._pex_info = info or {}
-        if "inherit_path" in self._pex_info:
-            self.inherit_path = self._pex_info["inherit_path"]
+        self._pex_info = dict(info) if info else {}  # type Dict[str, Any]
         self._distributions = self._pex_info.get("distributions", {})
         # cast as set because pex info from json must store interpreter_constraints as a list
         self._interpreter_constraints = set(self._pex_info.get("interpreter_constraints", set()))
@@ -209,36 +227,37 @@ class PexInfo(object):
 
     @property
     def pex_path(self):
+        # type: () -> Optional[str]
         """A colon separated list of other pex files to merge into the runtime environment.
 
         This pex info property is used to persist the PEX_PATH environment variable into the pex
         info metadata for reuse within a built pex.
         """
-        return self._pex_info.get("pex_path")
+        return cast("Optional[str]", self._pex_info.get("pex_path"))
 
     @pex_path.setter
     def pex_path(self, value):
+        # type: (str) -> None
         self._pex_info["pex_path"] = value
 
     @property
     def inherit_path(self):
+        # type: () -> InheritPath.Value
         """Whether or not this PEX should be allowed to inherit system dependencies.
 
         By default, PEX environments are scrubbed of all system distributions prior to execution.
         This means that PEX files cannot rely upon preexisting system libraries.
 
-        By default inherit_path is false.  This may be overridden at runtime by the $PEX_INHERIT_PATH
+        By default inherit_path is false. This may be overridden at runtime by the $PEX_INHERIT_PATH
         environment variable.
         """
-        return self._pex_info.get("inherit_path", "false")
+        inherit_path = self._pex_info.get("inherit_path")
+        return InheritPath.for_value(inherit_path) if inherit_path else InheritPath.FALSE
 
     @inherit_path.setter
     def inherit_path(self, value):
-        if value is False:
-            value = "false"
-        elif value is True:
-            value = "prefer"
-        self._pex_info["inherit_path"] = value
+        # type: (InheritPath.Value) -> None
+        self._pex_info["inherit_path"] = value.value
 
     @property
     def interpreter_constraints(self):
@@ -349,6 +368,7 @@ class PexInfo(object):
         return os.path.join(self.pex_root, "code")
 
     def update(self, other):
+        # type: (PexInfo) -> None
         if not isinstance(other, PexInfo):
             raise TypeError("Cannot merge a %r with PexInfo" % type(other))
         self._pex_info.update(other._pex_info)
@@ -356,15 +376,25 @@ class PexInfo(object):
         self._interpreter_constraints.update(other.interpreter_constraints)
         self._requirements.update(other.requirements)
 
-    def dump(self, **kwargs):
-        pex_info_copy = self._pex_info.copy()
-        pex_info_copy["requirements"] = sorted(self._requirements)
-        pex_info_copy["interpreter_constraints"] = sorted(self._interpreter_constraints)
-        pex_info_copy["distributions"] = self._distributions.copy()
-        return json.dumps(pex_info_copy, **kwargs)
+    def as_json_dict(self):
+        # type: () -> Dict[str, Any]
+        data = self._pex_info.copy()
+        data["inherit_path"] = self.inherit_path.value
+        data["requirements"] = list(self._requirements)
+        data["interpreter_constraints"] = list(self._interpreter_constraints)
+        data["distributions"] = self._distributions.copy()
+        return data
+
+    def dump(self):
+        # type: (...) -> str
+        data = self.as_json_dict()
+        data["requirements"].sort()
+        data["interpreter_constraints"].sort()
+        return json.dumps(data, sort_keys=True)
 
     def copy(self):
-        return self.from_json(self.dump())
+        # type: () -> PexInfo
+        return PexInfo(self._pex_info)
 
     @staticmethod
     def _merge_split(*paths):

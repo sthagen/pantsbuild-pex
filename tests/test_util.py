@@ -6,53 +6,20 @@ import subprocess
 from hashlib import sha1
 from textwrap import dedent
 
-from pex.common import safe_mkdir, temporary_dir
+from pex.common import safe_mkdir, safe_open, temporary_dir, touch
 from pex.compatibility import nested, to_bytes
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
+from pex.typing import TYPE_CHECKING, cast
 from pex.util import CacheHelper, DistributionHelper, iter_pth_paths, named_temporary_file
 
 try:
     from unittest import mock
 except ImportError:
-    import mock
+    import mock  # type: ignore[no-redef]
 
-
-def test_hash():
-    empty_hash = sha1().hexdigest()
-
-    with named_temporary_file() as fp:
-        fp.flush()
-        assert empty_hash == CacheHelper.hash(fp.name)
-
-    with named_temporary_file() as fp:
-        string = b"asdf" * 1024 * sha1().block_size + b"extra padding"
-        fp.write(string)
-        fp.flush()
-        assert sha1(string).hexdigest() == CacheHelper.hash(fp.name)
-
-    with named_temporary_file() as fp:
-        empty_hash = sha1()
-        fp.write(b"asdf")
-        fp.flush()
-        hash_output = CacheHelper.hash(fp.name, digest=empty_hash)
-        assert hash_output == empty_hash.hexdigest()
-
-
-CONTENT = {
-    "__main__.py": 200,
-    ".deps/morfgorf": 10000,
-    "twitter/__init__.py": 0,
-    "twitter/common/python/foo.py": 4000,
-    "twitter/common/python/bar.py": 8000,
-    "twitter/common/python/bar.pyc": 6000,
-}
-
-
-try:
-    import __builtin__ as python_builtins
-except ImportError:
-    import builtins as python_builtins
+if TYPE_CHECKING:
+    from typing import Any, Dict, List
 
 
 @mock.patch("pex.util.safe_mkdtemp", autospec=True, spec_set=True)
@@ -61,13 +28,13 @@ except ImportError:
 @mock.patch("pex.util.resource_isdir", autospec=True, spec_set=True)
 @mock.patch("pex.util.resource_string", autospec=True, spec_set=True)
 def test_access_zipped_assets(
-    mock_resource_string,
-    mock_resource_isdir,
-    mock_resource_listdir,
-    mock_safe_mkdir,
-    mock_safe_mkdtemp,
+    mock_resource_string,  # type: Any
+    mock_resource_isdir,  # type: Any
+    mock_resource_listdir,  # type: Any
+    mock_safe_mkdir,  # type: Any
+    mock_safe_mkdtemp,  # type: Any
 ):
-
+    # type: (...) -> None
     mock_open = mock.mock_open()
     mock_safe_mkdtemp.side_effect = iter(["tmpJIMMEH", "faketmpDir"])
     mock_resource_listdir.side_effect = iter([["./__init__.py", "./directory/"], ["file.py"]])
@@ -85,7 +52,70 @@ def test_access_zipped_assets(
         assert mock_safe_mkdir.mock_calls == [mock.call(os.path.join("tmpJIMMEH", "directory"))]
 
 
+def test_hash():
+    # type: () -> None
+    empty_hash_digest = sha1().hexdigest()
+
+    with named_temporary_file() as fp:
+        fp.flush()
+        assert empty_hash_digest == CacheHelper.hash(fp.name)
+
+    with named_temporary_file() as fp:
+        string = b"asdf" * 1024 * sha1().block_size + b"extra padding"
+        fp.write(string)
+        fp.flush()
+        assert sha1(string).hexdigest() == CacheHelper.hash(fp.name)
+
+    with named_temporary_file() as fp:
+        empty_hash = sha1()
+        fp.write(b"asdf")
+        fp.flush()
+        hash_output = CacheHelper.hash(fp.name, digest=empty_hash)
+        assert hash_output == empty_hash.hexdigest()
+
+
+def test_dir_hash():
+    # type: () -> None
+    with temporary_dir() as tmp_dir:
+        safe_mkdir(os.path.join(tmp_dir, "a", "b"))
+        with safe_open(os.path.join(tmp_dir, "c", "d", "e.py"), "w") as fp:
+            fp.write("contents1")
+        with safe_open(os.path.join(tmp_dir, "f.py"), "w") as fp:
+            fp.write("contents2")
+        hash1 = CacheHelper.dir_hash(tmp_dir)
+
+        os.rename(os.path.join(tmp_dir, "c"), os.path.join(tmp_dir, "c-renamed"))
+        assert hash1 != CacheHelper.dir_hash(tmp_dir)
+
+        os.rename(os.path.join(tmp_dir, "c-renamed"), os.path.join(tmp_dir, "c"))
+        assert hash1 == CacheHelper.dir_hash(tmp_dir)
+
+        touch(os.path.join(tmp_dir, "c", "d", "e.pyc"))
+        assert hash1 == CacheHelper.dir_hash(tmp_dir)
+        touch(os.path.join(tmp_dir, "c", "d", "e.pyc.123456789"))
+        assert hash1 == CacheHelper.dir_hash(tmp_dir)
+
+        pycache_dir = os.path.join(tmp_dir, "__pycache__")
+        safe_mkdir(pycache_dir)
+        touch(os.path.join(pycache_dir, "f.pyc"))
+        assert hash1 == CacheHelper.dir_hash(tmp_dir)
+        touch(os.path.join(pycache_dir, "f.pyc.123456789"))
+        assert hash1 == CacheHelper.dir_hash(tmp_dir)
+
+        touch(os.path.join(pycache_dir, "f.py"))
+        assert hash1 == CacheHelper.dir_hash(
+            tmp_dir
+        ), "All content under __pycache__ directories should be ignored."
+
+
+try:
+    import __builtin__ as python_builtins  # type: ignore[import]
+except ImportError:
+    import builtins as python_builtins  # type: ignore[no-redef]
+
+
 def assert_access_zipped_assets(distribution_helper_import):
+    # type: (str) -> bytes
     test_executable = dedent(
         """
         import os
@@ -121,21 +151,23 @@ def assert_access_zipped_assets(distribution_helper_import):
         stdout, stderr = process.communicate()
         assert process.returncode == 0
         assert b"accessed\n" == stdout
-        return stderr
+        return cast(bytes, stderr)
 
 
 def test_access_zipped_assets_integration():
+    # type: () -> None
     stderr = assert_access_zipped_assets("from pex.util import DistributionHelper")
     assert b"" == stderr.strip()
 
 
 def test_access_zipped_assets_integration_deprecated():
+    # type: () -> None
     stderr = assert_access_zipped_assets("from _pex.util import DistributionHelper")
     assert b"`import _pex.util`" in stderr
 
 
 def test_named_temporary_file():
-    name = ""
+    # type: () -> None
     with named_temporary_file() as fp:
         name = fp.name
         fp.write(b"hi")
@@ -149,6 +181,7 @@ def test_named_temporary_file():
 
 @mock.patch("os.path.exists", autospec=True, spec_set=True)
 def test_iter_pth_paths(mock_exists):
+    # type: (Any) -> None
     # Ensure path checking always returns True for dummy paths.
     mock_exists.return_value = True
 
@@ -171,7 +204,7 @@ def test_iter_pth_paths(mock_exists):
             "import nosuchmodule\nfoo": [],
             "import nosuchmodule\n": [],
             "import bad)syntax\n": [],
-        }
+        }  # type: Dict[str, List[str]]
 
         for i, pth_content in enumerate(PTH_TEST_MAPPING):
             pth_tmp_path = os.path.abspath(os.path.join(tmpdir, "test%s.pth" % i))

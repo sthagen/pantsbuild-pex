@@ -6,7 +6,9 @@ from __future__ import absolute_import, print_function
 import atexit
 import contextlib
 import errno
+import fcntl
 import os
+import re
 import shutil
 import stat
 import sys
@@ -14,10 +16,15 @@ import tempfile
 import threading
 import time
 import zipfile
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from contextlib import contextmanager
 from datetime import datetime
 from uuid import uuid4
+
+from pex.typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, DefaultDict, Iterable, Iterator, NoReturn, Optional, Set
 
 # We use the start of MS-DOS time, which is what zipfiles use (see section 4.4.6 of
 # https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
@@ -26,13 +33,37 @@ DETERMINISTIC_DATETIME = datetime(
 )
 
 
+def filter_pyc_dirs(dirs):
+    # type: (Iterable[str]) -> Iterator[str]
+    """Return an iterator over the input `dirs` filtering out Python bytecode cache directories."""
+    for d in dirs:
+        if d != "__pycache__":
+            yield d
+
+
+def filter_pyc_files(files):
+    # type: (Iterable[str]) -> Iterator[str]
+    """Return an iterator over the input `files` filtering out any Python bytecode files."""
+    for f in files:
+        # For Python 2.7, `.pyc` files are compiled as siblings to `.py` files (there is no
+        # __pycache__ dir). We rely on the fact that the temporary files created by CPython
+        # have object id (integer) suffixes to avoid picking up either finished `.pyc` files
+        # or files where Python bytecode compilation is in-flight; i.e.:
+        # `.pyc.0123456789`-style files.
+        if not re.search(r"\.pyc(?:\.[0-9]+)?$", f):
+            yield f
+
+
 def die(msg, exit_code=1):
+    # type: (str, int) -> NoReturn
     print(msg, file=sys.stderr)
     sys.exit(exit_code)
 
 
 def safe_copy(source, dest, overwrite=False):
+    # type: (str, str, bool) -> None
     def do_copy():
+        # type: () -> None
         temp_dest = dest + uuid4().hex
         shutil.copy(source, temp_dest)
         os.rename(temp_dest, dest)
@@ -72,23 +103,26 @@ def safe_copy(source, dest, overwrite=False):
 # See http://stackoverflow.com/questions/2572172/referencing-other-modules-in-atexit
 class MktempTeardownRegistry(object):
     def __init__(self):
-        self._registry = defaultdict(set)
-        self._getpid = os.getpid
+        # type: () -> None
+        self._registry = defaultdict(set)  # type: DefaultDict[int, Set[str]]
         self._lock = threading.RLock()
+        self._getpid = os.getpid
         self._exists = os.path.exists
-        self._getenv = os.getenv
         self._rmtree = shutil.rmtree
         atexit.register(self.teardown)
 
     def __del__(self):
+        # type: () -> None
         self.teardown()
 
     def register(self, path):
+        # type: (str) -> str
         with self._lock:
             self._registry[self._getpid()].add(path)
         return path
 
     def teardown(self):
+        # type: () -> None
         for td in self._registry.pop(self._getpid(), []):
             if self._exists(td):
                 self._rmtree(td)
@@ -100,14 +134,17 @@ _MKDTEMP_SINGLETON = MktempTeardownRegistry()
 class PermPreservingZipFile(zipfile.ZipFile, object):
     """A ZipFile that works around https://bugs.python.org/issue15795."""
 
-    @classmethod
-    def zip_info_from_file(cls, filename, arcname=None, date_time=None):
-        """Construct a ZipInfo for a file on the filesystem.
+    class ZipEntry(namedtuple("ZipEntry", ["info", "data"])):
+        pass
 
-        Usually this is provided directly as a method of ZipInfo, but it is not implemented in Python
-        2.7 so we re-implement it here. The main divergance we make from the original is adding a
-        parameter for the datetime (a time.struct_time), which allows us to use a deterministic
-        timestamp. See https://github.com/python/cpython/blob/master/Lib/zipfile.py#L495.
+    @classmethod
+    def zip_entry_from_file(cls, filename, arcname=None, date_time=None):
+        """Construct a ZipEntry for a file on the filesystem.
+
+        Usually a similar `zip_info_from_file` method is provided by `ZipInfo`, but it is not
+        implemented in Python 2.7 so we re-implement it here to construct the `info` for `ZipEntry`
+        adding the possibility to control the `ZipInfo` date_time separately from the underlying
+        file mtime. See https://github.com/python/cpython/blob/master/Lib/zipfile.py#L495.
         """
         st = os.stat(filename)
         isdir = stat.S_ISDIR(st.st_mode)
@@ -125,9 +162,14 @@ class PermPreservingZipFile(zipfile.ZipFile, object):
         if isdir:
             zinfo.file_size = 0
             zinfo.external_attr |= 0x10  # MS-DOS directory flag
+            zinfo.compress_type = zipfile.ZIP_STORED
+            data = b""
         else:
             zinfo.file_size = st.st_size
-        return zinfo
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            with open(filename, "rb") as fp:
+                data = fp.read()
+        return cls.ZipEntry(info=zinfo, data=data)
 
     def _extract_member(self, member, targetpath, pwd):
         result = super(PermPreservingZipFile, self)._extract_member(member, targetpath, pwd)
@@ -155,6 +197,7 @@ def open_zip(path, *args, **kwargs):
 
 @contextlib.contextmanager
 def temporary_dir(cleanup=True):
+    # type: (bool) -> Iterator[str]
     td = tempfile.mkdtemp()
     try:
         yield td
@@ -164,6 +207,7 @@ def temporary_dir(cleanup=True):
 
 
 def safe_mkdtemp(**kw):
+    # type: (**Any) -> str
     """Create a temporary directory that is cleaned up on process exit.
 
     Takes the same parameters as tempfile.mkdtemp.
@@ -173,11 +217,13 @@ def safe_mkdtemp(**kw):
 
 
 def register_rmtree(directory):
+    # type: (str) -> str
     """Register an existing directory to be cleaned up at process exit."""
     return _MKDTEMP_SINGLETON.register(directory)
 
 
 def safe_mkdir(directory, clean=False):
+    # type: (str, bool) -> None
     """Safely create a directory.
 
     Ensures a directory is present.  If it's not there, it is created.  If it is, it's a no-op. If
@@ -198,11 +244,14 @@ def safe_open(filename, *args, **kwargs):
     ``safe_open`` ensures that the directory components leading up the specified file have been
     created first.
     """
-    safe_mkdir(os.path.dirname(filename))
+    parent_dir = os.path.dirname(filename)
+    if parent_dir:
+        safe_mkdir(parent_dir)
     return open(filename, *args, **kwargs)  # noqa: T802
 
 
 def safe_delete(filename):
+    # type: (str) -> None
     """Delete a file safely.
 
     If it's not present, no-op.
@@ -215,6 +264,7 @@ def safe_delete(filename):
 
 
 def safe_rmtree(directory):
+    # type: (str) -> None
     """Delete a directory if it's present.
 
     If it's not present, no-op.
@@ -224,6 +274,7 @@ def safe_rmtree(directory):
 
 
 def safe_sleep(seconds):
+    # type: (int) -> None
     """Ensure that the thread sleeps at a minimum the requested seconds.
 
     Until Python 3.5, there was no guarantee that time.sleep() would actually sleep the requested
@@ -291,12 +342,16 @@ class AtomicDirectory(object):
 
 
 @contextmanager
-def atomic_directory(target_dir, source=None):
+def atomic_directory(target_dir, exclusive, source=None):
+    # type: (str, bool, Optional[str]) -> Iterator[Optional[str]]
     """A context manager that yields a new empty work directory path it will move to `target_dir`.
 
-    :param str target_dir: The target directory to atomically update.
-    :param str source: An optional source offset into the work directory to use for the atomic update
-                       of the target directory. By default the whole work directory is used.
+    :param target_dir: The target directory to atomically update.
+    :param exclusive: If `True`, its guaranteed that only one process will be yielded a non `None`
+                      workdir; otherwise two or more processes might be yielded unique non-`None`
+                      workdirs with the last process to finish "winning".
+    :param source: An optional source offset into the work directory to use for the atomic update
+                   of the target directory. By default the whole work directory is used.
 
     If the `target_dir` already exists the enclosed block will be yielded `None` to signal there is
     no work to do.
@@ -305,21 +360,61 @@ def atomic_directory(target_dir, source=None):
 
     The new work directory will be cleaned up regardless of whether or not the enclosed block
     succeeds.
+
+    If the contents of the resulting directory will be subsequently mutated it's probably correct to
+    pass `exclusive=True` to ensure mutations that race the creation process are not lost.
     """
     atomic_dir = AtomicDirectory(target_dir=target_dir)
     if atomic_dir.is_finalized:
+        # Our work is already done for us so exit early.
         yield None
         return
 
-    safe_mkdir(atomic_dir.work_dir)
+    lock_fd = None  # type: Optional[int]
+
+    def unlock():
+        # type: () -> None
+        if lock_fd is None:
+            return
+        try:
+            fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    if exclusive:
+        head, tail = os.path.split(atomic_dir.target_dir)
+        if head:
+            safe_mkdir(head)
+        # N.B.: We don't actually write anything to the lock file but the fcntl file locking
+        # operations only work on files opened for at least write.
+        lock_fd = os.open(
+            os.path.join(head, ".{}.atomic_directory.lck".format(tail or "here")),
+            os.O_CREAT | os.O_WRONLY,
+        )
+        # N.B.: Since lockf operates on an open file descriptor and these are guaranteed to be
+        # closed by the operating system when the owning process exits, this lock is immune to
+        # staleness.
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX)  # A blocking write lock.
+        if atomic_dir.is_finalized:
+            # We lost the double-checked locking race and our work was done for us by the race
+            # winner so exit early.
+            try:
+                yield None
+            finally:
+                unlock()
+            return
+
     try:
+        safe_mkdir(atomic_dir.work_dir)
         yield atomic_dir.work_dir
         atomic_dir.finalize(source=source)
     finally:
+        unlock()
         atomic_dir.cleanup()
 
 
 def chmod_plus_x(path):
+    # type: (str) -> None
     """Equivalent of unix `chmod a+x path`"""
     path_mode = os.stat(path).st_mode
     path_mode &= int("777", 8)
@@ -333,6 +428,7 @@ def chmod_plus_x(path):
 
 
 def chmod_plus_w(path):
+    # type: (str) -> None
     """Equivalent of unix `chmod +w path`"""
     path_mode = os.stat(path).st_mode
     path_mode &= int("777", 8)
@@ -340,7 +436,18 @@ def chmod_plus_w(path):
     os.chmod(path, path_mode)
 
 
+def is_exe(path):
+    # type: (str) -> bool
+    """Determines if the given path is a file executable by the current user.
+
+    :param path: The path to check.
+    :return: `True if the given path is an file executable by the current user.
+    """
+    return os.path.isfile(path) and os.access(path, os.R_OK | os.X_OK)
+
+
 def can_write_dir(path):
+    # type: (str) -> bool
     """Determines if the directory at path can be written to by the current process.
 
     If the directory doesn't exist, determines if it can be created and thus written to.
@@ -348,9 +455,8 @@ def can_write_dir(path):
     N.B.: This is a best-effort check only that uses permission heuristics and does not actually test
     that the directory can be written to with and writes.
 
-    :param str path: The directory path to test.
-    :return: `True` if the given path is a directory that can be written to by the current process.
-    :rtype boo:
+    :param path: The directory path to test.
+    :return:`True` if the given path is a directory that can be written to by the current process.
     """
     while not os.access(path, os.F_OK):
         parent_path = os.path.dirname(path)
@@ -361,25 +467,11 @@ def can_write_dir(path):
     return os.path.isdir(path) and os.access(path, os.R_OK | os.W_OK | os.X_OK)
 
 
-def touch(file, times=None):
-    """Equivalent of unix `touch path`.
-
-    :file The file to touch.
-    :times Either a tuple of (atime, mtime) or else a single time to use for both.  If not
-    specified both atime and mtime are updated to the current time.
-    """
-    if times:
-        if len(times) > 2:
-            raise ValueError(
-                "times must either be a tuple of (atime, mtime) or else a single time value "
-                "to use for both."
-            )
-
-        if len(times) == 1:
-            times = (times, times)
-
+def touch(file):
+    # type: (str) -> None
+    """Equivalent of unix `touch path`."""
     with safe_open(file, "a"):
-        os.utime(file, times)
+        os.utime(file, None)
 
 
 class Chroot(object):
@@ -525,15 +617,34 @@ class Chroot(object):
 
     def zip(self, filename, mode="w", deterministic_timestamp=False):
         with open_zip(filename, mode) as zf:
-            for f in sorted(self.files()):
-                full_path = os.path.join(self.chroot, f)
-                zinfo = zf.zip_info_from_file(
+
+            def write_entry(path):
+                full_path = os.path.join(self.chroot, path)
+                zip_entry = zf.zip_entry_from_file(
                     filename=full_path,
-                    arcname=f,
+                    arcname=path,
                     date_time=DETERMINISTIC_DATETIME.timetuple()
                     if deterministic_timestamp
                     else None,
                 )
-                with open(full_path, "rb") as open_f:
-                    data = open_f.read()
-                zf.writestr(zinfo, data, compress_type=zipfile.ZIP_DEFLATED)
+                zf.writestr(zip_entry.info, zip_entry.data)
+
+            def get_parent_dir(path):
+                parent_dir = os.path.normpath(os.path.dirname(path))
+                if parent_dir and parent_dir != os.curdir:
+                    return parent_dir
+                return None
+
+            written_dirs = set()
+
+            def maybe_write_parent_dirs(path):
+                parent_dir = get_parent_dir(path)
+                if parent_dir is None or parent_dir in written_dirs:
+                    return
+                maybe_write_parent_dirs(parent_dir)
+                write_entry(parent_dir)
+                written_dirs.add(parent_dir)
+
+            for f in sorted(self.files()):
+                maybe_write_parent_dirs(f)
+                write_entry(f)

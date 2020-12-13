@@ -9,10 +9,11 @@ import subprocess
 import sys
 from distutils import log
 from distutils.core import Command
+from io import StringIO
 
 from pex.bin.pex import configure_clp
 from pex.common import die
-from pex.compatibility import ConfigParser, StringIO, string, to_unicode
+from pex.compatibility import ConfigParser, string, to_unicode
 from pex.interpreter import PythonInterpreter
 
 
@@ -73,7 +74,7 @@ class bdist_pex(Command):  # noqa
 
     def run(self):
         parser = configure_clp()
-        options, reqs = parser.parse_args(self.pex_args)
+        options = parser.parse_args(self.pex_args)
 
         if options.entry_point or options.script or options.pex_name:
             die(
@@ -104,7 +105,7 @@ class bdist_pex(Command):  # noqa
             target = os.path.join(self.bdist_dir, name + "-" + version + ".pex")
             pex_specs.append((name if name in console_scripts else None, target))
 
-        args = ["-m", "pex", package_dir] + reqs + self.pex_args
+        args = ["-m", "pex", package_dir] + options.requirements + self.pex_args
         if self.get_log_level() < log.INFO and options.verbosity == 0:
             args.append("-v")
 

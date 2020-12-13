@@ -16,13 +16,15 @@ from pex import dist_metadata
 from pex.common import AtomicDirectory, atomic_directory, safe_mkdtemp
 from pex.distribution_target import DistributionTarget
 from pex.interpreter import spawn_python_job
-from pex.jobs import SpawnedJob, execute_parallel
+from pex.jobs import Raise, SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
-from pex.pip import get_pip
+from pex.pip import PackageIndexConfiguration, get_pip
 from pex.platforms import Platform
-from pex.requirements import local_project_from_requirement, local_projects_from_requirement_file
+from pex.requirements import ReqInfo, URLFetcher, parse_requirement_file, parse_requirement_strings
 from pex.third_party.packaging.markers import Marker
+from pex.third_party.packaging.version import Version
+from pex.third_party.packaging.version import parse as parse_version
 from pex.third_party.pkg_resources import Distribution, Environment, Requirement
 from pex.tracer import TRACER
 from pex.util import CacheHelper
@@ -109,6 +111,19 @@ class DistributionRequirements(object):
     def to_requirement(self, dist):
         req = dist.as_requirement()
 
+        # pkg_resources.Distribution.as_requirement returns requirements in one of two forms:
+        # 1.) project_name==version
+        # 2.) project_name===version
+        # The latter form is used whenever the distribution's version is non-standard. In those
+        # cases we cannot append environment markers since `===` indicates a raw version string to
+        # the right that should not be parsed and instead should be compared literally in full.
+        # See:
+        # + https://www.python.org/dev/peps/pep-0440/#arbitrary-equality
+        # + https://github.com/pantsbuild/pex/issues/940
+        operator, _ = req.specs[0]
+        if operator == "===":
+            return req
+
         markers = OrderedSet()
 
         # Here we map any wheel python requirement to the equivalent environment marker:
@@ -117,11 +132,22 @@ class DistributionRequirements(object):
         # + https://www.python.org/dev/peps/pep-0508/#environment-markers
         python_requires = dist_metadata.requires_python(dist)
         if python_requires:
+
+            def choose_marker(version):
+                # type: (str) -> str
+                parsed_version = parse_version(version)
+                if type(parsed_version) != Version or len(parsed_version.release) > 2:
+                    return "python_full_version"
+                else:
+                    return "python_version"
+
             markers.update(
                 Marker(python_version)
                 for python_version in sorted(
-                    "python_version {operator} {version!r}".format(
-                        operator=specifier.operator, version=specifier.version
+                    "{marker} {operator} {version!r}".format(
+                        marker=choose_marker(specifier.version),
+                        operator=specifier.operator,
+                        version=specifier.version,
                     )
                     for specifier in python_requires
                 )
@@ -172,9 +198,7 @@ class DownloadRequest(
             "constraint_files",
             "allow_prereleases",
             "transitive",
-            "indexes",
-            "find_links",
-            "network_configuration",
+            "package_index_configuration",
             "cache",
             "build",
             "use_wheel",
@@ -184,17 +208,25 @@ class DownloadRequest(
 ):
     def iter_local_projects(self):
         if self.requirements:
-            for req in self.requirements:
-                local_project = local_project_from_requirement(req)
-                if local_project:
+            for req in parse_requirement_strings(self.requirements):
+                if req.is_local_project:
                     for target in self.targets:
-                        yield BuildRequest.create(target=target, source_path=local_project)
+                        yield BuildRequest.create(target=target, source_path=req.url)
 
         if self.requirement_files:
+            fetcher = URLFetcher(
+                network_configuration=self.package_index_configuration.network_configuration
+            )
             for requirement_file in self.requirement_files:
-                for local_project in local_projects_from_requirement_file(requirement_file):
-                    for target in self.targets:
-                        yield BuildRequest.create(target=target, source_path=local_project)
+                for req_or_constraint in parse_requirement_file(requirement_file, fetcher=fetcher):
+                    if (
+                        isinstance(req_or_constraint, ReqInfo)
+                        and req_or_constraint.is_local_project
+                    ):
+                        for target in self.targets:
+                            yield BuildRequest.create(
+                                target=target, source_path=req_or_constraint.url
+                            )
 
     def download_distributions(self, dest=None, max_parallel_jobs=None):
         if not self.requirements and not self.requirement_files:
@@ -208,7 +240,7 @@ class DownloadRequest(
                 execute_parallel(
                     inputs=self.targets,
                     spawn_func=spawn_download,
-                    raise_type=Unsatisfiable,
+                    error_handler=Raise(Unsatisfiable),
                     max_jobs=max_parallel_jobs,
                 )
             )
@@ -223,9 +255,7 @@ class DownloadRequest(
             allow_prereleases=self.allow_prereleases,
             transitive=self.transitive,
             target=target,
-            indexes=self.indexes,
-            find_links=self.find_links,
-            network_configuration=self.network_configuration,
+            package_index_configuration=self.package_index_configuration,
             cache=self.cache,
             build=self.build,
             manylinux=self.manylinux,
@@ -437,7 +467,7 @@ class InstallResult(namedtuple("InstallResult", ["request", "installation_root",
         #
         wheel_dir_hash = CacheHelper.dir_hash(self.install_chroot)
         runtime_key_dir = os.path.join(self.installation_root, wheel_dir_hash)
-        with atomic_directory(runtime_key_dir) as work_dir:
+        with atomic_directory(runtime_key_dir, exclusive=False) as work_dir:
             if work_dir:
                 # Note: Create a relative path symlink between the two directories so that the PEX_ROOT
                 # can be used within a chroot environment where the prefix of the path may change
@@ -476,18 +506,14 @@ class BuildAndInstallRequest(object):
         self,
         build_requests,
         install_requests,
-        indexes=None,
-        find_links=None,
-        network_configuration=None,
+        package_index_configuration=None,
         cache=None,
         compile=False,
     ):
 
         self._build_requests = build_requests
         self._install_requests = install_requests
-        self._indexes = indexes
-        self._find_links = find_links
-        self._network_configuration = network_configuration
+        self._package_index_configuration = package_index_configuration
         self._cache = cache
         self._compile = compile
 
@@ -516,9 +542,7 @@ class BuildAndInstallRequest(object):
             distributions=[build_request.source_path],
             wheel_dir=build_result.build_dir,
             cache=self._cache,
-            indexes=self._indexes,
-            find_links=self._find_links,
-            network_configuration=self._network_configuration,
+            package_index_configuration=self._package_index_configuration,
             interpreter=build_request.target.get_interpreter(),
         )
         return SpawnedJob.wait(job=build_job, result=build_result)
@@ -586,7 +610,7 @@ class BuildAndInstallRequest(object):
                 for build_result in execute_parallel(
                     inputs=build_requests,
                     spawn_func=spawn_wheel_build,
-                    raise_type=Untranslatable,
+                    error_handler=Raise(Untranslatable),
                     max_jobs=max_parallel_jobs,
                 ):
                     to_install.extend(build_result.finalize_build())
@@ -624,7 +648,7 @@ class BuildAndInstallRequest(object):
             for install_result in execute_parallel(
                 inputs=install_requests,
                 spawn_func=spawn_install,
-                raise_type=Untranslatable,
+                error_handler=Raise(Untranslatable),
                 max_jobs=max_parallel_jobs,
             ):
                 add_requirements_requests(install_result)
@@ -638,7 +662,7 @@ class BuildAndInstallRequest(object):
                 execute_parallel(
                     inputs=to_calculate_requirements_for,
                     spawn_func=DistributionRequirements.Request.spawn_calculation,
-                    raise_type=Untranslatable,
+                    error_handler=Raise(Untranslatable),
                     max_jobs=max_parallel_jobs,
                 )
             )
@@ -733,11 +757,15 @@ def resolve(
       prerelease or development versions will override this setting.
     :keyword bool transitive: Whether to resolve transitive dependencies of requirements.
       Defaults to ``True``.
-    :keyword interpreter: The interpreter to use for building distributions and for testing
-      distribution compatibility. Defaults to the current interpreter.
+    :keyword interpreter: If specified, distributions will be resolved for this interpreter, and
+      non-wheel distributions will be built against this interpreter. If both `interpreter` and
+      `platform` are ``None`` (the default), this defaults to the current interpreter.
     :type interpreter: :class:`pex.interpreter.PythonInterpreter`
-    :keyword str platform: The exact target platform to resolve distributions for. If ``None`` or
-      ``'current'``, resolve for distributions appropriate for `interpreter`.
+    :keyword str platform: The exact PEP425-compatible platform string to resolve distributions for,
+      in addition to the platform of the given interpreter, if provided. If any distributions need
+      to be built, use the interpreter argument instead, providing the corresponding interpreter.
+      However, if the platform matches the current interpreter, the current interpreter will be used
+      to build any non-wheels.
     :keyword indexes: A list of urls or paths pointing to PEP 503 compliant repositories to search for
       distributions. Defaults to ``None`` which indicates to use the default pypi index. To turn off
       use of all indexes, pass an empty list.
@@ -765,6 +793,8 @@ def resolve(
     :raises Unsatisfiable: If ``requirements`` is not transitively satisfiable.
     :raises Untranslatable: If no compatible distributions could be acquired for
       a particular requirement.
+    :raises ValueError: If a foreign `platform` was provided, and `use_wheel=False`.
+    :raises ValueError: If `build=False` and `use_wheel=False`.
     """
     # TODO(https://github.com/pantsbuild/pex/issues/969): Deprecate resolve with a single interpreter
     #  or platform and rename resolve_multi to resolve for a single API entrypoint to a full resolve.
@@ -824,12 +854,16 @@ def resolve_multi(
       prerelease or development versions will override this setting.
     :keyword bool transitive: Whether to resolve transitive dependencies of requirements.
       Defaults to ``True``.
-    :keyword interpreters: The interpreters to use for building distributions and for testing
-      distribution compatibility. Defaults to the current interpreter.
+    :keyword interpreters: If specified, distributions will be resolved for these interpreters, and
+      non-wheel distributions will be built against each interpreter. If both `interpreters` and
+      `platforms` are ``None`` (the default) or an empty iterable, this defaults to a list
+      containing only the current interpreter.
     :type interpreters: list of :class:`pex.interpreter.PythonInterpreter`
     :keyword platforms: An iterable of PEP425-compatible platform strings to resolve distributions
-      for. If ``None`` (the default) or an empty iterable, use the platforms of the given
-      interpreters.
+      for, in addition to the platforms of any given interpreters. If any distributions need to be
+      built, use the interpreters argument instead, providing the corresponding interpreter.
+      However, if any platform matches the current interpreter, the current interpreter will be used
+      to build any non-wheels for that platform.
     :type platforms: list of str
     :keyword indexes: A list of urls or paths pointing to PEP 503 compliant repositories to search for
       distributions. Defaults to ``None`` which indicates to use the default pypi index. To turn off
@@ -858,6 +892,8 @@ def resolve_multi(
     :raises Unsatisfiable: If ``requirements`` is not transitively satisfiable.
     :raises Untranslatable: If no compatible distributions could be acquired for
       a particular requirement.
+    :raises ValueError: If a foreign platform was provided in `platforms`, and `use_wheel=False`.
+    :raises ValueError: If `build=False` and `use_wheel=False`.
     """
 
     # A resolve happens in four stages broken into two phases:
@@ -891,6 +927,9 @@ def resolve_multi(
 
     workspace = safe_mkdtemp()
 
+    package_index_configuration = PackageIndexConfiguration.create(
+        indexes=indexes, find_links=find_links, network_configuration=network_configuration
+    )
     build_requests, download_results = _download_internal(
         interpreters=interpreters,
         platforms=platforms,
@@ -899,9 +938,7 @@ def resolve_multi(
         constraint_files=constraint_files,
         allow_prereleases=allow_prereleases,
         transitive=transitive,
-        indexes=indexes,
-        find_links=find_links,
-        network_configuration=network_configuration,
+        package_index_configuration=package_index_configuration,
         cache=cache,
         build=build,
         use_wheel=use_wheel,
@@ -919,9 +956,7 @@ def resolve_multi(
     build_and_install_request = BuildAndInstallRequest(
         build_requests=build_requests,
         install_requests=install_requests,
-        indexes=indexes,
-        find_links=find_links,
-        network_configuration=network_configuration,
+        package_index_configuration=package_index_configuration,
         cache=cache,
         compile=compile,
     )
@@ -942,9 +977,7 @@ def _download_internal(
     transitive=True,
     interpreters=None,
     platforms=None,
-    indexes=None,
-    find_links=None,
-    network_configuration=None,
+    package_index_configuration=None,
     cache=None,
     build=True,
     use_wheel=True,
@@ -986,9 +1019,7 @@ def _download_internal(
         constraint_files=constraint_files,
         allow_prereleases=allow_prereleases,
         transitive=transitive,
-        indexes=indexes,
-        find_links=find_links,
-        network_configuration=network_configuration,
+        package_index_configuration=package_index_configuration,
         cache=cache,
         build=build,
         use_wheel=use_wheel,
@@ -1047,12 +1078,12 @@ def download(
       prerelease or development versions will override this setting.
     :keyword bool transitive: Whether to resolve transitive dependencies of requirements.
       Defaults to ``True``.
-    :keyword interpreters: The interpreters to use for building distributions and for testing
-      distribution compatibility. Defaults to the current interpreter.
+    :keyword interpreters: If specified, distributions will be resolved for these interpreters.
+      If both `interpreters` and `platforms` are ``None`` (the default) or an empty iterable, this
+      defaults to a list containing only the current interpreter.
     :type interpreters: list of :class:`pex.interpreter.PythonInterpreter`
     :keyword platforms: An iterable of PEP425-compatible platform strings to resolve distributions
-      for. If ``None`` (the default) or an empty iterable, use the platforms of the given
-      interpreters.
+      for, in addition to the platforms of any given interpreters.
     :type platforms: list of str
     :keyword indexes: A list of urls or paths pointing to PEP 503 compliant repositories to search for
       distributions. Defaults to ``None`` which indicates to use the default pypi index. To turn off
@@ -1075,10 +1106,15 @@ def download(
     :keyword str dest: A directory path to download distributions to.
     :keyword int max_parallel_jobs: The maximum number of parallel jobs to use when resolving,
       building and installing distributions in a resolve. Defaults to the number of CPUs available.
-    :raises Unsatisfiable: If the resolution of download of distributions fails for any reason.
     :returns: List of :class:`LocalDistribution` instances meeting ``requirements``.
+    :raises Unsatisfiable: If the resolution of download of distributions fails for any reason.
+    :raises ValueError: If a foreign platform was provided in `platforms`, and `use_wheel=False`.
+    :raises ValueError: If `build=False` and `use_wheel=False`.
     """
 
+    package_index_configuration = PackageIndexConfiguration.create(
+        indexes=indexes, find_links=find_links, network_configuration=network_configuration
+    )
     local_distributions, download_results = _download_internal(
         interpreters=interpreters,
         platforms=platforms,
@@ -1087,9 +1123,7 @@ def download(
         constraint_files=constraint_files,
         allow_prereleases=allow_prereleases,
         transitive=transitive,
-        indexes=indexes,
-        find_links=find_links,
-        network_configuration=network_configuration,
+        package_index_configuration=package_index_configuration,
         cache=cache,
         build=build,
         use_wheel=use_wheel,
@@ -1165,12 +1199,13 @@ def install(
         else:
             build_requests.append(BuildRequest.from_local_distribution(local_distribution))
 
+    package_index_configuration = PackageIndexConfiguration.create(
+        indexes=indexes, find_links=find_links, network_configuration=network_configuration
+    )
     build_and_install_request = BuildAndInstallRequest(
         build_requests=build_requests,
         install_requests=install_requests,
-        indexes=indexes,
-        find_links=find_links,
-        network_configuration=network_configuration,
+        package_index_configuration=package_index_configuration,
         cache=cache,
         compile=compile,
     )

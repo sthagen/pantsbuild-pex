@@ -12,19 +12,45 @@ import platform
 import re
 import subprocess
 import sys
+from collections import OrderedDict
 from textwrap import dedent
 
 from pex import third_party
-from pex.common import safe_rmtree
+from pex.common import is_exe, safe_rmtree
 from pex.compatibility import string
 from pex.executor import Executor
-from pex.jobs import Job, SpawnedJob, execute_parallel
+from pex.jobs import ErrorHandler, Job, Retain, SpawnedJob, execute_parallel
 from pex.platforms import Platform
 from pex.third_party.packaging import markers, tags
 from pex.third_party.pkg_resources import Distribution, Requirement
 from pex.tracer import TRACER
+from pex.typing import TYPE_CHECKING, cast, overload
 from pex.util import CacheHelper
 from pex.variables import ENV
+
+if TYPE_CHECKING:
+    from typing import (
+        Callable,
+        Dict,
+        Iterable,
+        Iterator,
+        List,
+        MutableMapping,
+        Optional,
+        Sequence,
+        Tuple,
+        Union,
+    )
+
+    PathFilter = Callable[[str], bool]
+
+    InterpreterIdentificationJobError = Tuple[str, Union[Job.Error, Exception]]
+    InterpreterOrJobError = Union["PythonInterpreter", InterpreterIdentificationJobError]
+
+    # N.B.: We convert InterpreterIdentificationJobErrors that result from spawning interpreter
+    # identification jobs to these end-user InterpreterIdentificationErrors for display.
+    InterpreterIdentificationError = Tuple[str, str]
+    InterpreterOrError = Union["PythonInterpreter", InterpreterIdentificationError]
 
 
 class PythonIdentity(object):
@@ -53,11 +79,31 @@ class PythonIdentity(object):
     }
 
     @classmethod
-    def get(cls):
+    def get(cls, binary=None):
+        # type: (Optional[str]) -> PythonIdentity
+
+        # N.B.: We should not need to look past `sys.executable` to learn the current interpreter's
+        # executable path, but on OSX there has been a bug where the `sys.executable` reported is
+        # _not_ the path of the current interpreter executable:
+        #   https://bugs.python.org/issue22490#msg283859
+        # That case is distinguished by the presence of a `__PYVENV_LAUNCHER__` environment
+        # variable as detailed in the Python bug linked above.
+        if binary and binary != sys.executable and "__PYVENV_LAUNCHER__" not in os.environ:
+            # Here we assume sys.executable is accurate and binary is something like a pyenv shim.
+            binary = sys.executable
+
         supported_tags = tuple(tags.sys_tags())
         preferred_tag = supported_tags[0]
         return cls(
-            binary=sys.executable,
+            binary=binary or sys.executable,
+            prefix=sys.prefix,
+            base_prefix=(
+                # Old virtualenv (16 series and lower) sets `sys.real_prefix` in all cases.
+                getattr(sys, "real_prefix", None)
+                # Both pyvenv and virtualenv 20+ set `sys.base_prefix` as per
+                # https://www.python.org/dev/peps/pep-0405/.
+                or getattr(sys, "base_prefix", sys.prefix)
+            ),
             python_tag=preferred_tag.interpreter,
             abi_tag=preferred_tag.abi,
             platform_tag=preferred_tag.platform,
@@ -70,7 +116,7 @@ class PythonIdentity(object):
     def decode(cls, encoded):
         TRACER.log("creating PythonIdentity from encoded: %s" % encoded, V=9)
         values = json.loads(encoded)
-        if len(values) != 7:
+        if len(values) != 9:
             raise cls.InvalidError("Invalid interpreter identity: %s" % encoded)
 
         supported_tags = values.pop("supported_tags")
@@ -89,13 +135,25 @@ class PythonIdentity(object):
         raise ValueError("Unknown interpreter: {}".format(python_tag))
 
     def __init__(
-        self, binary, python_tag, abi_tag, platform_tag, version, supported_tags, env_markers
+        self,
+        binary,  # type: str
+        prefix,  # type: str
+        base_prefix,  # type: str
+        python_tag,  # type: str
+        abi_tag,  # type: str
+        platform_tag,  # type: str
+        version,  # type: Iterable[int]
+        supported_tags,  # type: Iterable[tags.Tag]
+        env_markers,  # type: Dict[str, str]
     ):
+        # type: (...) -> None
         # N.B.: We keep this mapping to support historical values for `distribution` and `requirement`
         # properties.
         self._interpreter_name = self._find_interpreter_name(python_tag)
 
         self._binary = binary
+        self._prefix = prefix
+        self._base_prefix = base_prefix
         self._python_tag = python_tag
         self._abi_tag = abi_tag
         self._platform_tag = platform_tag
@@ -106,6 +164,8 @@ class PythonIdentity(object):
     def encode(self):
         values = dict(
             binary=self._binary,
+            prefix=self._prefix,
+            base_prefix=self._base_prefix,
             python_tag=self._python_tag,
             abi_tag=self._abi_tag,
             platform_tag=self._platform_tag,
@@ -122,6 +182,16 @@ class PythonIdentity(object):
         return self._binary
 
     @property
+    def prefix(self):
+        # type: () -> str
+        return self._prefix
+
+    @property
+    def base_prefix(self):
+        # type: () -> str
+        return self._base_prefix
+
+    @property
     def python_tag(self):
         return self._python_tag
 
@@ -135,10 +205,16 @@ class PythonIdentity(object):
 
     @property
     def version(self):
-        return self._version
+        # type: () -> Tuple[int, int, int]
+        """The interpreter version as a normalized tuple.
+
+        Consistent with `sys.version_info`, the tuple corresponds to `<major>.<minor>.<micro>`.
+        """
+        return cast("Tuple[int, int, int]", self._version)
 
     @property
     def version_str(self):
+        # type: () -> str
         return ".".join(map(str, self.version))
 
     @property
@@ -159,14 +235,13 @@ class PythonIdentity(object):
 
     @property
     def distribution(self):
+        # type: () -> Distribution
         return Distribution(project_name=self.interpreter, version=self.version_str)
 
     def iter_supported_platforms(self):
+        # type: () -> Iterator[Platform]
         """All platforms supported by the associated interpreter ordered from most specific to
-        least.
-
-        :rtype: iterator of :class:`Platform`
-        """
+        least."""
         for tags in self._supported_tags:
             yield Platform.from_tags(platform=tags.platform, python=tags.interpreter, abi=tags.abi)
 
@@ -195,18 +270,25 @@ class PythonIdentity(object):
         return self.distribution in requirement
 
     def hashbang(self):
+        # type: () -> str
         hashbang_string = self.INTERPRETER_NAME_TO_HASHBANG.get(
             self._interpreter_name, "CPython"
-        ) % {"major": self._version[0], "minor": self._version[1], "patch": self._version[2],}
+        ) % {
+            "major": self._version[0],
+            "minor": self._version[1],
+            "patch": self._version[2],
+        }
         return "#!/usr/bin/env %s" % hashbang_string
 
     @property
     def python(self):
+        # type: () -> str
         # return the python version in the format of the 'python' key for distributions
         # specifically, '2.7', '3.2', etc.
         return "%d.%d" % (self.version[0:2])
 
     def __str__(self):
+        # type: () -> str
         # N.B.: Kept as distinct from __repr__ to support legacy str(identity) used by Pants v1 when
         # forming cache locations.
         return "{interpreter_name}-{major}.{minor}.{patch}".format(
@@ -217,13 +299,16 @@ class PythonIdentity(object):
         )
 
     def __repr__(self):
-        return "{type}({binary!r}, {python_tag!r}, {abi_tag!r}, {platform_tag!r}, {version!r})".format(
-            type=self.__class__.__name__,
-            binary=self._binary,
-            python_tag=self._python_tag,
-            abi_tag=self._abi_tag,
-            platform_tag=self._platform_tag,
-            version=self._version,
+        # type: () -> str
+        return (
+            "{type}({binary!r}, {python_tag!r}, {abi_tag!r}, {platform_tag!r}, {version!r})".format(
+                type=self.__class__.__name__,
+                binary=self._binary,
+                python_tag=self._python_tag,
+                abi_tag=self._abi_tag,
+                platform_tag=self._platform_tag,
+                version=self._version,
+            )
         )
 
     def _tup(self):
@@ -235,6 +320,7 @@ class PythonIdentity(object):
         return self._tup() == other._tup()
 
     def __hash__(self):
+        # type: () -> int
         return hash(self._tup())
 
 
@@ -252,11 +338,106 @@ class PythonInterpreter(object):
         re.compile(r"pypy-1.[0-9]$"),
     )
 
-    _PYTHON_INTERPRETER_BY_NORMALIZED_PATH = {}
+    _PYTHON_INTERPRETER_BY_NORMALIZED_PATH = {}  # type: Dict
 
     @staticmethod
-    def _normalize_path(path):
-        return os.path.realpath(path)
+    def _get_pyvenv_cfg(path):
+        # type: (str) -> Optional[str]
+        # See: https://www.python.org/dev/peps/pep-0405/#specification
+        pyvenv_cfg_path = os.path.join(path, "pyvenv.cfg")
+        if os.path.isfile(pyvenv_cfg_path):
+            with open(pyvenv_cfg_path) as fp:
+                for line in fp:
+                    name, _, value = line.partition("=")
+                    if name.strip() == "home":
+                        return pyvenv_cfg_path
+        return None
+
+    @classmethod
+    def _find_pyvenv_cfg(cls, maybe_venv_python_binary):
+        # type: (str) -> Optional[str]
+        # A pyvenv is identified by a pyvenv.cfg file with a home key in one of the two following
+        # directory layouts:
+        #
+        # 1. <venv dir>/
+        #      bin/
+        #        pyvenv.cfg
+        #        python*
+        #
+        # 2. <venv dir>/
+        #      pyvenv.cfg
+        #      bin/
+        #        python*
+        #
+        # In practice, we see layout 2 in the wild, but layout 1 is also allowed by the spec.
+        #
+        # See: # See: https://www.python.org/dev/peps/pep-0405/#specification
+        maybe_venv_bin_dir = os.path.dirname(maybe_venv_python_binary)
+        pyvenv_cfg = cls._get_pyvenv_cfg(maybe_venv_bin_dir)
+        if not pyvenv_cfg:
+            maybe_venv_dir = os.path.dirname(maybe_venv_bin_dir)
+            pyvenv_cfg = cls._get_pyvenv_cfg(maybe_venv_dir)
+        return pyvenv_cfg
+
+    @classmethod
+    def _resolve_pyvenv_canonical_python_binary(
+        cls,
+        real_binary,  # type: str
+        maybe_venv_python_binary,  # type: str
+    ):
+        # type: (...) -> Optional[str]
+        maybe_venv_python_binary = os.path.abspath(maybe_venv_python_binary)
+        if not os.path.islink(maybe_venv_python_binary):
+            return None
+
+        pyvenv_cfg = cls._find_pyvenv_cfg(maybe_venv_python_binary)
+        if pyvenv_cfg is None:
+            return None
+
+        while os.path.islink(maybe_venv_python_binary):
+            resolved = os.readlink(maybe_venv_python_binary)
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(
+                    os.path.join(os.path.dirname(maybe_venv_python_binary), resolved)
+                )
+            if os.path.dirname(resolved) == os.path.dirname(maybe_venv_python_binary):
+                maybe_venv_python_binary = resolved
+            else:
+                # We've escaped the venv bin dir; so the last resolved link was the
+                # canonical venv Python binary.
+                #
+                # For example, for:
+                #   ./venv/bin/
+                #     python -> python3.8
+                #     python3 -> python3.8
+                #     python3.8 -> /usr/bin/python3.8
+                #
+                # We want to resolve each of ./venv/bin/python{,3{,.8}} to the canonical
+                # ./venv/bin/python3.8 which is the symlink that points to the home binary.
+                break
+        return maybe_venv_python_binary
+
+    @classmethod
+    def canonicalize_path(cls, path):
+        # type: (str) -> str
+        """Canonicalize a potential Python interpreter path.
+
+        This will return a path-equivalent of the given `path` in canonical form for use in cache
+        keys.
+
+        N.B.: If the path is a venv symlink it will not be fully de-referenced in order to maintain
+        fidelity with the requested venv Python binary choice.
+        """
+        real_binary = os.path.realpath(path)
+
+        # If the path is a PEP-405 venv interpreter symlink we do not want to resolve outside of the
+        # venv in order to stay faithful to the binary path choice.
+        return (
+            cls._resolve_pyvenv_canonical_python_binary(
+                real_binary=real_binary, maybe_venv_python_binary=path
+            )
+            or real_binary
+        )
 
     class Error(Exception):
         pass
@@ -267,28 +448,87 @@ class PythonInterpreter(object):
     class InterpreterNotFound(Error):
         pass
 
+    @staticmethod
+    def latest_release_of_min_compatible_version(interps):
+        # type: (Sequence[PythonInterpreter]) -> PythonInterpreter
+        """Find the minimum major version, but use the most recent micro version within that minor
+        version.
+
+        That is, prefer 3.6.1 over 3.6.0, and prefer both over 3.7.*.
+        """
+        assert interps, "No interpreters passed to `PythonInterpreter.safe_min()`"
+        return min(
+            interps, key=lambda interp: (interp.version[0], interp.version[1], -interp.version[2])
+        )
+
     @classmethod
     def get(cls):
         return cls.from_binary(sys.executable)
 
     @staticmethod
     def _paths(paths=None):
-        return paths or os.getenv("PATH", "").split(os.pathsep)
+        # type: (Optional[Iterable[str]]) -> Iterable[str]
+        # NB: If `paths=[]`, we will not read $PATH.
+        return paths if paths is not None else os.getenv("PATH", "").split(os.pathsep)
 
     @classmethod
     def iter(cls, paths=None):
-        """Iterate all interpreters found in `paths`.
+        # type: (Optional[Iterable[str]]) -> Iterator[PythonInterpreter]
+        """Iterate all valid interpreters found in `paths`.
 
         NB: The paths can either be directories to search for python binaries or the paths of python
         binaries themselves.
 
         :param paths: The paths to look for python interpreters; by default the `PATH`.
-        :type paths: list str
         """
         return cls._filter(cls._find(cls._paths(paths=paths)))
 
     @classmethod
+    def iter_candidates(cls, paths=None, path_filter=None):
+        # type: (Optional[Iterable[str]], Optional[PathFilter]) -> Iterator[InterpreterOrError]
+        """Iterate all likely interpreters found in `paths`.
+
+        NB: The paths can either be directories to search for python binaries or the paths of python
+        binaries themselves.
+
+        :param paths: The paths to look for python interpreters; by default the `PATH`.
+        :param path_filter: An optional predicate to test whether a candidate interpreter's binary
+                            path is acceptable.
+        :return: A heterogeneous iterator over valid interpreters and (python, error) invalid
+                 python binary tuples.
+        """
+        failed_interpreters = OrderedDict()  # type: MutableMapping[str, str]
+
+        def iter_interpreters():
+            # type: () -> Iterator[PythonInterpreter]
+            for candidate in cls._find(
+                cls._paths(paths=paths), path_filter=path_filter, error_handler=Retain()
+            ):
+                if isinstance(candidate, cls):
+                    yield candidate
+                else:
+                    python, exception = cast("InterpreterIdentificationJobError", candidate)
+                    if isinstance(exception, Job.Error):
+                        # We spawned a subprocess to identify the interpreter but the interpreter
+                        # could not run our identification code meaning the interpreter is either
+                        # broken or old enough that it either can't parse our identification code
+                        # or else provide stdlib modules we expect. The stderr should indicate the
+                        # broken-ness appropriately.
+                        failed_interpreters[python] = exception.stderr.strip()
+                    else:
+                        # We couldn't even spawn a subprocess to identify the interpreter. The
+                        # likely OSError should help identify the underlying issue.
+                        failed_interpreters[python] = repr(exception)
+
+        for interpreter in cls._filter(iter_interpreters()):
+            yield interpreter
+
+        for python, error in failed_interpreters.items():
+            yield python, error
+
+    @classmethod
     def all(cls, paths=None):
+        # type: (Optional[Iterable[str]]) -> Iterable[PythonInterpreter]
         return list(cls.iter(paths=paths))
 
     @classmethod
@@ -329,11 +569,20 @@ class PythonInterpreter(object):
 
     @classmethod
     def _spawn_from_binary_external(cls, binary):
-        def create_interpreter(stdout):
+        def create_interpreter(stdout, check_binary=False):
             identity = stdout.decode("utf-8").strip()
             if not identity:
-                raise cls.IdentificationError("Could not establish identity of %s" % binary)
-            return cls(PythonIdentity.decode(identity))
+                raise cls.IdentificationError("Could not establish identity of {}.".format(binary))
+            interpreter = cls(PythonIdentity.decode(identity))
+            # We should not need to check this since binary == interpreter.binary should always be
+            # true, but historically this could be untrue as noted in `PythonIdentity.get`.
+            if check_binary and not os.path.exists(interpreter.binary):
+                raise cls.InterpreterNotFound(
+                    "Cached interpreter for {} reports a binary of {}, which could not be found".format(
+                        binary, interpreter.binary
+                    )
+                )
+            return interpreter
 
         # Part of the PythonInterpreter data are environment markers that depend on the current OS
         # release. That data can change when the OS is upgraded but (some of) the installed interpreters
@@ -364,7 +613,7 @@ class PythonInterpreter(object):
         if os.path.isfile(cache_file):
             try:
                 with open(cache_file, "rb") as fp:
-                    return SpawnedJob.completed(create_interpreter(fp.read()))
+                    return SpawnedJob.completed(create_interpreter(fp.read(), check_binary=True))
             except (IOError, OSError, cls.Error, PythonIdentity.Error):
                 safe_rmtree(cache_dir)
                 return cls._spawn_from_binary_external(binary)
@@ -383,14 +632,14 @@ class PythonInterpreter(object):
                         from pex.interpreter import PythonIdentity
 
 
-                        encoded_identity = PythonIdentity.get().encode()
+                        encoded_identity = PythonIdentity.get(binary={binary!r}).encode()
                         sys.stdout.write(encoded_identity)
-                        with atomic_directory({cache_dir!r}) as cache_dir:
+                        with atomic_directory({cache_dir!r}, exclusive=False) as cache_dir:
                             if cache_dir:
                                 with safe_open(os.path.join(cache_dir, {info_file!r}), 'w') as fp:
                                     fp.write(encoded_identity)
                         """.format(
-                            cache_dir=cache_dir, info_file=cls.INTERP_INFO_FILE
+                            binary=binary, cache_dir=cache_dir, info_file=cls.INTERP_INFO_FILE
                         )
                     ),
                 ],
@@ -428,54 +677,115 @@ class PythonInterpreter(object):
 
     @classmethod
     def _spawn_from_binary(cls, binary):
-        normalized_binary = cls._normalize_path(binary)
-        if not os.path.exists(normalized_binary):
-            raise cls.InterpreterNotFound(normalized_binary)
+        canonicalized_binary = cls.canonicalize_path(binary)
+        if not os.path.exists(canonicalized_binary):
+            raise cls.InterpreterNotFound(canonicalized_binary)
 
         # N.B.: The cache is written as the last step in PythonInterpreter instance initialization.
-        cached_interpreter = cls._PYTHON_INTERPRETER_BY_NORMALIZED_PATH.get(normalized_binary)
+        cached_interpreter = cls._PYTHON_INTERPRETER_BY_NORMALIZED_PATH.get(canonicalized_binary)
         if cached_interpreter is not None:
             return SpawnedJob.completed(cached_interpreter)
-        if normalized_binary == cls._normalize_path(sys.executable):
+        if canonicalized_binary == cls.canonicalize_path(sys.executable):
             current_interpreter = cls(PythonIdentity.get())
             return SpawnedJob.completed(current_interpreter)
-        return cls._spawn_from_binary_external(normalized_binary)
+        return cls._spawn_from_binary_external(canonicalized_binary)
 
     @classmethod
     def from_binary(cls, binary):
+        # type: (str) -> PythonInterpreter
         """Create an interpreter from the given `binary`.
 
-        :param str binary: The path to the python interpreter binary.
+        :param binary: The path to the python interpreter binary.
         :return: an interpreter created from the given `binary`.
-        :rtype: :class:`PythonInterpreter`
         """
-        return cls._spawn_from_binary(binary).await_result()
+        return cast(PythonInterpreter, cls._spawn_from_binary(binary).await_result())
 
     @classmethod
     def _matches_binary_name(cls, path):
+        # type: (str) -> bool
         basefile = os.path.basename(path)
         return any(matcher.match(basefile) is not None for matcher in cls._REGEXEN)
 
+    @overload
     @classmethod
     def _find(cls, paths):
+        # type: (Iterable[str]) -> Iterator[PythonInterpreter]
+        pass
+
+    @overload
+    @classmethod
+    def _find(
+        cls,
+        paths,  # type: Iterable[str]
+        error_handler,  # type: Retain
+        path_filter=None,  # type: Optional[PathFilter]
+    ):
+        # type: (...) -> Iterator[InterpreterOrJobError]
+        pass
+
+    @classmethod
+    def _find(
+        cls,
+        paths,  # type: Iterable[str]
+        error_handler=None,  # type: Optional[ErrorHandler]
+        path_filter=None,  # type: Optional[PathFilter]
+    ):
+        # type: (...) -> Union[Iterator[PythonInterpreter], Iterator[InterpreterOrJobError]]
         """Given a list of files or directories, try to detect python interpreters amongst them.
 
         Returns an iterator over PythonInterpreter objects.
         """
-        return cls._identify_interpreters(filter=cls._matches_binary_name, paths=paths)
+        return cls._identify_interpreters(
+            filter=path_filter or cls._matches_binary_name, paths=paths, error_handler=error_handler
+        )
+
+    @overload
+    @classmethod
+    def _identify_interpreters(
+        cls,
+        filter,  # type: PathFilter
+        error_handler,  # type: None
+        paths=None,  # type: Optional[Iterable[str]]
+    ):
+        # type: (...) -> Iterator[PythonInterpreter]
+        pass
+
+    @overload
+    @classmethod
+    def _identify_interpreters(
+        cls,
+        filter,  # type: PathFilter
+        error_handler,  # type: Retain
+        paths=None,  # type: Optional[Iterable[str]]
+    ):
+        # type: (...) -> Iterator[InterpreterOrJobError]
+        pass
 
     @classmethod
-    def _identify_interpreters(cls, filter, paths=None):
+    def _identify_interpreters(
+        cls,
+        filter,  # type: PathFilter
+        error_handler=None,  # type: Optional[ErrorHandler]
+        paths=None,  # type: Optional[Iterable[str]]
+    ):
+        # type: (...) -> Union[Iterator[PythonInterpreter], Iterator[InterpreterOrJobError]]
         def iter_candidates():
+            # type: () -> Iterator[str]
             for path in cls._paths(paths=paths):
                 for fn in cls._expand_path(path):
                     if filter(fn):
                         yield fn
 
-        return execute_parallel(inputs=list(iter_candidates()), spawn_func=cls._spawn_from_binary)
+        results = execute_parallel(
+            inputs=list(iter_candidates()),
+            spawn_func=cls._spawn_from_binary,
+            error_handler=error_handler,
+        )
+        return cast("Union[Iterator[PythonInterpreter], Iterator[InterpreterOrJobError]]", results)
 
     @classmethod
     def _filter(cls, pythons):
+        # type: (Iterable[PythonInterpreter]) -> Iterator[PythonInterpreter]
         """Filters duplicate python interpreters and versions we don't support.
 
         Returns an iterator over PythonInterpreters.
@@ -483,6 +793,7 @@ class PythonInterpreter(object):
         MAJOR, MINOR, SUBMINOR = range(3)
 
         def version_filter(version):
+            # type: (Tuple[int, int, int]) -> bool
             return (
                 version[MAJOR] == 2
                 and version[MINOR] >= 7
@@ -506,14 +817,13 @@ class PythonInterpreter(object):
         return env_copy
 
     def __init__(self, identity):
+        # type: (PythonIdentity) -> None
         """Construct a PythonInterpreter.
 
         You should probably use `PythonInterpreter.from_binary` instead.
-
-        :param identity: The :class:`PythonIdentity` of the PythonInterpreter.
         """
         self._identity = identity
-        self._binary = self._normalize_path(self.identity.binary)
+        self._binary = self.canonicalize_path(self.identity.binary)
 
         self._supported_platforms = None
 
@@ -521,10 +831,112 @@ class PythonInterpreter(object):
 
     @property
     def binary(self):
+        # type: () -> str
         return self._binary
 
     @property
+    def is_venv(self):
+        # type: () -> bool
+        """Return `True` if this interpreter is homed in a virtual environment."""
+        return self._identity.prefix != self._identity.base_prefix
+
+    @property
+    def prefix(self):
+        # type: () -> str
+        """Return the `sys.prefix` of this interpreter.
+
+        For virtual environments, this will be the virtual environment directory itself.
+        """
+        return self._identity.prefix
+
+    class BaseInterpreterResolutionError(Exception):
+        """Indicates the base interpreter for a virtual environment could not be resolved."""
+
+    def resolve_base_interpreter(self):
+        # type: () -> PythonInterpreter
+        """Finds the base system interpreter used to create a virtual environment.
+
+        If this interpreter is not homed in a virtual environment, returns itself.
+        """
+        if not self.is_venv:
+            return self
+
+        # In the case of PyPy, the <base_prefix> dir might contain one of the following:
+        #
+        # 1. On a system with PyPy 2.7 series and one PyPy 3.x series
+        # bin/
+        #   pypy
+        #   pypy3
+        #
+        # 2. On a system with PyPy 2.7 series and more than one PyPy 3.x series
+        # bin/
+        #   pypy
+        #   pypy3
+        #   pypy3.6
+        #   pypy3.7
+        #
+        # In both cases, bin/pypy is a 2.7 series interpreter. In case 2 bin/pypy3 could be either
+        # PyPy 3.6 series or PyPy 3.7 series. In order to ensure we pick the correct base executable
+        # of a PyPy virtual environment, we always try to resolve the most specific basename first
+        # to the least specific basename last and we also verify that, if the basename resolves, it
+        # resolves to an equivalent interpreter. We employ the same strategy for CPython, but only
+        # for uniformity in the algorithm. It appears to always be the case for CPython that
+        # python<major>.<minor> is present in any given <prefix>/bin/ directory; so the algorithm
+        # gets a hit on 1st try for CPython binaries incurring ~no extra overhead.
+
+        version = self._identity.version
+        abi_tag = self._identity.abi_tag
+
+        prefix = "pypy" if self._identity.interpreter == "PyPy" else "python"
+        suffixes = ("{}.{}".format(version[0], version[1]), str(version[0]), "")
+        candidate_binaries = tuple("{}{}".format(prefix, suffix) for suffix in suffixes)
+
+        def iter_base_candidate_binary_paths(interpreter):
+            # type: (PythonInterpreter) -> Iterator[str]
+            bin_dir = os.path.join(interpreter._identity.base_prefix, "bin")
+            for candidate_binary in candidate_binaries:
+                candidate_binary_path = os.path.join(bin_dir, candidate_binary)
+                if is_exe(candidate_binary_path):
+                    yield candidate_binary_path
+
+        def is_same_interpreter(interpreter):
+            # type: (PythonInterpreter) -> bool
+            identity = interpreter._identity
+            return identity.version == version and identity.abi_tag == abi_tag
+
+        resolution_path = []  # type: List[str]
+        base_interpreter = self
+        while base_interpreter.is_venv:
+            resolved = None  # type: Optional[PythonInterpreter]
+            for candidate_path in iter_base_candidate_binary_paths(base_interpreter):
+                resolved_interpreter = self.from_binary(candidate_path)
+                if is_same_interpreter(resolved_interpreter):
+                    resolved = resolved_interpreter
+                    break
+            if resolved is None:
+                message = [
+                    "Failed to resolve the base interpreter for the virtual environment at "
+                    "{venv_dir}.".format(venv_dir=self._identity.prefix)
+                ]
+                if resolution_path:
+                    message.append(
+                        "Resolved through {path}".format(
+                            path=" -> ".join(binary for binary in resolution_path)
+                        )
+                    )
+                message.append(
+                    "Search of base_prefix {} found no equivalent interpreter for {}".format(
+                        base_interpreter._identity.base_prefix, base_interpreter._binary
+                    )
+                )
+                raise self.BaseInterpreterResolutionError("\n".join(message))
+            base_interpreter = resolved_interpreter
+            resolution_path.append(base_interpreter.binary)
+        return base_interpreter
+
+    @property
     def identity(self):
+        # type: () -> PythonIdentity
         return self._identity
 
     @property
@@ -537,6 +949,7 @@ class PythonInterpreter(object):
 
     @property
     def version_string(self):
+        # type: () -> str
         return str(self._identity)
 
     @property
@@ -579,11 +992,6 @@ class PythonInterpreter(object):
         if type(other) is not type(self):
             return NotImplemented
         return self._binary == other._binary
-
-    def __lt__(self, other):
-        if type(other) is not type(self):
-            return NotImplemented
-        return self.version < other.version
 
     def __repr__(self):
         return "{type}({binary!r}, {identity!r})".format(

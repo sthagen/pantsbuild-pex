@@ -1,6 +1,9 @@
 # Copyright 2015 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+from __future__ import absolute_import, print_function
+
+import errno
 import filecmp
 import functools
 import glob
@@ -11,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from contextlib import contextmanager
 from textwrap import dedent
 from zipfile import ZipFile
@@ -18,11 +22,23 @@ from zipfile import ZipFile
 import pytest
 
 from pex import pex_builder
-from pex.common import safe_copy, safe_mkdir, safe_open, safe_rmtree, safe_sleep, temporary_dir
+from pex.common import (
+    safe_copy,
+    safe_mkdir,
+    safe_open,
+    safe_rmtree,
+    safe_sleep,
+    temporary_dir,
+    touch,
+)
 from pex.compatibility import WINDOWS, nested, to_bytes
+from pex.executor import Executor
 from pex.interpreter import PythonInterpreter
+from pex.network_configuration import NetworkConfiguration
+from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
+from pex.requirements import LogicalLine, ReqInfo, URLFetcher, parse_requirement_file
 from pex.testing import (
     IS_PYPY,
     NOT_CPYTHON27,
@@ -31,10 +47,11 @@ from pex.testing import (
     PY27,
     PY35,
     PY36,
+    IntegResults,
     WheelBuilder,
     built_wheel,
-    ensure_python_distribution,
     ensure_python_interpreter,
+    ensure_python_venv,
     get_dep_dist_names_from_pex,
     make_source_dir,
     run_pex_command,
@@ -43,10 +60,26 @@ from pex.testing import (
     temporary_content,
 )
 from pex.third_party import pkg_resources
+from pex.typing import TYPE_CHECKING
 from pex.util import DistributionHelper, named_temporary_file
+
+if TYPE_CHECKING:
+    from typing import (
+        Any,
+        Callable,
+        ContextManager,
+        Dict,
+        Iterable,
+        Iterator,
+        List,
+        MutableSet,
+        Optional,
+        Tuple,
+    )
 
 
 def make_env(**kwargs):
+    # type: (**Any) -> Dict[str, str]
     env = os.environ.copy()
     env.update((k, str(v)) for k, v in kwargs.items() if v is not None)
     for k, v in kwargs.items():
@@ -56,23 +89,27 @@ def make_env(**kwargs):
 
 
 def test_pex_execute():
+    # type: () -> None
     body = "print('Hello')"
     _, rc = run_simple_pex_test(body, coverage=True)
     assert rc == 0
 
 
 def test_pex_raise():
+    # type: () -> None
     body = "raise Exception('This will improve coverage.')"
     run_simple_pex_test(body, coverage=True)
 
 
 def assert_installed_wheels(label, pex_root):
+    # type: (str, str) -> None
     assert "installed_wheels" in os.listdir(
         pex_root
     ), "Expected {label} pex root to be populated with buildtime artifacts.".format(label=label)
 
 
 def test_pex_root_build():
+    # type: () -> None
     with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (
         buildtime_pex_root,
         output_dir,
@@ -94,6 +131,7 @@ def test_pex_root_build():
 
 
 def test_pex_root_run():
+    # type: () -> None
     with nested(temporary_dir(), temporary_dir(), temporary_dir(), temporary_dir()) as (
         buildtime_pex_root,
         runtime_pex_root,
@@ -130,6 +168,7 @@ def test_pex_root_run():
 
 
 def test_cache_disable():
+    # type: () -> None
     with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (td, output_dir, tmp_home):
         output_path = os.path.join(output_dir, "pex.pex")
         args = [
@@ -147,6 +186,7 @@ def test_cache_disable():
 
 
 def test_pex_interpreter():
+    # type: () -> None
     with named_temporary_file() as fp:
         fp.write(b"print('Hello world')")
         fp.flush()
@@ -159,15 +199,14 @@ def test_pex_interpreter():
 
 
 def test_pex_repl_cli():
+    # type: () -> None
     """Tests the REPL in the context of the pex cli itself."""
     stdin_payload = b"import sys; sys.exit(3)"
 
     with temporary_dir() as output_dir:
         # Create a temporary pex containing just `requests` with no entrypoint.
         pex_path = os.path.join(output_dir, "pex.pex")
-        results = run_pex_command(
-            ["--disable-cache", "requests", "./", "-e", "pex.bin.pex:main", "-o", pex_path]
-        )
+        results = run_pex_command(["requests", "-o", pex_path])
         results.assert_success()
 
         # Test that the REPL is functional.
@@ -177,6 +216,7 @@ def test_pex_repl_cli():
 
 
 def test_pex_repl_built():
+    # type: () -> None
     """Tests the REPL in the context of a built pex."""
     stdin_payload = b"import requests; import sys; sys.exit(3)"
 
@@ -194,6 +234,7 @@ def test_pex_repl_built():
 
 @pytest.mark.skipif(WINDOWS, reason="No symlinks on windows")
 def test_pex_python_symlink():
+    # type: () -> None
     with temporary_dir() as td:
         symlink_path = os.path.join(td, "python-symlink")
         os.symlink(sys.executable, symlink_path)
@@ -207,6 +248,7 @@ def test_pex_python_symlink():
 
 
 def test_entry_point_exit_code():
+    # type: () -> None
     setup_py = dedent(
         """
         from setuptools import setup
@@ -244,6 +286,7 @@ def test_entry_point_exit_code():
     NOT_CPYTHON36_OR_LINUX, reason="inherits linux abi on linux w/ no backing packages"
 )
 def test_pex_multi_resolve():
+    # type: () -> None
     """Tests multi-interpreter + multi-platform resolution."""
     with temporary_dir() as output_dir:
         pex_path = os.path.join(output_dir, "pex.pex")
@@ -270,6 +313,7 @@ def test_pex_multi_resolve():
 
 @pytest.mark.xfail(reason="See https://github.com/pantsbuild/pants/issues/4682")
 def test_pex_re_exec_failure():
+    # type: () -> None
     with temporary_dir() as output_dir:
 
         # create 2 pex files for PEX_PATH
@@ -318,6 +362,7 @@ def test_pex_re_exec_failure():
 
 
 def test_pex_path_arg():
+    # type: () -> None
     with temporary_dir() as output_dir:
 
         # create 2 pex files for PEX_PATH
@@ -366,6 +411,7 @@ def test_pex_path_arg():
 
 
 def test_pex_path_in_pex_info_and_env():
+    # type: () -> None
     with temporary_dir() as output_dir:
 
         # create 2 pex files for PEX-INFO pex_path
@@ -415,6 +461,7 @@ def test_pex_path_in_pex_info_and_env():
 
 
 def test_interpreter_constraints_to_pex_info_py2():
+    # type: () -> None
     with temporary_dir() as output_dir:
         # target python 2
         pex_out_path = os.path.join(output_dir, "pex_py2.pex")
@@ -433,6 +480,7 @@ def test_interpreter_constraints_to_pex_info_py2():
 
 
 def test_interpreter_constraints_to_pex_info_py3():
+    # type: () -> None
     py3_interpreter = ensure_python_interpreter(PY36)
     with temporary_dir() as output_dir:
         # target python 3
@@ -447,6 +495,7 @@ def test_interpreter_constraints_to_pex_info_py3():
 
 
 def test_interpreter_resolution_with_constraint_option():
+    # type: () -> None
     with temporary_dir() as output_dir:
         pex_out_path = os.path.join(output_dir, "pex1.pex")
         res = run_pex_command(
@@ -459,6 +508,7 @@ def test_interpreter_resolution_with_constraint_option():
 
 
 def test_interpreter_resolution_with_multiple_constraint_options():
+    # type: () -> None
     with temporary_dir() as output_dir:
         pex_out_path = os.path.join(output_dir, "pex1.pex")
         res = run_pex_command(
@@ -479,6 +529,7 @@ def test_interpreter_resolution_with_multiple_constraint_options():
 
 
 def test_interpreter_resolution_with_pex_python_path():
+    # type: () -> None
     with temporary_dir() as td:
         pexrc_path = os.path.join(td, ".pexrc")
         with open(pexrc_path, "w") as pexrc:
@@ -517,6 +568,7 @@ def test_interpreter_resolution_with_pex_python_path():
 
 
 def test_interpreter_constraints_honored_without_ppp_or_pp():
+    # type: () -> None
     # Create a pex with interpreter constraints, but for not the default interpreter in the path.
     with temporary_dir() as td:
         py36_path = ensure_python_interpreter(PY36)
@@ -525,7 +577,12 @@ def test_interpreter_constraints_honored_without_ppp_or_pp():
         pex_out_path = os.path.join(td, "pex.pex")
         env = make_env(
             PEX_IGNORE_RCFILES="1",
-            PATH=os.pathsep.join([os.path.dirname(py35_path), os.path.dirname(py36_path),]),
+            PATH=os.pathsep.join(
+                [
+                    os.path.dirname(py35_path),
+                    os.path.dirname(py36_path),
+                ]
+            ),
         )
         res = run_pex_command(
             ["--disable-cache", "--interpreter-constraint===%s" % PY36, "-o", pex_out_path], env=env
@@ -545,6 +602,7 @@ def test_interpreter_constraints_honored_without_ppp_or_pp():
 
 
 def test_interpreter_resolution_pex_python_path_precedence_over_pex_python():
+    # type: () -> None
     with temporary_dir() as td:
         pexrc_path = os.path.join(td, ".pexrc")
         with open(pexrc_path, "w") as pexrc:
@@ -575,68 +633,24 @@ def test_interpreter_resolution_pex_python_path_precedence_over_pex_python():
         assert correct_interpreter_path in stdout
 
 
-def test_use_first_matching_interpreter():
-    py35_path = ensure_python_interpreter(PY35)
-    py36_path = ensure_python_interpreter(PY36)
-    env = make_env(PEX_PYTHON_PATH=os.pathsep.join((py35_path, py36_path)))
-
-    def run_pex_with_py36(use_first_matching_flag):
-        with temporary_dir() as output_dir:
-            pex_out_path = os.path.join(output_dir, "first_matching.pex")
-            args = [
-                "--disable-cache",
-                "--interpreter-constraint=>=3.5",
-                "-o",
-                pex_out_path,
-                "psutil==5.7.0",
-            ]
-            if use_first_matching_flag:
-                args.append("--use-first-matching-interpreter")
-            res = run_pex_command(args, env=env)
-            res.assert_success()
-
-            pex_info = PexInfo.from_pex(pex_out_path)
-            assert (
-                [] if use_first_matching_flag else [">=3.5"]
-            ) == pex_info.interpreter_constraints
-
-            # Running with Python 3.5 should always work because that is the first matching
-            # interpreter.
-            stdin_payload = b"import sys, psutil; print(sys.executable); sys.exit(0)"
-            stdout, rc = run_simple_pex(pex_out_path, stdin=stdin_payload, env=env)
-            assert rc == 0
-            assert py35_path in stdout.decode()
-
-            stdout, rc = run_simple_pex(
-                pex_out_path, stdin=stdin_payload, env=make_env(PEX_PYTHON_PATH=py36_path)
-            )
-            return stdout, rc
-
-    without_flag_stdout, without_flag_rc = run_pex_with_py36(use_first_matching_flag=False)
-    assert without_flag_rc == 0
-    assert py36_path in without_flag_stdout.decode()
-
-    with_flag_stdout, with_flag_rc = run_pex_with_py36(use_first_matching_flag=True)
-    assert with_flag_rc == 1
-    assert bool(re.search(r"Needed.*cp-36-cp36m", with_flag_stdout.decode()))
-
-
 def test_plain_pex_exec_no_ppp_no_pp_no_constraints():
+    # type: () -> None
     with temporary_dir() as td:
         pex_out_path = os.path.join(td, "pex.pex")
-        env = make_env(
-            PEX_IGNORE_RCFILES="1", PATH=os.path.dirname(os.path.realpath(sys.executable))
-        )
+        env = make_env(PEX_IGNORE_RCFILES="1")
         res = run_pex_command(["--disable-cache", "-o", pex_out_path], env=env)
         res.assert_success()
 
-        stdin_payload = b"import os, sys; print(os.path.realpath(sys.executable)); sys.exit(0)"
+        stdin_payload = b"import os, sys; print(sys.executable); sys.exit(0)"
         stdout, rc = run_simple_pex(pex_out_path, stdin=stdin_payload, env=env)
         assert rc == 0
-        assert os.path.realpath(sys.executable).encode() in stdout
+        assert (
+            PythonInterpreter.get().resolve_base_interpreter().binary.encode() in stdout
+        ), "Expected the current interpreter to be used when no constraints were supplied."
 
 
 def test_pex_exec_with_pex_python_path_only():
+    # type: () -> None
     with temporary_dir() as td:
         pexrc_path = os.path.join(td, ".pexrc")
         with open(pexrc_path, "w") as pexrc:
@@ -659,6 +673,7 @@ def test_pex_exec_with_pex_python_path_only():
 
 
 def test_pex_exec_with_pex_python_path_and_pex_python_but_no_constraints():
+    # type: () -> None
     with temporary_dir() as td:
         pexrc_path = os.path.join(td, ".pexrc")
         with open(pexrc_path, "w") as pexrc:
@@ -683,6 +698,7 @@ def test_pex_exec_with_pex_python_path_and_pex_python_but_no_constraints():
 
 
 def test_pex_python():
+    # type: () -> None
     py2_path_interpreter = ensure_python_interpreter(PY27)
     py3_path_interpreter = ensure_python_interpreter(PY36)
     path = ":".join([os.path.dirname(py2_path_interpreter), os.path.dirname(py3_path_interpreter)])
@@ -753,6 +769,7 @@ def test_pex_python():
 
 
 def test_entry_point_targeting():
+    # type: () -> None
     """Test bugfix for https://github.com/pantsbuild/pex/issues/434."""
     with temporary_dir() as td:
         pexrc_path = os.path.join(td, ".pexrc")
@@ -770,6 +787,7 @@ def test_entry_point_targeting():
 
 
 def test_interpreter_selection_using_os_environ_for_bootstrap_reexec():
+    # type: () -> None
     """This is a test for verifying the proper function of the pex bootstrapper's interpreter
     selection logic and validate a corresponding bugfix.
 
@@ -864,23 +882,26 @@ def test_interpreter_selection_using_os_environ_for_bootstrap_reexec():
         assert rc == 0
         # Ensure that child pex used the proper interpreter as specified by its pexrc.
         correct_interpreter_path = ensure_python_interpreter(child_pex_interpreter_version)
-        correct_interpreter_path = correct_interpreter_path.encode()  # Py 2/3 compatibility
-        assert correct_interpreter_path in stdout
+        assert correct_interpreter_path in stdout.decode("utf-8")
 
 
 def test_inherit_path_fallback():
+    # type: () -> None
     inherit_path("=fallback")
 
 
 def test_inherit_path_backwards_compatibility():
+    # type: () -> None
     inherit_path("")
 
 
 def test_inherit_path_prefer():
+    # type: () -> None
     inherit_path("=prefer")
 
 
 def inherit_path(inherit_path):
+    # type: (str) -> None
     with temporary_dir() as output_dir:
         exe = os.path.join(output_dir, "exe.py")
         body = "import sys ; print('\\n'.join(sys.path))"
@@ -901,7 +922,11 @@ def inherit_path(inherit_path):
         results.assert_success()
 
         env = make_env(PYTHONPATH="/doesnotexist")
-        stdout, rc = run_simple_pex(pex_path, args=(exe,), env=env,)
+        stdout, rc = run_simple_pex(
+            pex_path,
+            args=(exe,),
+            env=env,
+        )
         assert rc == 0
 
         stdout_lines = stdout.decode().split("\n")
@@ -917,6 +942,7 @@ def inherit_path(inherit_path):
 
 
 def test_pex_multi_resolve_2():
+    # type: () -> None
     """Tests multi-interpreter + multi-platform resolution using extended platform notation."""
     with temporary_dir() as output_dir:
         pex_path = os.path.join(output_dir, "pex.pex")
@@ -943,11 +969,18 @@ def test_pex_multi_resolve_2():
             ), "{} was not found in wheel".format(dist_substr)
 
 
+if TYPE_CHECKING:
+    TestResolveFn = Callable[[str, str, str, str, Optional[str]], None]
+    EnsureFailureFn = Callable[[str, str, str, str], None]
+
+
 @contextmanager
 def pex_manylinux_and_tag_selection_context():
+    # type: () -> Iterator[Tuple[TestResolveFn, EnsureFailureFn]]
     with temporary_dir() as output_dir:
 
         def do_resolve(req_name, req_version, platform, extra_flags=None):
+            # type: (str, str, str, Optional[str]) -> Tuple[str, IntegResults]
             extra_flags = extra_flags or ""
             pex_path = os.path.join(output_dir, "test.pex")
             results = run_pex_command(
@@ -955,7 +988,7 @@ def pex_manylinux_and_tag_selection_context():
                     "--disable-cache",
                     "--no-build",
                     "%s==%s" % (req_name, req_version),
-                    "--platform=%s" % (platform),
+                    "--platform=%s" % platform,
                     "-o",
                     pex_path,
                 ]
@@ -964,6 +997,7 @@ def pex_manylinux_and_tag_selection_context():
             return pex_path, results
 
         def test_resolve(req_name, req_version, platform, substr, extra_flags=None):
+            # type: (str, str, str, str, Optional[str]) -> None
             pex_path, results = do_resolve(req_name, req_version, platform, extra_flags)
             results.assert_success()
             included_dists = get_dep_dist_names_from_pex(pex_path, req_name.replace("-", "_"))
@@ -972,6 +1006,7 @@ def pex_manylinux_and_tag_selection_context():
             )
 
         def ensure_failure(req_name, req_version, platform, extra_flags):
+            # type: (str, str, str, str) -> None
             pex_path, results = do_resolve(req_name, req_version, platform, extra_flags)
             results.assert_failure()
 
@@ -979,6 +1014,7 @@ def pex_manylinux_and_tag_selection_context():
 
 
 def test_pex_manylinux_and_tag_selection_linux_msgpack():
+    # type: () -> None
     """Tests resolver manylinux support and tag targeting."""
     with pex_manylinux_and_tag_selection_context() as (test_resolve, ensure_failure):
         msgpack, msgpack_ver = "msgpack-python", "0.4.7"
@@ -1015,13 +1051,19 @@ def test_pex_manylinux_and_tag_selection_linux_msgpack():
 
 
 def test_pex_manylinux_and_tag_selection_lxml_osx():
+    # type: () -> None
     with pex_manylinux_and_tag_selection_context() as (test_resolve, ensure_failure):
-        test_resolve("lxml", "3.8.0", "macosx-10.6-x86_64-cp-27-m", "lxml-3.8.0-cp27-cp27m-macosx")
-        test_resolve("lxml", "3.8.0", "macosx-10.6-x86_64-cp-36-m", "lxml-3.8.0-cp36-cp36m-macosx")
+        test_resolve(
+            "lxml", "3.8.0", "macosx-10.6-x86_64-cp-27-m", "lxml-3.8.0-cp27-cp27m-macosx", None
+        )
+        test_resolve(
+            "lxml", "3.8.0", "macosx-10.6-x86_64-cp-36-m", "lxml-3.8.0-cp36-cp36m-macosx", None
+        )
 
 
 @pytest.mark.skipif(NOT_CPYTHON27_OR_OSX, reason="Relies on a pre-built wheel for linux 2.7")
 def test_pex_manylinux_runtime():
+    # type: () -> None
     """Tests resolver manylinux support and runtime resolution (and --platform=current)."""
     test_stub = dedent(
         """
@@ -1046,10 +1088,11 @@ def test_pex_manylinux_runtime():
         results.assert_success()
 
         out = subprocess.check_output([pex_path, tester_path])
-        assert out.strip() == "[1, 2, 3]"
+        assert out.strip() == b"[1, 2, 3]"
 
 
 def test_pex_exit_code_propagation():
+    # type: () -> None
     """Tests exit code propagation."""
     test_stub = dedent(
         """
@@ -1069,11 +1112,13 @@ def test_pex_exit_code_propagation():
 
 @pytest.mark.skipif(NOT_CPYTHON27, reason="Tests environment markers that select for python 2.7.")
 def test_ipython_appnope_env_markers():
+    # type: () -> None
     res = run_pex_command(["--disable-cache", "ipython==5.8.0", "-c", "ipython", "--", "--version"])
     res.assert_success()
 
 
 def test_cross_platform_abi_targeting_behavior_exact():
+    # type: () -> None
     with temporary_dir() as td:
         pex_out_path = os.path.join(td, "pex.pex")
         res = run_pex_command(
@@ -1091,6 +1136,7 @@ def test_cross_platform_abi_targeting_behavior_exact():
 
 
 def test_pex_source_bundling():
+    # type: () -> None
     with temporary_dir() as output_dir:
         with temporary_dir() as input_dir:
             with open(os.path.join(input_dir, "exe.py"), "w") as fh:
@@ -1103,7 +1149,16 @@ def test_pex_source_bundling():
                 )
 
             pex_path = os.path.join(output_dir, "pex1.pex")
-            res = run_pex_command(["-o", pex_path, "-D", input_dir, "-e", "exe",])
+            res = run_pex_command(
+                [
+                    "-o",
+                    pex_path,
+                    "-D",
+                    input_dir,
+                    "-e",
+                    "exe",
+                ]
+            )
             res.assert_success()
 
             stdout, rc = run_simple_pex(pex_path)
@@ -1112,7 +1167,37 @@ def test_pex_source_bundling():
             assert stdout == b"hello\n"
 
 
+def test_pex_source_bundling_pep420():
+    # type: () -> None
+    with temporary_dir() as output_dir:
+        with temporary_dir() as input_dir:
+            with safe_open(os.path.join(input_dir, "a/b/c.py"), "w") as fh:
+                fh.write("GREETING = 'hello'")
+
+            with open(os.path.join(input_dir, "exe.py"), "w") as fh:
+                fh.write(
+                    dedent(
+                        """
+                        from a.b.c import GREETING
+
+                        print(GREETING)
+                        """
+                    )
+                )
+
+            pex_path = os.path.join(output_dir, "pex1.pex")
+            py36 = ensure_python_interpreter(PY36)
+            res = run_pex_command(["-o", pex_path, "-D", input_dir, "-e", "exe"], python=py36)
+            res.assert_success()
+
+            stdout, rc = run_simple_pex(pex_path, interpreter=PythonInterpreter.from_binary(py36))
+
+            assert rc == 0
+            assert stdout == b"hello\n"
+
+
 def test_pex_resource_bundling():
+    # type: () -> None
     with temporary_dir() as output_dir:
         with temporary_dir() as input_dir, temporary_dir() as resources_input_dir:
             with open(os.path.join(resources_input_dir, "greeting"), "w") as fh:
@@ -1151,6 +1236,7 @@ def test_pex_resource_bundling():
 
 
 def test_entry_point_verification_3rdparty():
+    # type: () -> None
     with temporary_dir() as td:
         pex_out_path = os.path.join(td, "pex.pex")
         res = run_pex_command(
@@ -1160,6 +1246,7 @@ def test_entry_point_verification_3rdparty():
 
 
 def test_invalid_entry_point_verification_3rdparty():
+    # type: () -> None
     with temporary_dir() as td:
         pex_out_path = os.path.join(td, "pex.pex")
         res = run_pex_command(
@@ -1169,6 +1256,7 @@ def test_invalid_entry_point_verification_3rdparty():
 
 
 def test_multiplatform_entrypoint():
+    # type: () -> None
     with temporary_dir() as td:
         pex_out_path = os.path.join(td, "p537.pex")
         interpreter = ensure_python_interpreter(PY36)
@@ -1194,6 +1282,7 @@ def test_multiplatform_entrypoint():
 
 
 def test_pex_console_script_custom_setuptools_useable():
+    # type: () -> None
     setup_py = dedent(
         """
         from setuptools import setup
@@ -1242,6 +1331,7 @@ def test_pex_console_script_custom_setuptools_useable():
 
 @contextmanager
 def pex_with_no_entrypoints():
+    # type: () -> Iterator[Tuple[str, bytes, str]]
     with temporary_dir() as out:
         pex = os.path.join(out, "pex.pex")
         run_pex_command(["setuptools==36.2.7", "-o", pex])
@@ -1250,6 +1340,7 @@ def pex_with_no_entrypoints():
 
 
 def test_pex_interpreter_execute_custom_setuptools_useable():
+    # type: () -> None
     with pex_with_no_entrypoints() as (pex, test_script, out):
         script = os.path.join(out, "script.py")
         with open(script, "wb") as fp:
@@ -1259,12 +1350,14 @@ def test_pex_interpreter_execute_custom_setuptools_useable():
 
 
 def test_pex_interpreter_interact_custom_setuptools_useable():
+    # type: () -> None
     with pex_with_no_entrypoints() as (pex, test_script, _):
         stdout, rc = run_simple_pex(pex, env=make_env(PEX_VERBOSE=1), stdin=test_script)
         assert rc == 0, stdout
 
 
 def test_setup_python():
+    # type: () -> None
     interpreter = ensure_python_interpreter(PY27)
     with temporary_dir() as out:
         pex = os.path.join(out, "pex.pex")
@@ -1276,10 +1369,14 @@ def test_setup_python():
 
 
 def test_setup_interpreter_constraint():
+    # type: () -> None
     interpreter = ensure_python_interpreter(PY27)
     with temporary_dir() as out:
         pex = os.path.join(out, "pex.pex")
-        env = make_env(PEX_IGNORE_RCFILES="1", PATH=os.path.dirname(interpreter),)
+        env = make_env(
+            PEX_IGNORE_RCFILES="1",
+            PATH=os.path.dirname(interpreter),
+        )
         results = run_pex_command(
             [
                 "jsonschema==2.6.0",
@@ -1296,7 +1393,48 @@ def test_setup_interpreter_constraint():
         assert rc == 0
 
 
+def test_setup_python_path():
+    # type: () -> None
+    """Check that `--python-path` is used rather than the default $PATH."""
+    py27_interpreter_dir = os.path.dirname(ensure_python_interpreter(PY27))
+    py36_interpreter_dir = os.path.dirname(ensure_python_interpreter(PY36))
+    with temporary_dir() as out:
+        pex = os.path.join(out, "pex.pex")
+        # Even though we set $PATH="", we still expect for both interpreters to be used when
+        # building the PEX. Note that `more-itertools` has a distinct Py2 and Py3 wheel.
+        results = run_pex_command(
+            [
+                "more-itertools==5.0.0",
+                "--disable-cache",
+                "--interpreter-constraint=CPython=={}".format(PY27),
+                "--interpreter-constraint=CPython=={}".format(PY36),
+                "--python-path={}".format(
+                    os.pathsep.join([py27_interpreter_dir, py36_interpreter_dir])
+                ),
+                "-o",
+                pex,
+            ],
+            env=make_env(PEX_IGNORE_RCFILES="1", PATH=""),
+        )
+        results.assert_success()
+
+        py27_env = make_env(PEX_IGNORE_RCFILES="1", PATH=py27_interpreter_dir)
+        stdout, rc = run_simple_pex(
+            pex, env=py27_env, stdin=b"import more_itertools, sys; print(sys.version_info[:2])"
+        )
+        assert rc == 0
+        assert b"(2, 7)" in stdout
+
+        py36_env = make_env(PEX_IGNORE_RCFILES="1", PATH=py36_interpreter_dir)
+        stdout, rc = run_simple_pex(
+            pex, env=py36_env, stdin=b"import more_itertools, sys; print(sys.version_info[:2])"
+        )
+        assert rc == 0
+        assert b"(3, 6)" in stdout
+
+
 def test_setup_python_multiple_transitive_markers():
+    # type: () -> None
     py27_interpreter = ensure_python_interpreter(PY27)
     py36_interpreter = ensure_python_interpreter(PY36)
     with temporary_dir() as out:
@@ -1336,6 +1474,7 @@ def test_setup_python_multiple_transitive_markers():
 
 
 def test_setup_python_direct_markers():
+    # type: () -> None
     py36_interpreter = ensure_python_interpreter(PY36)
     with temporary_dir() as out:
         pex = os.path.join(out, "pex.pex")
@@ -1363,6 +1502,7 @@ def test_setup_python_direct_markers():
 
 
 def test_setup_python_multiple_direct_markers():
+    # type: () -> None
     py36_interpreter = ensure_python_interpreter(PY36)
     py27_interpreter = ensure_python_interpreter(PY27)
     with temporary_dir() as out:
@@ -1399,6 +1539,7 @@ def test_setup_python_multiple_direct_markers():
 
 
 def test_force_local_implicit_ns_packages_issues_598():
+    # type: () -> None
     # This was a minimal repro for the issue documented in #598.
     with temporary_dir() as out:
         tcl_pex = os.path.join(out, "tcl.pex")
@@ -1420,6 +1561,7 @@ def test_force_local_implicit_ns_packages_issues_598():
     "again, until we can address this.",
 )
 def test_issues_661_devendoring_required():
+    # type: () -> None
     # The cryptography distribution does not have a whl released for python3 on linux at version 2.5.
     # As a result, we're forced to build it under python3 and, prior to the fix for
     # https://github.com/pantsbuild/pex/issues/661, this would fail using the vendored setuptools
@@ -1433,6 +1575,7 @@ def test_issues_661_devendoring_required():
 
 
 def build_and_execute_pex_with_warnings(*extra_build_args, **extra_runtime_env):
+    # type: (*str, **str) -> bytes
     with temporary_dir() as out:
         tcl_pex = os.path.join(out, "tcl.pex")
         run_pex_command(["twitter.common.lang==0.3.10", "-o", tcl_pex] + list(extra_build_args))
@@ -1446,26 +1589,31 @@ def build_and_execute_pex_with_warnings(*extra_build_args, **extra_runtime_env):
 
 
 def test_emit_warnings_default():
+    # type: () -> None
     stderr = build_and_execute_pex_with_warnings()
     assert stderr
 
 
 def test_no_emit_warnings():
+    # type: () -> None
     stderr = build_and_execute_pex_with_warnings("--no-emit-warnings")
     assert not stderr
 
 
 def test_no_emit_warnings_emit_env_override():
+    # type: () -> None
     stderr = build_and_execute_pex_with_warnings("--no-emit-warnings", PEX_EMIT_WARNINGS="true")
     assert stderr
 
 
 def test_no_emit_warnings_verbose_override():
+    # type: () -> None
     stderr = build_and_execute_pex_with_warnings("--no-emit-warnings", PEX_VERBOSE="1")
     assert stderr
 
 
 def test_undeclared_setuptools_import_on_pex_path():
+    # type: () -> None
     """Test that packages which access pkg_resources at import time can be found with pkg_resources.
 
     See https://github.com/pantsbuild/pex/issues/729 for context. We warn when a package accesses
@@ -1510,6 +1658,7 @@ def test_undeclared_setuptools_import_on_pex_path():
 
 
 def test_pkg_resource_early_import_on_pex_path():
+    # type: () -> None
     """Test that packages which access pkg_resources at import time can be found with pkg_resources.
 
     See https://github.com/pantsbuild/pex/issues/749 for context. We only declare namespace packages
@@ -1562,6 +1711,7 @@ def test_pkg_resource_early_import_on_pex_path():
     "available.",
 )
 def test_issues_539_abi3_resolution():
+    # type: () -> None
     # The cryptography team releases the following relevant pre-built wheels for version 2.6.1:
     # cryptography-2.6.1-cp27-cp27m-macosx_10_6_intel.whl
     # cryptography-2.6.1-cp27-cp27m-manylinux1_x86_64.whl
@@ -1594,6 +1744,7 @@ def test_issues_539_abi3_resolution():
 
 
 def assert_reproducible_build(args):
+    # type: (List[str]) -> None
     with temporary_dir() as td:
         pex1 = os.path.join(td, "1.pex")
         pex2 = os.path.join(td, "2.pex")
@@ -1619,33 +1770,38 @@ def assert_reproducible_build(args):
             zf1.extractall(path=unzipped1)
             zf2.extractall(path=unzipped2)
             for member1, member2 in zip(sorted(zf1.namelist()), sorted(zf2.namelist())):
-                assert filecmp.cmp(
-                    os.path.join(unzipped1, member1),
-                    os.path.join(unzipped2, member2),
-                    shallow=False,
-                )
+                member1_path = os.path.join(unzipped1, member1)
+                if os.path.isdir(member1_path):
+                    continue
+                member2_path = os.path.join(unzipped2, member2)
+                assert filecmp.cmp(member1_path, member2_path, shallow=False)
         # Then compare the original .pex files. This is the assertion we truly care about.
         assert filecmp.cmp(pex1, pex2, shallow=False)
 
 
 def test_reproducible_build_no_args():
+    # type: () -> None
     assert_reproducible_build([])
 
 
 def test_reproducible_build_bdist_requirements():
+    # type: () -> None
     # We test both a pure Python wheel (six) and a platform-specific wheel (cryptography).
     assert_reproducible_build(["six==1.12.0", "cryptography==2.6.1"])
 
 
 def test_reproducible_build_sdist_requirements():
+    # type: () -> None
     assert_reproducible_build(["pycparser==2.19", "--no-wheel"])
 
 
 def test_reproducible_build_m_flag():
+    # type: () -> None
     assert_reproducible_build(["-m", "pydoc"])
 
 
 def test_reproducible_build_c_flag_from_source():
+    # type: () -> None
     setup_py = dedent(
         """\
         from setuptools import setup
@@ -1667,18 +1823,22 @@ def test_reproducible_build_c_flag_from_source():
 
 
 def test_reproducible_build_c_flag_from_dependency():
+    # type: () -> None
     assert_reproducible_build(["future==0.17.1", "-c", "futurize"])
 
 
 def test_reproducible_build_python_flag():
+    # type: () -> None
     assert_reproducible_build(["--python=python2.7"])
 
 
 def test_reproducible_build_python_shebang_flag():
+    # type: () -> None
     assert_reproducible_build(["--python-shebang=/usr/bin/python"])
 
 
 def test_issues_736_requirement_setup_py_with_extras():
+    # type: () -> None
     with make_source_dir(
         name="project1", version="1.0.0", extras_require={"foo": ["project2"]}
     ) as project1_dir:
@@ -1704,13 +1864,13 @@ def test_issues_736_requirement_setup_py_with_extras():
 
 
 def _assert_exec_chain(
-    exec_chain=None,
-    pex_python=None,
-    pex_python_path=None,
-    interpreter_constraints=None,
-    pythonpath=None,
+    exec_chain=None,  # type: Optional[List[str]]
+    pex_python=None,  # type: Optional[str]
+    pex_python_path=None,  # type: Optional[Iterable[str]]
+    interpreter_constraints=None,  # type: Optional[Iterable[str]]
+    pythonpath=None,  # type: Optional[Iterable[str]]
 ):
-
+    # type: (...) -> None
     with temporary_dir() as td:
         test_pex = os.path.join(td, "test.pex")
 
@@ -1719,9 +1879,10 @@ def _assert_exec_chain(
             args.extend("--interpreter-constraint={}".format(ic) for ic in interpreter_constraints)
 
         env = os.environ.copy()
-        PATH = env.get("PATH").split(os.pathsep)
+        PATH = env["PATH"].split(os.pathsep)
 
         def add_to_path(entry):
+            # type: (str) -> None
             if os.path.isfile(entry):
                 entry = os.path.dirname(entry)
             PATH.append(entry)
@@ -1744,9 +1905,10 @@ def _assert_exec_chain(
             PYTHONPATH=os.pathsep.join(pythonpath) if pythonpath else None,
         )
 
+        initial_interpreter = PythonInterpreter.get()
         output = subprocess.check_output(
             [
-                sys.executable,
+                initial_interpreter.binary,
                 test_pex,
                 "-c",
                 "import json, os; print(json.dumps(os.environ.copy()))",
@@ -1759,33 +1921,53 @@ def _assert_exec_chain(
         assert "PEX_PYTHON_PATH" not in final_env
         assert "_PEX_SHOULD_EXIT_BOOTSTRAP_REEXEC" not in final_env
 
-        expected_exec_chain = [os.path.realpath(i) for i in [sys.executable] + (exec_chain or [])]
-        assert expected_exec_chain == final_env["_PEX_EXEC_CHAIN"].split(os.pathsep)
+        expected_exec_interpreters = [initial_interpreter]
+        if exec_chain:
+            expected_exec_interpreters.extend(PythonInterpreter.from_binary(b) for b in exec_chain)
+        final_interpreter = expected_exec_interpreters[-1]
+        if final_interpreter.is_venv:
+            # If the last interpreter in the chain is in a virtual environment, it should be fully
+            # resolved and re-exec'd against in order to escape the virtual environment since we're
+            # not setting PEX_INHERIT_PATH in these tests.
+            resolved = final_interpreter.resolve_base_interpreter()
+            if exec_chain:
+                # There is already an expected reason to re-exec; so no extra exec step is needed.
+                expected_exec_interpreters[-1] = resolved
+            else:
+                # The expected exec chain is just the initial_interpreter, but it turned out to be a
+                # venv which forces a re-exec.
+                expected_exec_interpreters.append(resolved)
+        expected_exec_chain = [i.binary for i in expected_exec_interpreters]
+        actual_exec_chain = final_env["_PEX_EXEC_CHAIN"].split(os.pathsep)
+        assert expected_exec_chain == actual_exec_chain
 
 
 def test_pex_no_reexec_no_constraints():
+    # type: () -> None
     _assert_exec_chain()
 
 
 def test_pex_reexec_no_constraints_pythonpath_present():
-    _assert_exec_chain(exec_chain=[os.path.realpath(sys.executable)], pythonpath=["."])
+    # type: () -> None
+    _assert_exec_chain(exec_chain=[sys.executable], pythonpath=["."])
 
 
 def test_pex_no_reexec_constraints_match_current():
-    current_version = ".".join(str(component) for component in sys.version_info[0:3])
-    _assert_exec_chain(interpreter_constraints=["=={}".format(current_version)])
+    # type: () -> None
+    _assert_exec_chain(interpreter_constraints=[PythonInterpreter.get().identity.requirement])
 
 
 def test_pex_reexec_constraints_match_current_pythonpath_present():
-    current_version = ".".join(str(component) for component in sys.version_info[0:3])
+    # type: () -> None
     _assert_exec_chain(
-        exec_chain=[os.path.realpath(sys.executable)],
+        exec_chain=[sys.executable],
         pythonpath=["."],
-        interpreter_constraints=["=={}".format(current_version)],
+        interpreter_constraints=[PythonInterpreter.get().identity.requirement],
     )
 
 
 def test_pex_reexec_constraints_dont_match_current_pex_python_path():
+    # type: () -> None
     py36_interpreter = ensure_python_interpreter(PY36)
     py27_interpreter = ensure_python_interpreter(PY27)
     _assert_exec_chain(
@@ -1796,6 +1978,7 @@ def test_pex_reexec_constraints_dont_match_current_pex_python_path():
 
 
 def test_pex_reexec_constraints_dont_match_current_pex_python_path_min_py_version_selected():
+    # type: () -> None
     py36_interpreter = ensure_python_interpreter(PY36)
     py27_interpreter = ensure_python_interpreter(PY27)
     _assert_exec_chain(
@@ -1804,6 +1987,7 @@ def test_pex_reexec_constraints_dont_match_current_pex_python_path_min_py_versio
 
 
 def test_pex_reexec_constraints_dont_match_current_pex_python():
+    # type: () -> None
     version = PY27 if sys.version_info[0:2] == (3, 6) else PY36
     interpreter = ensure_python_interpreter(version)
     _assert_exec_chain(
@@ -1814,20 +1998,21 @@ def test_pex_reexec_constraints_dont_match_current_pex_python():
 
 
 def test_issues_745_extras_isolation():
+    # type: () -> None
     # Here we ensure one of our extras, `subprocess32`, is properly isolated in the transition from
     # pex bootstrapping where it is imported by `pex.executor` to execution of user code.
-    python, pip = ensure_python_distribution(PY27)
+    python, pip = ensure_python_venv(PY27)
     subprocess.check_call([pip, "install", "subprocess32"])
     with temporary_dir() as td:
         src_dir = os.path.join(td, "src")
         with safe_open(os.path.join(src_dir, "test_issues_745.py"), "w") as fp:
             fp.write(
                 dedent(
-                    """
+                    """\
                     import subprocess32
 
                     print(subprocess32.__file__)
-      """
+                    """
                 )
             )
 
@@ -1868,7 +2053,63 @@ def test_issues_745_extras_isolation():
         assert subprocess32_location.startswith(pex_root)
 
 
+@pytest.fixture
+def issues_1025_pth():
+    def safe_rm(path):
+        try:
+            os.unlink(path)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+
+    cleanups = []
+
+    def write_pth(pth_path, sitedir):
+        cleanups.append(lambda: safe_rm(pth_path))
+        with open(pth_path, "w") as fp:
+            fp.write("import site; site.addsitedir({!r})\n".format(sitedir))
+
+    try:
+        yield write_pth
+    finally:
+        for cleanup in cleanups:
+            cleanup()
+
+
+def test_issues_1025_extras_isolation(issues_1025_pth):
+    python, pip = ensure_python_venv(PY36)
+    interpreter = PythonInterpreter.from_binary(python)
+    _, stdout, _ = interpreter.execute(args=["-c", "import site; print(site.getsitepackages()[0])"])
+    with temporary_dir() as tmpdir:
+        sitedir = os.path.join(tmpdir, "sitedir")
+        Executor.execute(cmd=[pip, "install", "--target", sitedir, "ansicolors==1.1.8"])
+
+        pth_path = os.path.join(stdout.strip(), "issues_1025.{}.pth".format(uuid.uuid4().hex))
+        issues_1025_pth(pth_path, sitedir)
+
+        pex_file = os.path.join(tmpdir, "isolated.pex")
+        results = run_pex_command(args=["-o", pex_file], python=python)
+        results.assert_success()
+
+        output, returncode = run_simple_pex(
+            pex_file,
+            args=["-c", "import colors"],
+            interpreter=interpreter,
+            env=make_env(PEX_VERBOSE="9"),
+        )
+        assert returncode != 0, output
+
+        output, returncode = run_simple_pex(
+            pex_file,
+            args=["-c", "import colors"],
+            interpreter=interpreter,
+            env=make_env(PEX_VERBOSE="9", PEX_INHERIT_PATH="fallback"),
+        )
+        assert returncode == 0, output
+
+
 def test_trusted_host_handling():
+    # type: () -> None
     python = ensure_python_interpreter(PY27)
     # Since we explicitly ask Pex to find links at http://www.antlr3.org/download/Python, it should
     # implicitly trust the www.antlr3.org host.
@@ -1886,6 +2127,7 @@ def test_trusted_host_handling():
 
 
 def test_issues_898():
+    # type: () -> None
     python27 = ensure_python_interpreter(PY27)
     python36 = ensure_python_interpreter(PY36)
     with temporary_dir() as td:
@@ -1926,6 +2168,7 @@ def test_issues_898():
 
 
 def test_pex_run_strip_env():
+    # type: () -> None
     with temporary_dir() as td:
         src_dir = os.path.join(td, "src")
         with safe_open(os.path.join(src_dir, "print_pex_env.py"), "w") as fp:
@@ -1954,7 +2197,7 @@ def test_pex_run_strip_env():
         )
         results.assert_success()
         assert {} == json.loads(
-            subprocess.check_output([stripped_pex_file], env=env)
+            subprocess.check_output([stripped_pex_file], env=env).decode("utf-8")
         ), "Expected the entrypoint environment to be stripped of PEX_ environment variables."
 
         unstripped_pex_file = os.path.join(td, "unstripped.pex")
@@ -1969,15 +2212,16 @@ def test_pex_run_strip_env():
         )
         results.assert_success()
         assert pex_env == json.loads(
-            subprocess.check_output([unstripped_pex_file], env=env)
+            subprocess.check_output([unstripped_pex_file], env=env).decode("utf-8")
         ), "Expected the entrypoint environment to be left un-stripped."
 
 
-def iter_distributions(pex_root, project_name=None):
+def iter_distributions(pex_root, project_name):
+    # type: (str, str) -> Iterator[pkg_resources.Distribution]
     found = set()
     for root, dirs, _ in os.walk(pex_root):
         for d in dirs:
-            if project_name and not d.startswith(project_name):
+            if not d.startswith(project_name):
                 continue
             if not d.endswith(".whl"):
                 continue
@@ -1985,12 +2229,14 @@ def iter_distributions(pex_root, project_name=None):
             if wheel_path in found:
                 continue
             dist = DistributionHelper.distribution_from_path(wheel_path)
+            assert dist is not None
             if dist.project_name == project_name:
                 found.add(wheel_path)
                 yield dist
 
 
 def test_pex_cache_dir_and_pex_root():
+    # type: () -> None
     python = ensure_python_interpreter(PY36)
     with temporary_dir() as td:
         cache_dir = os.path.join(td, "cache_dir")
@@ -2020,6 +2266,7 @@ def test_pex_cache_dir_and_pex_root():
 
 
 def test_disable_cache():
+    # type: () -> None
     python = ensure_python_interpreter(PY36)
     with temporary_dir() as td:
         pex_root = os.path.join(td, "pex_root")
@@ -2034,6 +2281,7 @@ def test_disable_cache():
 
 
 def test_unzip_mode():
+    # type: () -> None
     with temporary_dir() as td:
         pex_root = os.path.join(td, "pex_root")
         pex_file = os.path.join(td, "pex_file")
@@ -2072,7 +2320,9 @@ def test_unzip_mode():
             ]
         ).assert_success()
 
-        output1 = subprocess.check_output(args=[pex_file, "quit", "re-exec"],)
+        output1 = subprocess.check_output(
+            args=[pex_file, "quit", "re-exec"],
+        )
         assert ["quit re-exec", os.path.realpath(pex_file)] == output1.decode("utf-8").splitlines()
 
         unzipped_cache = os.path.join(pex_root, pex_builder.UNZIPPED_DIR)
@@ -2087,11 +2337,13 @@ def test_unzip_mode():
 
 
 def test_issues_996():
+    # type: () -> None
     python27 = ensure_python_interpreter(PY27)
     python36 = ensure_python_interpreter(PY36)
     pex_python_path = os.pathsep.join((python27, python36))
 
     def create_platform_pex(args):
+        # type: (List[str]) -> IntegResults
         return run_pex_command(
             args=["--platform", str(PythonInterpreter.from_binary(python36).platform)] + args,
             python=python27,
@@ -2121,3 +2373,261 @@ def test_issues_996():
         )
         assert 0 == returncode
         assert int(output.strip()) >= multiprocessing.cpu_count()
+
+
+@pytest.fixture
+def tmp_workdir():
+    # type: () -> Iterator[str]
+    cwd = os.getcwd()
+    with temporary_dir() as tmpdir:
+        os.chdir(tmpdir)
+        try:
+            yield os.path.realpath(tmpdir)
+        finally:
+            os.chdir(cwd)
+
+
+def test_tmpdir_absolute(tmp_workdir):
+    # type: (str) -> None
+    result = run_pex_command(
+        args=[
+            "--tmpdir",
+            ".",
+            "--",
+            "-c",
+            dedent(
+                """\
+                import os
+                import tempfile
+                
+                print(os.environ["TMPDIR"])
+                print(tempfile.gettempdir())
+                """
+            ),
+        ]
+    )
+    result.assert_success()
+    assert [tmp_workdir, tmp_workdir] == result.output.strip().splitlines()
+
+
+def test_tmpdir_dne(tmp_workdir):
+    # type: (str) -> None
+    tmpdir_dne = os.path.join(tmp_workdir, ".tmp")
+    result = run_pex_command(args=["--tmpdir", ".tmp", "--", "-c", ""])
+    result.assert_failure()
+    assert tmpdir_dne in result.error
+    assert "does not exist" in result.error
+
+
+def test_tmpdir_file(tmp_workdir):
+    # type: (str) -> None
+    tmpdir_file = os.path.join(tmp_workdir, ".tmp")
+    touch(tmpdir_file)
+    result = run_pex_command(args=["--tmpdir", ".tmp", "--", "-c", ""])
+    result.assert_failure()
+    assert tmpdir_file in result.error
+    assert "is not a directory" in result.error
+
+
+def test_resolve_arbitrary_equality_issues_940():
+    # type: () -> None
+    with temporary_dir() as tmpdir, built_wheel(
+        name="foo",
+        version="1.0.2-fba4511",
+        python_requires=">=2.7,<=3.9,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*",
+    ) as whl:
+        pex_file = os.path.join(tmpdir, "pex")
+        results = run_pex_command(args=["-o", pex_file, whl])
+        results.assert_success()
+
+        stdout, returncode = run_simple_pex(pex_file, args=["-c", "import foo"])
+        assert returncode == 0
+        assert stdout == b""
+
+
+def test_resolve_python_requires_full_version_issues_1017():
+    # type: () -> None
+    python36 = ensure_python_interpreter(PY36)
+    result = run_pex_command(
+        python=python36,
+        args=[
+            "pandas==1.0.5",
+            "--",
+            "-c",
+            "import pandas; print(pandas._version.get_versions()['version'])",
+        ],
+        quiet=True,
+    )
+    result.assert_success()
+    assert "1.0.5" == result.output.strip()
+
+
+@pytest.fixture(scope="module")
+def mitmdump():
+    # type: () -> Tuple[str, str]
+    python, pip = ensure_python_venv(PY36)
+    subprocess.check_call([pip, "install", "mitmproxy==5.3.0"])
+    mitmdump = os.path.join(os.path.dirname(python), "mitmdump")
+    return mitmdump, os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+
+
+@pytest.fixture
+def run_proxy(mitmdump, tmp_workdir):
+    # type: (Tuple[str, str], str) -> Callable[[Optional[str]], ContextManager[Tuple[int, str]]]
+    messages = os.path.join(tmp_workdir, "messages")
+    addon = os.path.join(tmp_workdir, "addon.py")
+    with open(addon, "w") as fp:
+        fp.write(
+            dedent(
+                """\
+                from mitmproxy import ctx
+        
+                class NotifyUp:
+                    def running(self) -> None:
+                        port = ctx.master.server.address[1]
+                        with open({msg_channel!r}, "w") as fp:
+                            print(str(port), file=fp)
+        
+                addons = [NotifyUp()]
+                """.format(
+                    msg_channel=messages
+                )
+            )
+        )
+
+    @contextmanager
+    def _run_proxy(
+        proxy_auth=None,  # type: Optional[str]
+    ):
+        # type: (...) -> Iterator[Tuple[int, str]]
+        os.mkfifo(messages)
+        proxy, ca_cert = mitmdump
+        args = [proxy, "-p", "0", "-s", addon]
+        if proxy_auth:
+            args.extend(["--proxyauth", proxy_auth])
+        proxy_process = subprocess.Popen(args)
+        try:
+            with open(messages, "r") as fp:
+                port = int(fp.readline().strip())
+                yield port, ca_cert
+        finally:
+            proxy_process.kill()
+            os.unlink(messages)
+
+    return _run_proxy
+
+
+def test_requirements_network_configuration(run_proxy, tmp_workdir):
+    # type: (Callable[[Optional[str]], ContextManager[Tuple[int, str]]], str) -> None
+    requirements_file = os.path.join(tmp_workdir, "requirements.txt")
+    requirements_url = (
+        "https://raw.githubusercontent.com/pantsbuild/example-python/"
+        "2a6f66ce8a4557d4867b39accfca171d7262bb76"
+        "/requirements.txt"
+    )
+    with open(requirements_file, "w") as fp:
+        fp.write("-r {}".format(requirements_url))
+
+    def line(
+        contents,  # type: str
+        line_no,  # type: int
+    ):
+        # type: (...) -> LogicalLine
+        return LogicalLine(
+            "{}\n".format(contents),
+            contents,
+            source=requirements_url,
+            start_line=line_no,
+            end_line=line_no,
+        )
+
+    proxy_auth = "jake:jones"
+    with run_proxy(proxy_auth) as (port, ca_cert):
+        reqs = parse_requirement_file(
+            requirements_file,
+            fetcher=URLFetcher(
+                NetworkConfiguration.create(
+                    proxy="{proxy_auth}@localhost:{port}".format(proxy_auth=proxy_auth, port=port),
+                    cert=ca_cert,
+                )
+            ),
+        )
+        assert [
+            ReqInfo.create(line=line("ansicolors>=1.0.2", 4), project_name="ansicolors"),
+            ReqInfo.create(line=line("setuptools>=42.0.0", 5), project_name="setuptools"),
+            ReqInfo.create(line=line("translate>=3.2.1", 6), project_name="translate"),
+            ReqInfo.create(line=line("protobuf>=3.11.3", 7), project_name="protobuf"),
+        ] == list(reqs)
+
+
+@pytest.mark.parametrize(
+    "py_version",
+    [
+        pytest.param(PY27, id="virtualenv-16.7.10"),
+        pytest.param(PY36, id="pyvenv"),
+    ],
+)
+def test_issues_1031(py_version):
+    # type: (str) -> None
+    system_site_packages_venv, _ = ensure_python_venv(
+        py_version, latest_pip=False, system_site_packages=True
+    )
+    standard_venv, _ = ensure_python_venv(py_version, latest_pip=False, system_site_packages=False)
+
+    print_sys_path_code = "import os, sys; print('\\n'.join(map(os.path.realpath, sys.path)))"
+
+    def get_sys_path(python):
+        # type: (str) -> MutableSet[str]
+        _, stdout, _ = PythonInterpreter.from_binary(python).execute(
+            args=["-c", print_sys_path_code]
+        )
+        return OrderedSet(stdout.strip().splitlines())
+
+    system_site_packages_venv_sys_path = get_sys_path(system_site_packages_venv)
+    standard_venv_sys_path = get_sys_path(standard_venv)
+
+    def venv_dir(python):
+        # type: (str) -> str
+        bin_dir = os.path.dirname(python)
+        venv_dir = os.path.dirname(bin_dir)
+        return os.path.realpath(venv_dir)
+
+    system_site_packages = {
+        p
+        for p in (system_site_packages_venv_sys_path - standard_venv_sys_path)
+        if not p.startswith((venv_dir(system_site_packages_venv), venv_dir(standard_venv)))
+    }
+    assert len(system_site_packages) == 1, (
+        "system_site_packages_venv_sys_path:\n"
+        "\t{}\n"
+        "standard_venv_sys_path:\n"
+        "\t{}\n"
+        "difference:\n"
+        "\t{}".format(
+            "\n\t".join(system_site_packages_venv_sys_path),
+            "\n\t".join(standard_venv_sys_path),
+            "\n\t".join(system_site_packages),
+        )
+    )
+    system_site_packages_path = system_site_packages.pop()
+
+    def get_system_site_packages_pex_sys_path(**env):
+        # type: (**Any) -> MutableSet[str]
+        output, returncode = run_simple_pex_test(
+            body=print_sys_path_code,
+            interpreter=PythonInterpreter.from_binary(system_site_packages_venv),
+            env=make_env(**env),
+        )
+        assert returncode == 0
+        return OrderedSet(output.decode("utf-8").strip().splitlines())
+
+    assert system_site_packages_path not in get_system_site_packages_pex_sys_path()
+    assert system_site_packages_path not in get_system_site_packages_pex_sys_path(
+        PEX_INHERIT_PATH="false"
+    )
+    assert system_site_packages_path in get_system_site_packages_pex_sys_path(
+        PEX_INHERIT_PATH="prefer"
+    )
+    assert system_site_packages_path in get_system_site_packages_pex_sys_path(
+        PEX_INHERIT_PATH="fallback"
+    )

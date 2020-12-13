@@ -6,6 +6,7 @@ from __future__ import absolute_import
 import logging
 import os
 
+from pex import pex_warnings
 from pex.common import Chroot, chmod_plus_x, open_zip, safe_mkdir, safe_mkdtemp, temporary_dir
 from pex.compatibility import to_bytes
 from pex.compiler import Compiler
@@ -46,7 +47,7 @@ def __maybe_run_unzipped__(pex_zip):
     with open(pex_zip, 'rb') as fp:
       hasher.update(fp.read())
   unzip_to = os.path.join(pex_info.pex_root, {unzipped_dir!r}, hasher.hexdigest())
-  with atomic_directory(unzip_to) as chroot:
+  with atomic_directory(unzip_to, exclusive=True) as chroot:
     if chroot:
       with TRACER.timed('Extracting {{}} to {{}}'.format(pex_zip, unzip_to)):
         with open_zip(pex_zip) as zip:
@@ -115,7 +116,14 @@ class PEXBuilder(object):
         pass
 
     def __init__(
-        self, path=None, interpreter=None, chroot=None, pex_info=None, preamble=None, copy=False
+        self,
+        path=None,
+        interpreter=None,
+        chroot=None,
+        pex_info=None,
+        preamble=None,
+        copy=False,
+        include_tools=False,
     ):
         """Initialize a pex builder.
 
@@ -130,6 +138,8 @@ class PEXBuilder(object):
         :type preamble: str
         :keyword copy: If False, attempt to create the pex environment via hard-linking, falling
                        back to copying across devices. If True, always copy.
+        :keyword include_tools: If True, include runtime tools which can be executed by exporting
+                                `PEX_TOOLS=1`.
 
         .. versionchanged:: 0.8
           The temporary directory created when ``path`` is not specified is now garbage collected on
@@ -140,6 +150,7 @@ class PEXBuilder(object):
         self._pex_info = pex_info or PexInfo.default(self._interpreter)
         self._preamble = preamble or ""
         self._copy = copy
+        self._include_tools = include_tools
 
         self._shebang = self._interpreter.identity.hashbang()
         self._logger = logging.getLogger(__name__)
@@ -215,6 +226,10 @@ class PEXBuilder(object):
         :param env_filename: The destination filename in the PEX.  This path
           must be a relative path.
         """
+        pex_warnings.warn(
+            "The `add_resource` method is deprecated. Resources should be added via the "
+            "`add_source` method instead."
+        )
         self._ensure_unfrozen("Adding a resource")
         self._copy_or_link(filename, env_filename, "resource")
 
@@ -440,9 +455,7 @@ class PEXBuilder(object):
             self._chroot.touch(compiled, label="bytecode")
 
     def _prepare_manifest(self):
-        self._chroot.write(
-            self._pex_info.dump(sort_keys=True).encode("utf-8"), PexInfo.PATH, label="manifest"
-        )
+        self._chroot.write(self._pex_info.dump().encode("utf-8"), PexInfo.PATH, label="manifest")
 
     def _prepare_main(self):
         self._chroot.write(
@@ -475,9 +488,13 @@ class PEXBuilder(object):
         if not isinstance(provider, DefaultProvider):
             mod = __import__(source_name, fromlist=["ignore"])
             provider = ZipProvider(mod)
-        for package in ("", "third_party"):
+
+        bootstrap_packages = ["", "third_party"]
+        if self._include_tools:
+            bootstrap_packages.extend(["tools", "tools/commands"])
+        for package in bootstrap_packages:
             for fn in provider.resource_listdir(package):
-                if fn.endswith(".py"):
+                if not (provider.resource_isdir(os.path.join(package, fn)) or fn.endswith(".pyc")):
                     rel_path = os.path.join(package, fn)
                     self._chroot.write(
                         provider.get_resource_string(source_name, rel_path),
