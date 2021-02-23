@@ -1,8 +1,8 @@
 ***
 PEX
 ***
-.. image:: https://travis-ci.org/pantsbuild/pex.svg?branch=master
-    :target: https://travis-ci.org/pantsbuild/pex
+.. image:: https://github.com/pantsbuild/pex/workflows/CI/badge.svg?branch=master
+    :target: https://github.com/pantsbuild/pex/actions?query=branch%3Amaster+workflow%3ACI
 .. image:: https://img.shields.io/pypi/l/pex.svg
     :target: https://pypi.org/project/pex/
 .. image:: https://img.shields.io/pypi/v/pex.svg

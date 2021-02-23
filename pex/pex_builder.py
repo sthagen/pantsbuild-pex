@@ -3,11 +3,12 @@
 
 from __future__ import absolute_import
 
+import hashlib
 import logging
 import os
 
 from pex import pex_warnings
-from pex.common import Chroot, chmod_plus_x, open_zip, safe_mkdir, safe_mkdtemp, temporary_dir
+from pex.common import Chroot, chmod_plus_x, open_zip, safe_mkdtemp, safe_open, temporary_dir
 from pex.compatibility import to_bytes
 from pex.compiler import Compiler
 from pex.distribution_target import DistributionTarget
@@ -15,38 +16,57 @@ from pex.finders import get_entry_point_from_console_script, get_script_from_dis
 from pex.interpreter import PythonInterpreter
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
-from pex.third_party.pkg_resources import DefaultProvider, ZipProvider, get_provider
+from pex.third_party.pkg_resources import DefaultProvider, Distribution, ZipProvider, get_provider
 from pex.tracer import TRACER
+from pex.typing import TYPE_CHECKING
 from pex.util import CacheHelper, DistributionHelper
+
+if TYPE_CHECKING:
+    from typing import Optional, Dict
+
+
+class CopyMode(object):
+    class Value(object):
+        def __init__(self, value):
+            # type: (str) -> None
+            self.value = value
+
+        def __repr__(self):
+            # type: () -> str
+            return repr(self.value)
+
+    COPY = Value("copy")
+    LINK = Value("link")
+    SYMLINK = Value("symlink")
+
+    values = COPY, LINK, SYMLINK
+
+    @classmethod
+    def for_value(cls, value):
+        # type: (str) -> CopyMode.Value
+        for v in cls.values:
+            if v.value == value:
+                return v
+        raise ValueError(
+            "{!r} of type {} must be one of {}".format(
+                value, type(value), ", ".join(map(repr, cls.values))
+            )
+        )
+
 
 BOOTSTRAP_DIR = ".bootstrap"
 
-LEGACY_BOOSTRAP_PKG = "_pex"
-
-UNZIPPED_DIR = "unzipped_pexes"
-
-BOOTSTRAP_ENVIRONMENT = """
+BOOTSTRAP_ENVIRONMENT = """\
 import os
 import sys
 
 
 def __maybe_run_unzipped__(pex_zip):
-  from pex.pex_info import PexInfo
-  pex_info = PexInfo.from_pex(pex_zip)
-  pex_info.update(PexInfo.from_env())
-  if not pex_info.unzip:
-    return
-
-  import hashlib
   from pex.common import atomic_directory, open_zip
   from pex.tracer import TRACER
-  from pex.variables import ENV
+  from pex.variables import unzip_dir
 
-  with TRACER.timed('Checking extraction for {{}}'.format(pex_zip)):
-    hasher = hashlib.sha1()
-    with open(pex_zip, 'rb') as fp:
-      hasher.update(fp.read())
-  unzip_to = os.path.join(pex_info.pex_root, {unzipped_dir!r}, hasher.hexdigest())
+  unzip_to = unzip_dir({pex_root!r}, {pex_hash!r})
   with atomic_directory(unzip_to, exclusive=True) as chroot:
     if chroot:
       with TRACER.timed('Extracting {{}} to {{}}'.format(pex_zip, unzip_to)):
@@ -59,6 +79,28 @@ def __maybe_run_unzipped__(pex_zip):
   os.environ['__PEX_EXE__'] = pex_zip
 
   os.execv(sys.executable, [sys.executable, unzip_to] + sys.argv[1:])
+
+
+def __maybe_run_venv__(pex):
+  from pex.common import is_exe
+  from pex.tracer import TRACER
+  from pex.variables import venv_dir
+
+  venv_home = venv_dir(
+    {pex_root!r}, {pex_hash!r}, {interpreter_constraints!r}, pex_path={pex_path!r}
+  )
+  venv_pex = os.path.join(venv_home, 'pex')
+  if not is_exe(venv_pex):
+    # Code in bootstrap_pex will (re)create the venv after selecting the correct interpreter. 
+    return
+
+  TRACER.log('Executing pex venv for {{}} at {{}}'.format(pex, venv_pex))
+  
+  # N.B.: This is read by pex.PEX and used to point sys.argv[0] back to the original pex before
+  # unconditionally scrubbing the env var and handing off to user code.
+  os.environ['__PEX_EXE__'] = pex
+
+  os.execv(venv_pex, [venv_pex] + sys.argv[1:])
 
 
 __entry_point__ = None
@@ -78,23 +120,24 @@ if __entry_point__ is None:
 sys.path[0] = os.path.abspath(sys.path[0])
 sys.path.insert(0, os.path.abspath(os.path.join(__entry_point__, {bootstrap_dir!r})))
 
-import zipfile
-if zipfile.is_zipfile(__entry_point__):
-  __maybe_run_unzipped__(__entry_point__)
-
-from pex.third_party import VendorImporter
-VendorImporter.install(uninstallable=False,
-                       prefix={legacy_bootstrap_pkg!r},
-                       path_items=['pex'],
-                       warning='Runtime pex API access through the `{legacy_bootstrap_pkg}` '
-                               'package is deprecated and will be removed in pex 2.0.0. Please '
-                               'switch to the `pex` package for runtime API access.')
+from pex.variables import ENV, Variables
+if Variables.PEX_VENV.value_or(ENV, {is_venv!r}):
+  if not {is_venv!r}:
+    from pex.common import die
+    die(
+      "The PEX_VENV environment variable was set, but this PEX was not built with venv support "
+      "(Re-build the PEX file with `pex --venv ...`):"
+    )
+  if not ENV.PEX_TOOLS:  # We need to run from the PEX for access to tools.
+    __maybe_run_venv__(__entry_point__)
+elif Variables.PEX_UNZIP.value_or(ENV, {is_unzip!r}):
+  import zipfile
+  if zipfile.is_zipfile(__entry_point__):
+    __maybe_run_unzipped__(__entry_point__)
 
 from pex.pex_bootstrapper import bootstrap_pex
 bootstrap_pex(__entry_point__)
-""".format(
-    unzipped_dir=UNZIPPED_DIR, bootstrap_dir=BOOTSTRAP_DIR, legacy_bootstrap_pkg=LEGACY_BOOSTRAP_PKG
-)
+"""
 
 
 class PEXBuilder(object):
@@ -117,14 +160,15 @@ class PEXBuilder(object):
 
     def __init__(
         self,
-        path=None,
-        interpreter=None,
-        chroot=None,
-        pex_info=None,
-        preamble=None,
-        copy=False,
-        include_tools=False,
+        path=None,  # type: Optional[str]
+        interpreter=None,  # type: Optional[PythonInterpreter]
+        chroot=None,  # type: Optional[Chroot]
+        pex_info=None,  # type: Optional[PexInfo]
+        preamble=None,  # type: Optional[str]
+        copy_mode=CopyMode.LINK,  # type: CopyMode.Value
+        include_tools=False,  # type: bool
     ):
+        # type: (...) -> None
         """Initialize a pex builder.
 
         :keyword path: The path to write the PEX as it is built.  If ``None`` is specified,
@@ -135,9 +179,7 @@ class PEXBuilder(object):
         :keyword pex_info: A preexisting PexInfo to use to build the PEX.
         :keyword preamble: If supplied, execute this code prior to bootstrapping this PEX
           environment.
-        :type preamble: str
-        :keyword copy: If False, attempt to create the pex environment via hard-linking, falling
-                       back to copying across devices. If True, always copy.
+        :keyword copy_mode: Create the pex environment using the given copy mode.
         :keyword include_tools: If True, include runtime tools which can be executed by exporting
                                 `PEX_TOOLS=1`.
 
@@ -149,13 +191,13 @@ class PEXBuilder(object):
         self._chroot = chroot or Chroot(path or safe_mkdtemp())
         self._pex_info = pex_info or PexInfo.default(self._interpreter)
         self._preamble = preamble or ""
-        self._copy = copy
+        self._copy_mode = copy_mode
         self._include_tools = include_tools
 
         self._shebang = self._interpreter.identity.hashbang()
         self._logger = logging.getLogger(__name__)
         self._frozen = False
-        self._distributions = set()
+        self._distributions = {}  # type: Dict[str, Distribution]
 
     def _ensure_unfrozen(self, name="Operation"):
         if self._frozen:
@@ -187,7 +229,7 @@ class PEXBuilder(object):
             interpreter=self._interpreter,
             pex_info=self._pex_info.copy(),
             preamble=self._preamble,
-            copy=self._copy,
+            copy_mode=self._copy_mode,
         )
         clone.set_shebang(self._shebang)
         clone._distributions = self._distributions.copy()
@@ -319,14 +361,16 @@ class PEXBuilder(object):
         """
 
         # check if 'script' is a console_script
-        dist, entry_point = get_entry_point_from_console_script(script, self._distributions)
+        dist, entry_point = get_entry_point_from_console_script(
+            script, self._distributions.values()
+        )
         if entry_point:
             self.set_entry_point(entry_point)
             TRACER.log("Set entrypoint to console_script %r in %r" % (entry_point, dist))
             return
 
         # check if 'script' is an ordinary script
-        dist_script = get_script_from_distributions(script, self._distributions)
+        dist_script = get_script_from_distributions(script, self._distributions.values())
         if dist_script:
             if self._pex_info.entry_point:
                 raise self.InvalidExecutableSpecification(
@@ -338,7 +382,7 @@ class PEXBuilder(object):
 
         raise self.InvalidExecutableSpecification(
             "Could not find script %r in any distribution %s within PEX!"
-            % (script, ", ".join(str(d) for d in self._distributions))
+            % (script, ", ".join(str(d) for d in self._distributions.values()))
         )
 
     def set_entry_point(self, entry_point):
@@ -370,12 +414,16 @@ class PEXBuilder(object):
         self._shebang = "#!%s" % shebang if not shebang.startswith("#!") else shebang
 
     def _add_dist_dir(self, path, dist_name):
-        for root, _, files in os.walk(path):
-            for f in files:
-                filename = os.path.join(root, f)
-                relpath = os.path.relpath(filename, path)
-                target = os.path.join(self._pex_info.internal_cache, dist_name, relpath)
-                self._copy_or_link(filename, target)
+        target_dir = os.path.join(self._pex_info.internal_cache, dist_name)
+        if self._copy_mode == CopyMode.SYMLINK:
+            self._copy_or_link(path, target_dir)
+        else:
+            for root, _, files in os.walk(path):
+                for f in files:
+                    filename = os.path.join(root, f)
+                    relpath = os.path.relpath(filename, path)
+                    target = os.path.join(target_dir, relpath)
+                    self._copy_or_link(filename, target)
         return CacheHelper.dir_hash(path)
 
     def _add_dist_wheel_file(self, path, dist_name):
@@ -387,9 +435,6 @@ class PEXBuilder(object):
             ).wait()
             return self._add_dist_dir(install_dir, dist_name)
 
-    def _prepare_code_hash(self):
-        self._pex_info.code_hash = CacheHelper.pex_hash(self._chroot.path())
-
     def add_distribution(self, dist, dist_name=None):
         """Add a :class:`pkg_resources.Distribution` from its handle.
 
@@ -398,9 +443,14 @@ class PEXBuilder(object):
           this will be inferred from the distribution itself should it be formatted in a standard way.
         :type dist: :class:`pkg_resources.Distribution`
         """
+        if dist.location in self._distributions:
+            TRACER.log(
+                "Skipping adding {} - already added from {}".format(dist, dist.location), V=9
+            )
+            return
         self._ensure_unfrozen("Adding a distribution")
         dist_name = dist_name or os.path.basename(dist.location)
-        self._distributions.add(dist)
+        self._distributions[dist.location] = dist
 
         if os.path.isdir(dist.location):
             dist_hash = self._add_dist_dir(dist.location, dist_name)
@@ -447,6 +497,9 @@ class PEXBuilder(object):
             for label in ("source", "executable", "main", "bootstrap")
             for path in self._chroot.filesets.get(label, ())
             if path.endswith(".py")
+            # N.B.: This file if Python 3.6+ only and will not compile under Python 2.7 or
+            # Python 3.5. Since we don't actually use it we just skip compiling it.
+            and path != os.path.join(BOOTSTRAP_DIR, "pex/vendor/_vendored/attrs/attr/_next_gen.py")
         ]
 
         compiler = Compiler(self.interpreter)
@@ -454,19 +507,29 @@ class PEXBuilder(object):
         for compiled in compiled_relpaths:
             self._chroot.touch(compiled, label="bytecode")
 
-    def _prepare_manifest(self):
+    def _prepare_code(self):
+        self._pex_info.code_hash = CacheHelper.pex_code_hash(self._chroot.path())
+        self._pex_info.pex_hash = hashlib.sha1(self._pex_info.dump().encode("utf-8")).hexdigest()
         self._chroot.write(self._pex_info.dump().encode("utf-8"), PexInfo.PATH, label="manifest")
 
-    def _prepare_main(self):
-        self._chroot.write(
-            to_bytes(self._preamble + "\n" + BOOTSTRAP_ENVIRONMENT), "__main__.py", label="main"
+        bootstrap = BOOTSTRAP_ENVIRONMENT.format(
+            bootstrap_dir=BOOTSTRAP_DIR,
+            pex_root=self._pex_info.raw_pex_root,
+            pex_hash=self._pex_info.pex_hash,
+            interpreter_constraints=self._pex_info.interpreter_constraints,
+            pex_path=self._pex_info.pex_path,
+            is_unzip=self._pex_info.unzip,
+            is_venv=self._pex_info.venv,
         )
+        self._chroot.write(to_bytes(self._preamble + "\n" + bootstrap), "__main__.py", label="main")
 
     def _copy_or_link(self, src, dst, label=None):
         if src is None:
             self._chroot.touch(dst, label)
-        elif self._copy:
+        elif self._copy_mode == CopyMode.COPY:
             self._chroot.copy(src, dst, label)
+        elif self._copy_mode == CopyMode.SYMLINK:
+            self._chroot.symlink(src, dst, label)
         else:
             self._chroot.link(src, dst, label)
 
@@ -480,7 +543,7 @@ class PEXBuilder(object):
             # NB: We use pip here in the builder, but that's only at buildtime and
             # although we don't use pyparsing directly, packaging.markers, which we
             # do use at runtime, does.
-            root_module_names=["packaging", "pkg_resources", "pyparsing"],
+            root_module_names=["attr", "packaging", "pkg_resources", "pyparsing"],
         )
 
         source_name = "pex"
@@ -502,12 +565,6 @@ class PEXBuilder(object):
                         "bootstrap",
                     )
 
-        # Setup a re-director package to support the legacy pex runtime `_pex` APIs through a
-        # VendorImporter.
-        self._chroot.touch(
-            os.path.join(BOOTSTRAP_DIR, LEGACY_BOOSTRAP_PKG, "__init__.py"), "bootstrap"
-        )
-
     def freeze(self, bytecode_compile=True):
         """Freeze the PEX.
 
@@ -517,10 +574,8 @@ class PEXBuilder(object):
         only be called once and renders the PEXBuilder immutable.
         """
         self._ensure_unfrozen("Freezing the environment")
-        self._prepare_code_hash()
-        self._prepare_manifest()
         self._prepare_bootstrap()
-        self._prepare_main()
+        self._prepare_code()
         if bytecode_compile:
             self._precompile_source()
         self._frozen = True
@@ -537,21 +592,21 @@ class PEXBuilder(object):
         """
         if not self._frozen:
             self.freeze(bytecode_compile=bytecode_compile)
+        tmp_zip = filename + "~"
         try:
-            os.unlink(filename + "~")
+            os.unlink(tmp_zip)
             self._logger.warning(
-                "Previous binary unexpectedly exists, cleaning: %s" % (filename + "~")
+                "Previous binary unexpectedly exists, cleaning: {}".format(tmp_zip)
             )
         except OSError:
             # The expectation is that the file does not exist, so continue
             pass
-        if os.path.dirname(filename):
-            safe_mkdir(os.path.dirname(filename))
-        with open(filename + "~", "ab") as pexfile:
+        with safe_open(tmp_zip, "ab") as pexfile:
             assert os.path.getsize(pexfile.name) == 0
-            pexfile.write(to_bytes("%s\n" % self._shebang))
-        self._chroot.zip(filename + "~", mode="a", deterministic_timestamp=deterministic_timestamp)
+            pexfile.write(to_bytes("{}\n".format(self._shebang)))
+        with TRACER.timed("Zipping PEX file."):
+            self._chroot.zip(tmp_zip, mode="a", deterministic_timestamp=deterministic_timestamp)
         if os.path.exists(filename):
             os.unlink(filename)
-        os.rename(filename + "~", filename)
+        os.rename(tmp_zip, filename)
         chmod_plus_x(filename)

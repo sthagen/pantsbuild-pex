@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from collections import namedtuple
 from contextlib import contextmanager
 from textwrap import dedent
 from types import ModuleType
@@ -15,13 +14,14 @@ from types import ModuleType
 import pytest
 
 from pex.common import safe_mkdir, safe_open, temporary_dir
-from pex.compatibility import PY2, WINDOWS, nested, to_bytes
+from pex.compatibility import PY2, WINDOWS, to_bytes
 from pex.interpreter import PythonInterpreter
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
 from pex.resolver import resolve
 from pex.testing import (
+    IS_PYPY3,
     PY27,
     PY36,
     WheelBuilder,
@@ -34,6 +34,7 @@ from pex.testing import (
     temporary_content,
     write_simple_pex,
 )
+from pex.third_party.pkg_resources import Distribution
 from pex.typing import TYPE_CHECKING
 from pex.util import named_temporary_file
 
@@ -43,7 +44,10 @@ except ImportError:
     import mock  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
-    from typing import Dict, Iterator, Union
+    import attr  # vendor:skip
+    from typing import Dict, Iterable, Iterator, Union
+else:
+    from pex.third_party import attr
 
 
 def test_pex_uncaught_exceptions():
@@ -108,6 +112,7 @@ def test_pex_sys_exit_prints_objects():
     _test_sys_exit('Exception("derp")', b"derp\n", 1)
 
 
+@pytest.mark.xfail(IS_PYPY3, reason="https://github.com/pantsbuild/pex/issues/1210")
 def test_pex_atexit_swallowing():
     # type: () -> None
     body = textwrap.dedent(
@@ -202,10 +207,9 @@ def test_minimum_sys_modules():
 
 def test_site_libs():
     # type: () -> None
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         mock_site_packages.return_value = set([site_packages])
@@ -216,10 +220,9 @@ def test_site_libs():
 @pytest.mark.skipif(WINDOWS, reason="No symlinks on windows")
 def test_site_libs_symlink():
     # type: () -> None
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         site_packages_link = os.path.join(tempdir, "site-packages-link")
@@ -238,10 +241,9 @@ def test_site_libs_excludes_prefix():
     Make sure to exclude it.
     """
 
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         mock_site_packages.return_value = set([site_packages, sys.prefix])
@@ -307,13 +309,16 @@ def test_pex_run_extra_sys_path():
             assert b"extra/syspath/entry2" in syspath
 
 
-class PythonpathIsolationTest(
-    namedtuple("PythonpathIsolationTest", ["pythonpath", "dists", "exe"])
-):
+@attr.s(frozen=True)
+class PythonpathIsolationTest(object):
     @staticmethod
     def pex_info(inherit_path):
         # type: (Union[str, bool]) -> PexInfo
         return PexInfo.from_json(json.dumps({"inherit_path": inherit_path}))
+
+    pythonpath = attr.ib()  # type: str
+    dists = attr.ib()  # type: Iterable[Distribution]
+    exe = attr.ib()  # type: str
 
     def assert_isolation(self, inherit_path, expected_output):
         # type: (Union[str, bool], str) -> None

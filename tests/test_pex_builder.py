@@ -7,16 +7,17 @@ import zipfile
 
 import pytest
 
-from pex.common import temporary_dir
-from pex.compatibility import WINDOWS, nested
+from pex.common import safe_open, temporary_dir
+from pex.compatibility import WINDOWS
+from pex.executor import Executor
 from pex.pex import PEX
-from pex.pex_builder import BOOTSTRAP_DIR, PEXBuilder
+from pex.pex_builder import BOOTSTRAP_DIR, CopyMode, PEXBuilder
 from pex.testing import make_bdist
 from pex.testing import write_simple_pex as write_pex
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import List
+    from typing import Any, Iterator, List
 
 exe_main = """
 import sys
@@ -41,7 +42,7 @@ with open(sys.argv[1], 'w') as fp:
 def test_pex_builder():
     # type: () -> None
     # test w/ and w/o zipfile dists
-    with nested(temporary_dir(), make_bdist("p1")) as (td, p1):
+    with temporary_dir() as td, make_bdist("p1") as p1:
         pb = write_pex(td, exe_main, dists=[p1])
 
         success_txt = os.path.join(td, "success.txt")
@@ -51,7 +52,7 @@ def test_pex_builder():
             assert fp.read() == "success"
 
     # test w/ and w/o zipfile dists
-    with nested(temporary_dir(), temporary_dir(), make_bdist("p1")) as (td1, td2, p1):
+    with temporary_dir() as td1, temporary_dir() as td2, make_bdist("p1") as p1:
         pb = write_pex(td1, exe_main, dists=[p1])
 
         success_txt = os.path.join(td1, "success.txt")
@@ -65,7 +66,7 @@ def test_pex_builder_wheeldep():
     # type: () -> None
     """Repeat the pex_builder test, but this time include an import of something from a wheel that
     doesn't come in importable form."""
-    with nested(temporary_dir(), make_bdist("p1")) as (td, p1):
+    with temporary_dir() as td, make_bdist("p1") as p1:
         pyparsing_path = "./tests/example_packages/pyparsing-2.1.10-py2.py3-none-any.whl"
         pb = write_pex(td, wheeldeps_exe_main, dists=[p1, pyparsing_path])
         success_txt = os.path.join(td, "success.txt")
@@ -118,7 +119,7 @@ def test_pex_builder_preamble():
 
 def test_pex_builder_compilation():
     # type: () -> None
-    with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (td1, td2, td3):
+    with temporary_dir() as td1, temporary_dir() as td2, temporary_dir() as td3:
         src = os.path.join(td1, "src.py")
         with open(src, "w") as fp:
             fp.write(exe_main)
@@ -155,14 +156,15 @@ def test_pex_builder_compilation():
 @pytest.mark.skipif(WINDOWS, reason="No hardlinks on windows")
 def test_pex_builder_copy_or_link():
     # type: () -> None
-    with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (td1, td2, td3):
-        src = os.path.join(td1, "exe.py")
-        with open(src, "w") as fp:
+    with temporary_dir() as td:
+        src = os.path.join(td, "exe.py")
+        with safe_open(src, "w") as fp:
             fp.write(exe_main)
 
-        def build_and_check(path, copy):
-            # type: (str, bool) -> None
-            pb = PEXBuilder(path=path, copy=copy)
+        def build_and_check(copy_mode):
+            # type: (CopyMode.Value) -> None
+            pb = PEXBuilder(copy_mode=copy_mode)
+            path = pb.path()
             pb.add_source(src, "exe.py")
 
             path_clone = os.path.join(path, "__clone")
@@ -172,13 +174,51 @@ def test_pex_builder_copy_or_link():
                 s1 = os.stat(src)
                 s2 = os.stat(os.path.join(root, "exe.py"))
                 is_link = (s1[stat.ST_INO], s1[stat.ST_DEV]) == (s2[stat.ST_INO], s2[stat.ST_DEV])
-                if copy:
+                if copy_mode == CopyMode.COPY:
                     assert not is_link
                 else:
+                    # Since os.stat follows symlinks; so in CopyMode.SYMLINK, this just proves
+                    # the symlink points to the original file. Going further and checking path
+                    # and path_clone for the presence of a symlink (an os.islink test) is
+                    # trickier since a Linux hardlink of a symlink produces a symlink whereas a
+                    # macOS hardlink of a symlink produces a hardlink.
                     assert is_link
 
-        build_and_check(td2, False)
-        build_and_check(td3, True)
+        build_and_check(CopyMode.LINK)
+        build_and_check(CopyMode.COPY)
+        build_and_check(CopyMode.SYMLINK)
+
+
+@pytest.fixture
+def tmp_chroot(tmpdir):
+    # type: (Any) -> Iterator[str]
+    tmp_chroot = str(tmpdir)
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp_chroot)
+        yield tmp_chroot
+    finally:
+        os.chdir(cwd)
+
+
+@pytest.mark.parametrize(
+    "copy_mode", [pytest.param(copy_mode, id=copy_mode.value) for copy_mode in CopyMode.values]
+)
+def test_pex_builder_add_source_relpath_issues_1192(
+    tmp_chroot,  # type: str
+    copy_mode,  # type: CopyMode.Value
+):
+    # type: (...) -> None
+    pb = PEXBuilder(copy_mode=copy_mode)
+    with safe_open("src/main.py", "w") as fp:
+        fp.write("import sys; sys.exit(42)")
+    pb.add_source("src/main.py", "main.py")
+    pb.set_entry_point("main")
+    pb.build("test.pex")
+
+    process = Executor.open_process(cmd=[os.path.abspath("test.pex")])
+    process.wait()
+    assert 42 == process.returncode
 
 
 def test_pex_builder_deterministic_timestamp():
@@ -213,14 +253,14 @@ def test_pex_builder_from_requirements_pex():
 
     # Build from pex dir.
     with temporary_dir() as td2:
-        with nested(temporary_dir(), make_bdist("p1")) as (td1, p1):
+        with temporary_dir() as td1, make_bdist("p1") as p1:
             pb1 = write_pex(td1, dists=[p1])
             pb2 = build_from_req_pex(td2, pb1.path())
         verify(pb2)
 
     # Build from .pex file.
     with temporary_dir() as td4:
-        with nested(temporary_dir(), make_bdist("p1")) as (td3, p1):
+        with temporary_dir() as td3, make_bdist("p1") as p1:
             pb3 = write_pex(td3, dists=[p1])
             target = os.path.join(td3, "foo.pex")
             pb3.build(target)

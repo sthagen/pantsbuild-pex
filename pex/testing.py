@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from textwrap import dedent
 
-from pex.common import open_zip, safe_mkdir, safe_mkdtemp, safe_rmtree, temporary_dir, touch
+from pex.common import atomic_directory, open_zip, safe_mkdir, safe_mkdtemp, temporary_dir
 from pex.compatibility import to_unicode
 from pex.distribution_target import DistributionTarget
 from pex.executor import Executor
@@ -24,6 +24,7 @@ from pex.pip import get_pip
 from pex.third_party.pkg_resources import Distribution
 from pex.typing import TYPE_CHECKING
 from pex.util import DistributionHelper, named_temporary_file
+from pex.variables import ENV
 
 if TYPE_CHECKING:
     from typing import (
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 PY_VER = sys.version_info[:2]
 IS_PYPY = hasattr(sys, "pypy_version_info")
+IS_PYPY3 = IS_PYPY and sys.version_info[0] == 3
 NOT_CPYTHON27 = IS_PYPY or PY_VER != (2, 7)
 NOT_CPYTHON36 = IS_PYPY or PY_VER != (3, 6)
 IS_LINUX = platform.system() == "Linux"
@@ -163,12 +165,19 @@ class WheelBuilder(object):
     class BuildFailure(Exception):
         pass
 
-    def __init__(self, source_dir, interpreter=None, wheel_dir=None):
-        # type: (str, Optional[PythonInterpreter], Optional[str]) -> None
+    def __init__(
+        self,
+        source_dir,  # type: str
+        interpreter=None,  # type: Optional[PythonInterpreter]
+        wheel_dir=None,  # type: Optional[str]
+        verify=True,  # type: bool
+    ):
+        # type: (...) -> None
         """Create a wheel from an unpacked source distribution in source_dir."""
         self._source_dir = source_dir
         self._wheel_dir = wheel_dir or safe_mkdtemp()
         self._interpreter = interpreter or PythonInterpreter.get()
+        self._verify = verify
 
     def bdist(self):
         # type: () -> str
@@ -176,6 +185,7 @@ class WheelBuilder(object):
             distributions=[self._source_dir],
             wheel_dir=self._wheel_dir,
             interpreter=self._interpreter,
+            verify=self._verify,
         ).wait()
         dists = os.listdir(self._wheel_dir)
         if len(dists) == 0:
@@ -240,7 +250,7 @@ def make_bdist(
         get_pip().spawn_install_wheel(
             wheel=dist_location,
             install_dir=install_dir,
-            target=DistributionTarget.for_interpreter(interpreter),
+            target=DistributionTarget(interpreter=interpreter),
         ).wait()
         dist = DistributionHelper.distribution_from_path(install_dir)
         assert dist is not None
@@ -314,7 +324,7 @@ class IntegResults(object):
     """Convenience object to return integration run results."""
 
     def __init__(self, output, error, return_code):
-        # type: (Text, Text, int) -> None
+        # type: (str, str, int) -> None
         super(IntegResults, self).__init__()
         self.output = output
         self.error = error
@@ -391,7 +401,6 @@ def run_simple_pex_test(
 
 def bootstrap_python_installer(dest):
     # type: (str) -> None
-    safe_rmtree(dest)
     for _ in range(3):
         try:
             subprocess.check_call(["git", "clone", "https://github.com/pyenv/pyenv.git", dest])
@@ -402,8 +411,6 @@ def bootstrap_python_installer(dest):
             break
     else:
         raise RuntimeError("Helper method could not clone pyenv from git after 3 tries")
-    # Create an empty file indicating the fingerprint of the correct set of test interpreters.
-    touch(os.path.join(dest, _INTERPRETER_SET_FINGERPRINT))
 
 
 # NB: We keep the pool of bootstrapped interpreters as small as possible to avoid timeouts in CI
@@ -417,41 +424,18 @@ PY36 = "3.6.6"
 _ALL_PY_VERSIONS = (PY27, PY35, PY36)
 _ALL_PY3_VERSIONS = (PY35, PY36)
 
-# This is the filename of a sentinel file that sits in the pyenv root directory.
-# Its purpose is to indicate whether pyenv has the correct interpreters installed
-# and will be useful for indicating whether we should trigger a reclone to update
-# pyenv.
-_INTERPRETER_SET_FINGERPRINT = "_".join(_ALL_PY_VERSIONS) + "_pex_fingerprint"
-
-
-_ROOT_DIR = None  # type: Optional[str]
-
-
-def root_dir():
-    # type: () -> str
-    global _ROOT_DIR
-    if _ROOT_DIR is None:
-        cwd = os.getcwd()
-        try:
-            os.chdir(os.path.dirname(__file__))
-            _ROOT_DIR = str(
-                os.path.realpath(
-                    subprocess.check_output(["git", "rev-parse", "--show-toplevel"])
-                    .decode("utf-8")
-                    .strip()
-                )
-            )
-        finally:
-            os.chdir(cwd)
-    return _ROOT_DIR
-
 
 def ensure_python_distribution(version):
     # type: (str) -> Tuple[str, str, Callable[[Iterable[str]], Text]]
     if version not in _ALL_PY_VERSIONS:
         raise ValueError("Please constrain version to one of {}".format(_ALL_PY_VERSIONS))
 
-    pyenv_root = os.path.join(root_dir(), ".pyenv_test")
+    pyenv_root = os.path.abspath(
+        os.path.join(
+            os.environ.get("_PEX_TEST_PYENV_ROOT", "{}_dev".format(ENV.PEX_ROOT)),
+            "pyenv",
+        )
+    )
     interpreter_location = os.path.join(pyenv_root, "versions", version)
 
     pyenv = os.path.join(pyenv_root, "bin", "pyenv")
@@ -460,15 +444,37 @@ def ensure_python_distribution(version):
 
     pip = os.path.join(interpreter_location, "bin", "pip")
 
-    if not os.path.exists(os.path.join(pyenv_root, _INTERPRETER_SET_FINGERPRINT)):
-        bootstrap_python_installer(pyenv_root)
+    with atomic_directory(target_dir=os.path.join(pyenv_root), exclusive=True) as target_dir:
+        if target_dir:
+            bootstrap_python_installer(target_dir)
 
-    if not os.path.exists(interpreter_location):
-        env = pyenv_env.copy()
-        if sys.platform.lower() == "linux":
-            env["CONFIGURE_OPTS"] = "--enable-shared"
-        subprocess.check_call([pyenv, "install", "--keep", version], env=env)
-        subprocess.check_call([pip, "install", "-U", "pip"])
+    with atomic_directory(
+        target_dir=interpreter_location, exclusive=True
+    ) as interpreter_target_dir:
+        if interpreter_target_dir:
+            subprocess.check_call(
+                [
+                    "git",
+                    "--git-dir={}".format(os.path.join(pyenv_root, ".git")),
+                    "--work-tree={}".format(pyenv_root),
+                    "pull",
+                    "--ff-only",
+                    "https://github.com/pyenv/pyenv.git",
+                ]
+            )
+            env = pyenv_env.copy()
+            if sys.platform.lower().startswith("linux"):
+                env["CONFIGURE_OPTS"] = "--enable-shared"
+                # The pyenv builder detects `--enable-shared` and sets up `RPATH` via
+                # `LDFLAGS=-Wl,-rpath=... $LDFLAGS` to ensure the built python binary links the
+                # correct libpython shared lib. Some versions of compiler set the `RUNPATH` instead
+                # though which is searched _after_ the `LD_LIBRARY_PATH` environment variable. To
+                # ensure an inopportune `LD_LIBRARY_PATH` doesn't fool the pyenv python binary into
+                # linking the wrong libpython, force `RPATH`, which is searched 1st by the linker,
+                # with with `--disable-new-dtags`.
+                env["LDFLAGS"] = "-Wl,--disable-new-dtags"
+            subprocess.check_call([pyenv, "install", "--keep", version], env=env)
+            subprocess.check_call([pip, "install", "-U", "pip"])
 
     python = os.path.join(interpreter_location, "bin", "python" + version[0:3])
 
@@ -522,3 +528,14 @@ def environment_as(**kwargs):
         yield
     finally:
         adjust_environment(existing)
+
+
+@contextmanager
+def pushd(directory):
+    # type: (str) -> Iterator[None]
+    cwd = os.getcwd()
+    try:
+        os.chdir(directory)
+        yield
+    finally:
+        os.chdir(cwd)

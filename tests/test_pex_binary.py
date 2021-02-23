@@ -8,9 +8,15 @@ from tempfile import NamedTemporaryFile
 
 import pytest
 
-from pex.bin.pex import build_pex, compute_indexes, configure_clp, configure_clp_pex_resolution
+from pex.bin.pex import (
+    build_pex,
+    compute_indexes,
+    configure_clp,
+    configure_clp_pex_options,
+    configure_clp_pex_resolution,
+)
 from pex.common import safe_copy, temporary_dir
-from pex.compatibility import nested, to_bytes
+from pex.compatibility import to_bytes
 from pex.interpreter import PythonInterpreter
 from pex.testing import (
     PY27,
@@ -20,6 +26,7 @@ from pex.testing import (
     run_simple_pex,
 )
 from pex.typing import TYPE_CHECKING
+from pex.venv_bin_path import BinPath
 
 if TYPE_CHECKING:
     from typing import Iterator, List, Optional, Text
@@ -148,14 +155,11 @@ def test_clp_prereleases():
 
 def test_clp_prereleases_resolver():
     # type: () -> None
-    with nested(
-        built_wheel(name="prerelease-dep", version="1.2.3b1"),
-        built_wheel(name="transitive-dep", install_reqs=["prerelease-dep"]),
-        built_wheel(name="dep", install_reqs=["prerelease-dep>=1.2", "transitive-dep"]),
-        temporary_dir(),
-        temporary_dir(),
-    ) as (prerelease_dep, transitive_dep, dep, dist_dir, cache_dir):
-
+    with built_wheel(name="prerelease-dep", version="1.2.3b1") as prerelease_dep, built_wheel(
+        name="transitive-dep", install_reqs=["prerelease-dep"]
+    ) as transitive_dep, built_wheel(
+        name="dep", install_reqs=["prerelease-dep>=1.2", "transitive-dep"]
+    ) as dep, temporary_dir() as dist_dir, temporary_dir() as cache_dir:
         for dist in (prerelease_dep, transitive_dep, dep):
             safe_copy(dist, os.path.join(dist_dir, os.path.basename(dist)))
 
@@ -174,7 +178,7 @@ def test_clp_prereleases_resolver():
         )
         assert not options.allow_prereleases
 
-        with pytest.raises(SystemExit, message="Should have failed to resolve prerelease dep"):
+        with pytest.raises(SystemExit):
             build_pex(options.requirements, options)
 
         # When we specify `--pre`, allow_prereleases is True
@@ -204,6 +208,23 @@ def test_clp_prereleases_resolver():
         assert len(pex_builder.info.distributions) == 3, "Should have resolved deps"
 
 
+def test_clp_pex_options():
+    with option_parser() as parser:
+        configure_clp_pex_options(parser)
+
+        options = parser.parse_args(args=[])
+        assert options.venv == False
+
+        options = parser.parse_args(args=["--venv"])
+        assert options.venv == BinPath.FALSE
+
+        options = parser.parse_args(args=["--venv", "append"])
+        assert options.venv == BinPath.APPEND
+
+        options = parser.parse_args(args=["--venv", "prepend"])
+        assert options.venv == BinPath.PREPEND
+
+
 def test_build_pex():
     # type: () -> None
     with temporary_dir() as sandbox:
@@ -221,7 +242,7 @@ def test_run_pex():
     # type: () -> None
 
     def assert_run_pex(python=None, pex_args=None):
-        # type: (Optional[str], Optional[List[str]]) -> List[Text]
+        # type: (Optional[str], Optional[List[str]]) -> List[str]
         pex_args = list(pex_args) if pex_args else []
         results = run_pex_command(
             python=python,

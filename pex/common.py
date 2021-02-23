@@ -24,7 +24,7 @@ from uuid import uuid4
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, DefaultDict, Iterable, Iterator, NoReturn, Optional, Set
+    from typing import Any, DefaultDict, Iterable, Iterator, NoReturn, Optional, Set, Sized
 
 # We use the start of MS-DOS time, which is what zipfiles use (see section 4.4.6 of
 # https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
@@ -58,6 +58,22 @@ def die(msg, exit_code=1):
     # type: (str, int) -> NoReturn
     print(msg, file=sys.stderr)
     sys.exit(exit_code)
+
+
+def pluralize(
+    subject,  # type: Sized
+    noun,  # type: str
+):
+    # type: (...) -> str
+    if noun == "":
+        return ""
+    count = len(subject)
+    if count == 1:
+        return noun
+    if noun[-1] in ("s", "x", "z") or noun[-2:] in ("sh", "ch"):
+        return noun + "es"
+    else:
+        return noun + "s"
 
 
 def safe_copy(source, dest, overwrite=False):
@@ -292,26 +308,31 @@ def safe_sleep(seconds):
 
 class AtomicDirectory(object):
     def __init__(self, target_dir):
+        # type: (str) -> None
         self._target_dir = target_dir
         self._work_dir = "{}.{}".format(target_dir, uuid4().hex)
 
     @property
     def work_dir(self):
+        # type: () -> str
         return self._work_dir
 
     @property
     def target_dir(self):
+        # type: () -> str
         return self._target_dir
 
     @property
     def is_finalized(self):
+        # type: () -> bool
         return os.path.exists(self._target_dir)
 
     def finalize(self, source=None):
+        # type: (Optional[str]) -> None
         """Rename `work_dir` to `target_dir` using `os.rename()`.
 
-        :param str source: An optional source offset into the `work_dir`` to use for the atomic
-                           update of `target_dir`. By default the whole `work_dir` is used.
+        :param source: An optional source offset into the `work_dir`` to use for the atomic update
+                       of `target_dir`. By default the whole `work_dir` is used.
 
         If a race is lost and `target_dir` already exists, the `target_dir` dir is left unchanged and
         the `work_dir` directory will simply be removed.
@@ -338,6 +359,7 @@ class AtomicDirectory(object):
             self.cleanup()
 
     def cleanup(self):
+        # type: () -> None
         safe_rmtree(self._work_dir)
 
 
@@ -572,6 +594,20 @@ class Chroot(object):
         safe_copy(abs_src, abs_dst, overwrite=False)
         # TODO: Ensure the target and dest are the same if the file already exists.
 
+    def symlink(
+        self,
+        src,  # type: str
+        dst,  # type: str
+        label=None,  # type: Optional[str]
+    ):
+        # type: (...) -> None
+        dst = self._normalize(dst)
+        self._tag(dst, label)
+        self._ensure_parent(dst)
+        abs_src = os.path.abspath(src)
+        abs_dst = os.path.join(self.chroot, dst)
+        os.symlink(abs_src, abs_dst)
+
     def write(self, data, dst, label=None, mode="wb"):
         """Write data to ``chroot/dst`` with optional label.
 
@@ -618,11 +654,10 @@ class Chroot(object):
     def zip(self, filename, mode="w", deterministic_timestamp=False):
         with open_zip(filename, mode) as zf:
 
-            def write_entry(path):
-                full_path = os.path.join(self.chroot, path)
+            def write_entry(filename, arcname):
                 zip_entry = zf.zip_entry_from_file(
-                    filename=full_path,
-                    arcname=path,
+                    filename=filename,
+                    arcname=arcname,
                     date_time=DETERMINISTIC_DATETIME.timetuple()
                     if deterministic_timestamp
                     else None,
@@ -642,9 +677,21 @@ class Chroot(object):
                 if parent_dir is None or parent_dir in written_dirs:
                     return
                 maybe_write_parent_dirs(parent_dir)
-                write_entry(parent_dir)
+                write_entry(filename=os.path.join(self.chroot, parent_dir), arcname=parent_dir)
                 written_dirs.add(parent_dir)
 
-            for f in sorted(self.files()):
-                maybe_write_parent_dirs(f)
-                write_entry(f)
+            def iter_files():
+                for path in sorted(self.files()):
+                    full_path = os.path.join(self.chroot, path)
+                    if os.path.isfile(full_path):
+                        yield full_path, path
+                        continue
+                    for root, _, files in os.walk(full_path):
+                        for f in files:
+                            abs_path = os.path.join(root, f)
+                            rel_path = os.path.join(path, os.path.relpath(abs_path, full_path))
+                            yield abs_path, rel_path
+
+            for filename, arcname in iter_files():
+                maybe_write_parent_dirs(arcname)
+                write_entry(filename, arcname)

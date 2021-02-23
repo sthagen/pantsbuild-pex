@@ -5,6 +5,7 @@ from __future__ import absolute_import, division, print_function
 
 import string
 import re
+import sys
 
 if "__PEX_UNVENDORED__" in __import__("os").environ:
   from pyparsing import stringStart, stringEnd, originalTextFor, ParseException  # vendor:skip
@@ -21,18 +22,19 @@ if "__PEX_UNVENDORED__" in __import__("os").environ:
 else:
   from pex.third_party.pyparsing import Literal as L
   # noqa
-if "__PEX_UNVENDORED__" in __import__("os").environ:
-  from six.moves.urllib import parse as urlparse  # vendor:skip
-else:
-  from pex.third_party.six.moves.urllib import parse as urlparse
-
 
 from ._typing import TYPE_CHECKING
 from .markers import MARKER_EXPR, Marker
 from .specifiers import LegacySpecifier, Specifier, SpecifierSet
 
+if sys.version_info[0] >= 3:
+    from urllib import parse as urlparse  # pragma: no cover
+else:  # pragma: no cover
+    import urlparse
+
+
 if TYPE_CHECKING:  # pragma: no cover
-    from typing import List
+    from typing import List, Optional as TOptional, Set
 
 
 class InvalidRequirement(ValueError):
@@ -119,7 +121,7 @@ class Requirement(object):
                 )
             )
 
-        self.name = req.name
+        self.name = req.name  # type: str
         if req.url:
             parsed_url = urlparse.urlparse(req.url)
             if parsed_url.scheme == "file":
@@ -129,12 +131,12 @@ class Requirement(object):
                 not parsed_url.scheme and not parsed_url.netloc
             ):
                 raise InvalidRequirement("Invalid URL: {0}".format(req.url))
-            self.url = req.url
+            self.url = req.url  # type: TOptional[str]
         else:
             self.url = None
-        self.extras = set(req.extras.asList() if req.extras else [])
-        self.specifier = SpecifierSet(req.specifier)
-        self.marker = req.marker if req.marker else None
+        self.extras = set(req.extras.asList() if req.extras else [])  # type: Set[str]
+        self.specifier = SpecifierSet(req.specifier)  # type: SpecifierSet
+        self.marker = req.marker if req.marker else None  # type: TOptional[Marker]
 
     def __str__(self):
         # type: () -> str

@@ -16,10 +16,11 @@ from collections import OrderedDict
 from textwrap import dedent
 
 from pex import third_party
-from pex.common import is_exe, safe_rmtree
+from pex.common import is_exe, safe_mkdtemp, safe_rmtree, temporary_dir
 from pex.compatibility import string
 from pex.executor import Executor
 from pex.jobs import ErrorHandler, Job, Retain, SpawnedJob, execute_parallel
+from pex.orderedset import OrderedSet
 from pex.platforms import Platform
 from pex.third_party.packaging import markers, tags
 from pex.third_party.pkg_resources import Distribution, Requirement
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         MutableMapping,
         Optional,
         Sequence,
+        Text,
         Tuple,
         Union,
     )
@@ -49,7 +51,7 @@ if TYPE_CHECKING:
 
     # N.B.: We convert InterpreterIdentificationJobErrors that result from spawning interpreter
     # identification jobs to these end-user InterpreterIdentificationErrors for display.
-    InterpreterIdentificationError = Tuple[str, str]
+    InterpreterIdentificationError = Tuple[str, Text]
     InterpreterOrError = Union["PythonInterpreter", InterpreterIdentificationError]
 
 
@@ -63,18 +65,8 @@ class PythonIdentity(object):
     class UnknownRequirement(Error):
         pass
 
-    # TODO(wickman)  Support interpreter-specific versions, e.g. PyPy-2.2.1
-    INTERPRETER_NAME_TO_HASHBANG = {
-        "CPython": "python%(major)d.%(minor)d",
-        "Jython": "jython",
-        "PyPy": "pypy",
-        "IronPython": "ipy",
-    }
-
     ABBR_TO_INTERPRETER_NAME = {
         "pp": "PyPy",
-        "jy": "Jython",
-        "ip": "IronPython",
         "cp": "CPython",
     }
 
@@ -219,6 +211,7 @@ class PythonIdentity(object):
 
     @property
     def supported_tags(self):
+        # type: () -> Tuple[tags.Tag, ...]
         return self._supported_tags
 
     @property
@@ -242,8 +235,8 @@ class PythonIdentity(object):
         # type: () -> Iterator[Platform]
         """All platforms supported by the associated interpreter ordered from most specific to
         least."""
-        for tags in self._supported_tags:
-            yield Platform.from_tags(platform=tags.platform, python=tags.interpreter, abi=tags.abi)
+        for tag in self._supported_tags:
+            yield Platform.from_tag(tag)
 
     @classmethod
     def parse_requirement(cls, requirement, default_interpreter="CPython"):
@@ -271,14 +264,11 @@ class PythonIdentity(object):
 
     def hashbang(self):
         # type: () -> str
-        hashbang_string = self.INTERPRETER_NAME_TO_HASHBANG.get(
-            self._interpreter_name, "CPython"
-        ) % {
-            "major": self._version[0],
-            "minor": self._version[1],
-            "patch": self._version[2],
-        }
-        return "#!/usr/bin/env %s" % hashbang_string
+        if self._interpreter_name == "PyPy":
+            hashbang_string = "pypy" if self._version[0] == 2 else "pypy{}".format(self._version[0])
+        else:
+            hashbang_string = "python{}.{}".format(self._version[0], self._version[1])
+        return "#!/usr/bin/env {}".format(hashbang_string)
 
     @property
     def python(self):
@@ -326,16 +316,31 @@ class PythonIdentity(object):
 
 class PythonInterpreter(object):
     _REGEXEN = (
-        re.compile(r"jython$"),
-        # NB: OSX ships python binaries named Python so we allow for capital-P.
-        re.compile(r"[Pp]ython$"),
-        re.compile(r"python[23]$"),
-        re.compile(r"python[23].[0-9]$"),
-        # Some distributions include a suffix on the interpreter name, similar to PEP-3149.
-        # For example, Gentoo has /usr/bin/python3.6m to indicate it was built with pymalloc.
-        re.compile(r"python[23].[0-9][a-z]$"),
-        re.compile(r"pypy$"),
-        re.compile(r"pypy-1.[0-9]$"),
+        # NB: OSX ships python binaries named Python with a capital-P; so we allow for this.
+        re.compile(r"^Python$"),
+        re.compile(
+            r"""
+            ^
+            (?:
+                python |
+                pypy
+            )
+            (?:
+                # Major version
+                [2-9]
+                (?:.
+                    # Minor version
+                    [0-9]
+                    # Some distributions include a suffix on the interpreter name, similar to
+                    # PEP-3149. For example, Gentoo has /usr/bin/python3.6m to indicate it was
+                    # built with pymalloc
+                    [a-z]?
+                )?
+            )?
+            $
+            """,
+            flags=re.VERBOSE,
+        ),
     )
 
     _PYTHON_INTERPRETER_BY_NORMALIZED_PATH = {}  # type: Dict
@@ -469,7 +474,7 @@ class PythonInterpreter(object):
     def _paths(paths=None):
         # type: (Optional[Iterable[str]]) -> Iterable[str]
         # NB: If `paths=[]`, we will not read $PATH.
-        return paths if paths is not None else os.getenv("PATH", "").split(os.pathsep)
+        return OrderedSet(paths if paths is not None else os.getenv("PATH", "").split(os.pathsep))
 
     @classmethod
     def iter(cls, paths=None):
@@ -497,7 +502,7 @@ class PythonInterpreter(object):
         :return: A heterogeneous iterator over valid interpreters and (python, error) invalid
                  python binary tuples.
         """
-        failed_interpreters = OrderedDict()  # type: MutableMapping[str, str]
+        failed_interpreters = OrderedDict()  # type: MutableMapping[str, Text]
 
         def iter_interpreters():
             # type: () -> Iterator[PythonInterpreter]
@@ -508,7 +513,7 @@ class PythonInterpreter(object):
                     yield candidate
                 else:
                     python, exception = cast("InterpreterIdentificationJobError", candidate)
-                    if isinstance(exception, Job.Error):
+                    if isinstance(exception, Job.Error) and exception.stderr:
                         # We spawned a subprocess to identify the interpreter but the interpreter
                         # could not run our identification code meaning the interpreter is either
                         # broken or old enough that it either can't parse our identification code
@@ -606,7 +611,11 @@ class PythonInterpreter(object):
         # would otherwise be unstable.
         #
         # See cls._REGEXEN for a related affordance.
-        path_id = binary.replace(os.sep, ".").lstrip(".")
+        #
+        # N.B.: The path for --venv mode interpreters can be quite long; so we just used a fixed
+        # length hash of the interpreter binary path to ensure uniqueness and not run afoul of file
+        # name length limits.
+        path_id = hashlib.sha1(binary.encode("utf-8")).hexdigest()
 
         cache_dir = os.path.join(os_cache_dir, interpreter_hash, path_id)
         cache_file = os.path.join(cache_dir, cls.INTERP_INFO_FILE)
@@ -645,10 +654,13 @@ class PythonInterpreter(object):
                 ],
                 pythonpath=pythonpath,
             )
+            # Ensure the `.` implicit PYTHONPATH entry contains no Pex code (of a different version)
+            # that might interfere with the behavior we expect in the script above.
+            cwd = safe_mkdtemp()
             process = Executor.open_process(
-                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd
             )
-            job = Job(command=cmd, process=process)
+            job = Job(command=cmd, process=process, finalizer=lambda: safe_rmtree(cwd))
             return SpawnedJob.stdout(job, result_func=create_interpreter)
 
     @classmethod
@@ -804,8 +816,9 @@ class PythonInterpreter(object):
         seen = set()
         for interp in pythons:
             version = interp.identity.version
-            if version not in seen and version_filter(version):
-                seen.add(version)
+            identity = version, interp.identity.abi_tag
+            if identity not in seen and version_filter(version):
+                seen.add(identity)
                 yield interp
 
     @classmethod

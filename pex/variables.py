@@ -6,6 +6,8 @@
 
 from __future__ import absolute_import
 
+import hashlib
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -14,9 +16,21 @@ from pex import pex_warnings
 from pex.common import can_write_dir, die, safe_mkdtemp
 from pex.inherit_path import InheritPath
 from pex.typing import TYPE_CHECKING, Generic, overload
+from pex.venv_bin_path import BinPath
 
 if TYPE_CHECKING:
-    from typing import Callable, Dict, Iterator, Optional, Tuple, TypeVar, Type, Union
+    from typing import (
+        Callable,
+        Dict,
+        Iterable,
+        Iterator,
+        Optional,
+        Tuple,
+        TypeVar,
+        Type,
+        Union,
+        Any,
+    )
 
     _O = TypeVar("_O")
     _P = TypeVar("_P")
@@ -92,6 +106,25 @@ class DefaultedProperty(Generic["_O", "_P"]):
             return self._validate(instance, self._func(instance))
         except NoValueError:
             return None
+
+    def value_or(
+        self,
+        instance,  # type: _O
+        fallback,  # type: _P
+    ):
+        # type: (...) -> _P
+        """Return the value of this property without the default value applied or else the fallback.
+
+        If the property is not set, `fallback` will be validated and returned.
+
+        :param instance: The instance to check for the non-defaulted property value.
+        :return: The property value or `fallback` if not set.
+        """
+        try:
+            value = self._func(instance)
+        except NoValueError:
+            value = fallback
+        return self._validate(instance, value)
 
     def validator(self, func):
         # type: (Callable[[_O, _P], _P]) -> Callable[[_O, _P], _P]
@@ -330,6 +363,31 @@ class Variables(object):
         Default: false.
         """
         return self._get_bool("PEX_UNZIP")
+
+    @defaulted_property(default=False)
+    def PEX_VENV(self):
+        # type: () -> bool
+        """Boolean.
+
+        Force this PEX to create a venv under $PEX_ROOT and re-execute from there.  If the pex file
+        will be run multiple times under a stable $PEX_ROOT the venv creation will only be performed
+        once and subsequent runs will enjoy lower startup latency.
+
+        Default: false.
+        """
+        return self._get_bool("PEX_VENV")
+
+    @defaulted_property(default=BinPath.FALSE)
+    def PEX_VENV_BIN_PATH(self):
+        # type: () -> BinPath.Value
+        """String (false|prepend|append).
+
+        When running in PEX_VENV mode, optionally add the scripts and console scripts of
+        distributions in the PEX file to the $PATH.
+
+        Default: false.
+        """
+        return BinPath.for_value(self._get_string("PEX_VENV_BIN_PATH"))
 
     @defaulted_property(default=False)
     def PEX_IGNORE_ERRORS(self):
@@ -581,3 +639,62 @@ class Variables(object):
 
 # Global singleton environment
 ENV = Variables()
+
+
+# TODO(John Sirois): Extract a runtime.modes package to hold code dealing with runtime mode
+#  calculations: https://github.com/pantsbuild/pex/issues/1154
+def _expand_pex_root(pex_root):
+    # type: (str) -> str
+    fallback = os.path.expanduser(pex_root)
+    return os.path.expanduser(Variables.PEX_ROOT.value_or(ENV, fallback=fallback))
+
+
+def unzip_dir(
+    pex_root,  # type: str
+    pex_hash,  # type: str
+):
+    # type: (...) -> str
+    return os.path.join(_expand_pex_root(pex_root), "unzipped_pexes", pex_hash)
+
+
+def venv_dir(
+    pex_root,  # type: str
+    pex_hash,  # type: str
+    interpreter_constraints,  # type: Iterable[str]
+    pex_path=None,  # type: Optional[str]
+):
+    # type: (...) -> str
+    # The venv contents are affected by which interpreter is selected as well as which PEX files are
+    # in play. The former can be influenced by interpreter constraints changes as well as PEX_PYTHON
+    # and PEX_PYTHON_PATH. The latter is influenced via PEX_PATH.
+    venv_contents = {
+        "interpreter_constraints": sorted(interpreter_constraints),
+        "PEX_PYTHON": ENV.PEX_PYTHON,
+        "PEX_PYTHON_PATH": ENV.PEX_PYTHON_PATH,
+        "pex_path": {},
+    }  # type: Dict[str, Any]
+
+    # PexInfo.pex_path and PEX_PATH are merged by PEX at runtime, so we include both and hash just
+    # the distributions since those are the only items used from PEX_PATH adjoined PEX files; i.e.:
+    # neither the entry_point nor any other PEX file data or metadata is used.
+    def add_pex_path_items(pex_path):
+        if not pex_path:
+            return
+        from pex.pex_info import PexInfo
+
+        pex_path_contents = venv_contents["pex_path"]
+        for pex in pex_path.split(":"):
+            pex_path_contents[pex] = PexInfo.from_pex(pex).distributions
+
+    add_pex_path_items(pex_path)
+    add_pex_path_items(ENV.PEX_PATH)
+
+    venv_contents_hash = hashlib.sha1(
+        json.dumps(venv_contents, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return os.path.join(
+        _expand_pex_root(pex_root),
+        "venvs",
+        pex_hash,
+        venv_contents_hash,
+    )

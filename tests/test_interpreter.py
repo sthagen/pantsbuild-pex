@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 import glob
+import json
 import os
 import subprocess
 from collections import defaultdict
@@ -20,7 +21,9 @@ from pex.testing import (
     PY_VER,
     ensure_python_distribution,
     ensure_python_interpreter,
+    ensure_python_venv,
     environment_as,
+    pushd,
 )
 from pex.typing import TYPE_CHECKING
 from pex.variables import ENV
@@ -31,10 +34,9 @@ except ImportError:
     from unittest.mock import Mock, patch  # type: ignore[misc,no-redef,import]
 
 if TYPE_CHECKING:
-    from typing import Iterator, Tuple, Union, Any, List
+    from typing import Any, Iterator, List, Tuple
 
-    InterpreterIdentificationError = Tuple[str, str]
-    InterpreterOrError = Union[PythonInterpreter, InterpreterIdentificationError]
+    from pex.interpreter import InterpreterOrError
 
 
 def tuple_from_version(version_string):
@@ -94,11 +96,13 @@ class TestPythonInterpreter(object):
     def test_binary_name_matching(self):
         # type: () -> None
         valid_binary_names = (
-            "jython",
-            "pypy",
-            "pypy-1.1",
-            "python",
             "Python",
+            "pypy",
+            "pypy2",
+            "pypy3",
+            "pypy3.6",
+            "pypy3.6m",
+            "python",
             "python2",
             "python2.7",
             "python2.7m",
@@ -331,3 +335,25 @@ def test_resolve_venv_ambient():
     # type: () -> None
     ambient_real_interpreter = PythonInterpreter.get().resolve_base_interpreter()
     check_resolve_venv(ambient_real_interpreter)
+
+
+def test_identify_cwd_isolation_issues_1231(tmpdir):
+    # type: (Any) -> None
+
+    python36, pip = ensure_python_venv(PY36)
+    polluted_cwd = os.path.join(str(tmpdir), "dir")
+    subprocess.check_call(args=[pip, "install", "--target", polluted_cwd, "pex==2.1.16"])
+
+    pex_root = os.path.join(str(tmpdir), "pex_root")
+    with pushd(polluted_cwd), ENV.patch(PEX_ROOT=pex_root):
+        interp = PythonInterpreter.from_binary(python36)
+
+    interp_info_files = {
+        os.path.join(root, f)
+        for root, _, files in os.walk(pex_root)
+        for f in files
+        if f == PythonInterpreter.INTERP_INFO_FILE
+    }
+    assert 1 == len(interp_info_files)
+    with open(interp_info_files.pop()) as fp:
+        assert interp.binary == json.load(fp)["binary"]

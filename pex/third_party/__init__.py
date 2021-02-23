@@ -252,7 +252,7 @@ class VendorImporter(object):
             yield os.path.join(root, exposed_path)
 
     @classmethod
-    def install(cls, uninstallable, prefix, path_items, root=None, warning=None):
+    def install(cls, uninstallable, prefix, path_items, root=None):
         """Install an importer for modules found under ``path_items`` at the given import
         ``prefix``.
 
@@ -264,15 +264,12 @@ class VendorImporter(object):
         :param str root: The root path of the distribution containing the vendored code. NB: This is the
                          the path to the pex code, which serves as the root under which code is vendored
                          at ``pex/vendor/_vendored``.
-        :param str warning: An optional warning to emit if any imports are made through the installed
-                            importer.
-        :return:
+        :return: The installed importer.
+        :rtype: :class:`VendorImporter`
         """
         root = cls._abs_root(root)
         importables = tuple(cls._iter_importables(root=root, path_items=path_items, prefix=prefix))
-        vendor_importer = cls(
-            root=root, importables=importables, uninstallable=uninstallable, warning=warning
-        )
+        vendor_importer = cls(root=root, importables=importables, uninstallable=uninstallable)
         sys.meta_path.insert(0, vendor_importer)
         _tracer().log("Installed {}".format(vendor_importer), V=3)
         return vendor_importer
@@ -283,12 +280,11 @@ class VendorImporter(object):
         for vendor_importer in cls._iter_all_installed_vendor_importers():
             vendor_importer.uninstall()
 
-    def __init__(self, root, importables, uninstallable=True, warning=None):
+    def __init__(self, root, importables, uninstallable=True):
         self._root = root
         self._importables = importables
 
         self._uninstallable = uninstallable
-        self._warning = warning
 
         self._loaders = []
 
@@ -315,12 +311,6 @@ class VendorImporter(object):
             loader = importable.loader_for(fullname)
             if loader is not None:
                 self._loaders.append(loader)
-                if self._warning:
-                    from pex import pex_warnings
-
-                    pex_warnings.warn(
-                        "Found loader for `import {}`:\n\t{}".format(fullname, self._warning)
-                    )
                 return loader
         return None
 
@@ -385,7 +375,18 @@ def isolated():
 
         pex_path = os.path.join(vendor.VendorSpec.ROOT, "pex")
         with _tracer().timed("Hashing pex"):
-            dir_hash = CacheHelper.dir_hash(pex_path)
+            if os.path.isdir(pex_path):
+                dir_hash = CacheHelper.dir_hash(pex_path)
+            else:
+                pex_zip = os.path.abspath(sys.argv[0])
+                assert zipfile.is_zipfile(pex_zip) and pex_zip == os.path.commonprefix(
+                    (pex_zip, pex_path)
+                ), (
+                    "Expected the `pex` module to be available via an installed distribution or "
+                    "else via a PEX zipfile present as argv0. Loaded the `pex` module from {} and "
+                    "argv0 is {}.".format(pex_path, sys.argv[0])
+                )
+                dir_hash = CacheHelper.zip_hash(pex_zip, os.path.relpath(pex_path, pex_zip))
         isolated_dir = os.path.join(ENV.PEX_ROOT, "isolated", dir_hash)
 
         with _tracer().timed("Isolating pex"):

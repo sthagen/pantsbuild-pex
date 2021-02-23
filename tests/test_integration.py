@@ -11,6 +11,7 @@ import json
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,6 @@ from zipfile import ZipFile
 
 import pytest
 
-from pex import pex_builder
 from pex.common import (
     safe_copy,
     safe_mkdir,
@@ -31,14 +31,14 @@ from pex.common import (
     temporary_dir,
     touch,
 )
-from pex.compatibility import WINDOWS, nested, to_bytes
+from pex.compatibility import WINDOWS, to_bytes
 from pex.executor import Executor
 from pex.interpreter import PythonInterpreter
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
-from pex.requirements import LogicalLine, ReqInfo, URLFetcher, parse_requirement_file
+from pex.requirements import LogicalLine, PyPIRequirement, URLFetcher, parse_requirement_file
 from pex.testing import (
     IS_PYPY,
     NOT_CPYTHON27,
@@ -60,8 +60,10 @@ from pex.testing import (
     temporary_content,
 )
 from pex.third_party import pkg_resources
-from pex.typing import TYPE_CHECKING
+from pex.third_party.pkg_resources import Requirement
+from pex.typing import TYPE_CHECKING, cast
 from pex.util import DistributionHelper, named_temporary_file
+from pex.variables import ENV, unzip_dir, venv_dir
 
 if TYPE_CHECKING:
     from typing import (
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
         Callable,
         ContextManager,
         Dict,
+        FrozenSet,
         Iterable,
         Iterator,
         List,
@@ -101,6 +104,13 @@ def test_pex_raise():
     run_simple_pex_test(body, coverage=True)
 
 
+def assert_interpreters(label, pex_root):
+    # type: (str, str) -> None
+    assert "interpreters" in os.listdir(
+        pex_root
+    ), "Expected {label} pex root to be populated with interpreters.".format(label=label)
+
+
 def assert_installed_wheels(label, pex_root):
     # type: (str, str) -> None
     assert "installed_wheels" in os.listdir(
@@ -110,11 +120,10 @@ def assert_installed_wheels(label, pex_root):
 
 def test_pex_root_build():
     # type: () -> None
-    with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (
-        buildtime_pex_root,
-        output_dir,
-        home,
-    ):
+    with temporary_dir() as td, temporary_dir() as home:
+        buildtime_pex_root = os.path.join(td, "buildtime_pex_root")
+        output_dir = os.path.join(td, "output_dir")
+
         output_path = os.path.join(output_dir, "pex.pex")
         args = [
             "pex",
@@ -132,26 +141,33 @@ def test_pex_root_build():
 
 def test_pex_root_run():
     # type: () -> None
-    with nested(temporary_dir(), temporary_dir(), temporary_dir(), temporary_dir()) as (
-        buildtime_pex_root,
-        runtime_pex_root,
-        output_dir,
-        home,
-    ):
-        output_path = os.path.join(output_dir, "pex.pex")
+    python35 = ensure_python_interpreter(PY35)
+    python36 = ensure_python_interpreter(PY36)
+
+    with temporary_dir() as td, temporary_dir() as runtime_pex_root, temporary_dir() as home:
+        pex_env = make_env(HOME=home, PEX_PYTHON_PATH=os.pathsep.join((python35, python36)))
+
+        buildtime_pex_root = os.path.join(td, "buildtime_pex_root")
+        output_dir = os.path.join(td, "output_dir")
+
+        pex_pex = os.path.join(output_dir, "pex.pex")
         args = [
             "pex",
             "-o",
-            output_path,
+            pex_pex,
+            "-c",
+            "pex",
             "--not-zip-safe",
             "--pex-root={}".format(buildtime_pex_root),
             "--runtime-pex-root={}".format(runtime_pex_root),
+            "--interpreter-constraint=CPython=={version}".format(version=PY35),
         ]
-        results = run_pex_command(args=args, env=make_env(HOME=home, PEX_INTERPRETER="1"))
+        results = run_pex_command(args=args, env=pex_env, python=python36)
         results.assert_success()
         assert ["pex.pex"] == os.listdir(output_dir), "Expected built pex file."
         assert [] == os.listdir(home), "Expected empty home dir."
 
+        assert_interpreters(label="buildtime", pex_root=buildtime_pex_root)
         assert_installed_wheels(label="buildtime", pex_root=buildtime_pex_root)
         safe_mkdir(buildtime_pex_root, clean=True)
 
@@ -159,17 +175,18 @@ def test_pex_root_run():
             runtime_pex_root
         ), "Expected runtime pex root to be empty prior to any runs."
 
-        _, rc = run_simple_pex(output_path)
-        assert rc == 0
+        subprocess.check_call(args=[python36, pex_pex, "--version"], env=pex_env)
+        assert_interpreters(label="runtime", pex_root=runtime_pex_root)
         assert_installed_wheels(label="runtime", pex_root=runtime_pex_root)
         assert [] == os.listdir(
             buildtime_pex_root
-        ), "Expected buildtime pex root to be empty after runs using a seperate runtime pex root."
+        ), "Expected buildtime pex root to be empty after runs using a separate runtime pex root."
+        assert [] == os.listdir(home), "Expected empty home dir."
 
 
 def test_cache_disable():
     # type: () -> None
-    with nested(temporary_dir(), temporary_dir(), temporary_dir()) as (td, output_dir, tmp_home):
+    with temporary_dir() as td, temporary_dir() as output_dir, temporary_dir() as tmp_home:
         output_path = os.path.join(output_dir, "pex.pex")
         args = [
             "pex",
@@ -1528,10 +1545,10 @@ def test_setup_python_multiple_direct_markers():
                 stderr=subprocess.STDOUT,
                 env=make_env(PATH=os.path.dirname(py36_interpreter)),
             )
-        # TODO: Is the intention of this test that this should fail on platform incompatibility?
-        #  Or should we be working around the platform issue so that the error we see here is
-        #  b"ModuleNotFoundError: No module named 'subprocess32'" ?
-        assert re.search(b"Needed .* compatible dependencies", err.value.output) is not None
+        assert (
+            re.search(b"ModuleNotFoundError: No module named 'subprocess32'", err.value.output)
+            is not None
+        )
 
         subprocess.check_call(
             py2_only_program, env=make_env(PATH=os.path.dirname(py27_interpreter))
@@ -2325,7 +2342,9 @@ def test_unzip_mode():
         )
         assert ["quit re-exec", os.path.realpath(pex_file)] == output1.decode("utf-8").splitlines()
 
-        unzipped_cache = os.path.join(pex_root, pex_builder.UNZIPPED_DIR)
+        pex_hash = PexInfo.from_pex(pex_file).pex_hash
+        assert pex_hash is not None
+        unzipped_cache = unzip_dir(pex_root, pex_hash)
         assert os.path.isdir(unzipped_cache)
         shutil.rmtree(unzipped_cache)
 
@@ -2434,7 +2453,10 @@ def test_resolve_arbitrary_equality_issues_940():
     with temporary_dir() as tmpdir, built_wheel(
         name="foo",
         version="1.0.2-fba4511",
-        python_requires=">=2.7,<=3.9,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*",
+        # We need this to allow the invalid version above to sneak by pip wheel metadata
+        # verification.
+        verify=False,
+        python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*",
     ) as whl:
         pex_file = os.path.join(tmpdir, "pex")
         results = run_pex_command(args=["-o", pex_file, whl])
@@ -2517,46 +2539,46 @@ def run_proxy(mitmdump, tmp_workdir):
     return _run_proxy
 
 
+EXAMPLE_PYTHON_REQUIREMENTS_URL = (
+    "https://raw.githubusercontent.com/pantsbuild/example-python/"
+    "c6052498f25a436f2639ccd0bc846cec1a55d7d5"
+    "/requirements.txt"
+)
+
+
 def test_requirements_network_configuration(run_proxy, tmp_workdir):
     # type: (Callable[[Optional[str]], ContextManager[Tuple[int, str]]], str) -> None
-    requirements_file = os.path.join(tmp_workdir, "requirements.txt")
-    requirements_url = (
-        "https://raw.githubusercontent.com/pantsbuild/example-python/"
-        "2a6f66ce8a4557d4867b39accfca171d7262bb76"
-        "/requirements.txt"
-    )
-    with open(requirements_file, "w") as fp:
-        fp.write("-r {}".format(requirements_url))
-
-    def line(
+    def req(
         contents,  # type: str
         line_no,  # type: int
     ):
-        # type: (...) -> LogicalLine
-        return LogicalLine(
-            "{}\n".format(contents),
-            contents,
-            source=requirements_url,
-            start_line=line_no,
-            end_line=line_no,
+        return PyPIRequirement(
+            LogicalLine(
+                "{}\n".format(contents),
+                contents,
+                source=EXAMPLE_PYTHON_REQUIREMENTS_URL,
+                start_line=line_no,
+                end_line=line_no,
+            ),
+            Requirement.parse(contents),
         )
 
     proxy_auth = "jake:jones"
     with run_proxy(proxy_auth) as (port, ca_cert):
         reqs = parse_requirement_file(
-            requirements_file,
+            EXAMPLE_PYTHON_REQUIREMENTS_URL,
             fetcher=URLFetcher(
-                NetworkConfiguration.create(
+                NetworkConfiguration(
                     proxy="{proxy_auth}@localhost:{port}".format(proxy_auth=proxy_auth, port=port),
                     cert=ca_cert,
                 )
             ),
         )
         assert [
-            ReqInfo.create(line=line("ansicolors>=1.0.2", 4), project_name="ansicolors"),
-            ReqInfo.create(line=line("setuptools>=42.0.0", 5), project_name="setuptools"),
-            ReqInfo.create(line=line("translate>=3.2.1", 6), project_name="translate"),
-            ReqInfo.create(line=line("protobuf>=3.11.3", 7), project_name="protobuf"),
+            req("ansicolors>=1.0.2", 4),
+            req("setuptools>=42.0.0", 5),
+            req("translate>=3.2.1", 6),
+            req("protobuf>=3.11.3", 7),
         ] == list(reqs)
 
 
@@ -2631,3 +2653,512 @@ def test_issues_1031(py_version):
     assert system_site_packages_path in get_system_site_packages_pex_sys_path(
         PEX_INHERIT_PATH="fallback"
     )
+
+
+@pytest.fixture
+def isort_pex_args(tmpdir):
+    # type: (Any) -> Tuple[str, List[str]]
+    pex_file = os.path.join(str(tmpdir), "pex")
+
+    requirements = [
+        # For Python 2.7 and Python 3.5:
+        "isort==4.3.21; python_version<'3.6'",
+        "setuptools==44.1.1; python_version<'3.6'",
+        # For Python 3.6+:
+        "isort==5.6.4; python_version>='3.6'",
+    ]
+    return pex_file, requirements + ["-c", "isort", "-o", pex_file]
+
+
+def test_venv_mode(
+    tmpdir,  # type: Any
+    isort_pex_args,  # type: Tuple[str, List[str]]
+):
+    # type: (...) -> None
+    other_interpreter_version = PY36 if sys.version_info[0] == 2 else PY27
+    other_interpreter = ensure_python_interpreter(other_interpreter_version)
+
+    pex_file, args = isort_pex_args
+    results = run_pex_command(
+        args=args + ["--python", sys.executable, "--python", other_interpreter, "--venv"],
+        quiet=True,
+    )
+    results.assert_success()
+
+    def run_isort_pex(**env):
+        # type: (**Any) -> str
+        pex_root = str(tmpdir)
+        stdout, returncode = run_simple_pex(
+            pex_file,
+            args=["-c", "import sys; print(sys.executable)"],
+            env=make_env(PEX_ROOT=pex_root, PEX_INTERPRETER=1, **env),
+        )
+        assert returncode == 0, stdout
+        pex_interpreter = cast(str, stdout.decode("utf-8").strip())
+        with ENV.patch(**env):
+            pex_info = PexInfo.from_pex(pex_file)
+            pex_hash = pex_info.pex_hash
+            assert pex_hash is not None
+            expected_venv_home = venv_dir(pex_root, pex_hash, interpreter_constraints=[])
+        assert expected_venv_home == os.path.commonprefix([pex_interpreter, expected_venv_home])
+        return pex_interpreter
+
+    isort_pex_interpreter1 = run_isort_pex()
+    assert isort_pex_interpreter1 == run_isort_pex()
+
+    isort_pex_interpreter2 = run_isort_pex(PEX_PYTHON=other_interpreter)
+    assert other_interpreter != isort_pex_interpreter2
+    assert isort_pex_interpreter1 != isort_pex_interpreter2
+    assert isort_pex_interpreter2 == run_isort_pex(PEX_PYTHON=other_interpreter)
+
+
+def test_venv_mode_issues_1218(tmpdir):
+    # type: (Any) -> None
+
+    def get_fabric_versions(pex):
+        # type: (str) -> Dict[str, str]
+        output, returncode = run_simple_pex(pex, args=["--version"])
+        assert 0 == returncode
+        return dict(
+            cast("Tuple[str, str]", line.split(" ", 1))
+            for line in output.decode("utf-8").splitlines()
+        )
+
+    # The only difference in these two PEX files is their entrypoint. Ensure venv execution takes
+    # that into account and disambiguates the otherwise identical PEX files.
+
+    invoke_pex = os.path.join(str(tmpdir), "invoke.pex")
+    results = run_pex_command(
+        args=["fabric==2.6.0", "--venv", "-e", "invoke", "-o", invoke_pex], quiet=True
+    )
+    results.assert_success()
+    invoke_versions = get_fabric_versions(invoke_pex)
+    assert len(invoke_versions) == 1
+    invoke_version = invoke_versions["Invoke"]
+    assert invoke_version == "1.5.0"
+
+    fabric_pex = os.path.join(str(tmpdir), "fabric.pex")
+    results = run_pex_command(
+        args=[
+            "fabric==2.6.0",
+            "--venv",
+            "-e",
+            "fabric",
+            "-o",
+            fabric_pex,
+            "--pex-repository",
+            invoke_pex,
+        ],
+        quiet=True,
+    )
+    results.assert_success()
+    fabric_versions = get_fabric_versions(fabric_pex)
+    assert len(fabric_versions) >= 2
+    assert invoke_version == fabric_versions["Invoke"]
+    assert "2.6.0" == fabric_versions["Fabric"]
+
+    invoke_pex_info = PexInfo.from_pex(invoke_pex)
+    fabric_pex_info = PexInfo.from_pex(fabric_pex)
+    assert invoke_pex_info.code_hash == fabric_pex_info.code_hash
+    assert invoke_pex_info.distributions == fabric_pex_info.distributions
+    assert invoke_pex_info.pex_hash != fabric_pex_info.pex_hash
+
+
+def test_venv_mode_pex_path_issues_1225(tmpdir):
+    # type: (Any) -> None
+
+    test_file = os.path.join(str(tmpdir), "test.py")
+    with open(test_file, "w") as fp:
+        fp.write(
+            dedent(
+                """
+                import sys
+
+                try:
+                    __import__(sys.argv[1])
+                except ImportError:
+                    sys.exit(int(sys.argv[2]))
+                """
+            )
+        )
+
+    empty_pex = os.path.join(str(tmpdir), "empty.pex")
+    results = run_pex_command(args=["--venv", "-o", empty_pex])
+    results.assert_success()
+
+    output, returncode = run_simple_pex(empty_pex, args=[test_file, "colors", "37"])
+    assert 37 == returncode, output.decode("utf-8")
+
+    colors_pex = os.path.join(str(tmpdir), "colors.pex")
+    results = run_pex_command(args=["ansicolors==1.1.8", "-o", colors_pex])
+    results.assert_success()
+
+    # Exporting PEX_PATH should re-create the venv.
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "colors", "37"], env=make_env(PEX_PATH=colors_pex)
+    )
+    assert 0 == returncode, output.decode("utf-8")
+
+    results = run_pex_command(args=["--pex-path", colors_pex, "--venv", "-o", empty_pex])
+    results.assert_success()
+
+    output, returncode = run_simple_pex(empty_pex, args=[test_file, "colors", "37"])
+    assert 0 == returncode
+
+    # Exporting PEX_PATH should re-create the venv, adding to --pex-path.
+    pkginfo_pex = os.path.join(str(tmpdir), "pkginfo.pex")
+    results = run_pex_command(args=["pkginfo==1.7.0", "-o", pkginfo_pex])
+    results.assert_success()
+
+    pex_path_env = make_env(PEX_PATH=pkginfo_pex)
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "colors", "37"], env=pex_path_env
+    )
+    assert 0 == returncode
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "pkginfo", "42"], env=pex_path_env
+    )
+    assert 0 == returncode
+
+    # Exporting PEX_PATH should re-create the venv since the adjoined pex file's distribution
+    # contents have changed.
+    results = run_pex_command(args=["ascii-ruler==0.0.4", "-o", pkginfo_pex])
+    results.assert_success()
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "colors", "37"], env=pex_path_env
+    )
+    assert 0 == returncode
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "ascii_ruler", "19"], env=pex_path_env
+    )
+    assert 0 == returncode
+    output, returncode = run_simple_pex(
+        empty_pex, args=[test_file, "pkginfo", "42"], env=pex_path_env
+    )
+    assert 42 == returncode
+
+
+@pytest.mark.parametrize(
+    "mode_args",
+    [
+        pytest.param([], id="PEX"),
+        pytest.param(["--unzip"], id="unzip"),
+        pytest.param(["--venv"], id="venv"),
+    ],
+)
+def test_seed(
+    isort_pex_args,  # type: Tuple[str, List[str]]
+    mode_args,  # type: List[str]
+):
+    # type: (...) -> None
+    pex_file, args = isort_pex_args
+    results = run_pex_command(args=args + mode_args + ["--seed"], quiet=True)
+    results.assert_success()
+
+    # Setting posix=False works around this issue under pypy: https://bugs.python.org/issue1170.
+    seed_argv = shlex.split(results.output, posix=False)
+    isort_args = ["--version"]
+    seed_stdout, seed_stderr = Executor.execute(seed_argv + isort_args)
+    pex_stdout, pex_stderr = Executor.execute([pex_file] + isort_args)
+    assert pex_stdout == seed_stdout
+    assert pex_stderr == seed_stderr
+
+
+def test_pip_issues_9420_workaround():
+    # type: () -> None
+
+    # N.B.: isort 5.7.0 needs Python >=3.6
+    python = ensure_python_interpreter(PY36)
+
+    results = run_pex_command(
+        args=["--resolver-version", "pip-2020-resolver", "isort[colors]==5.7.0", "colorama==0.4.1"],
+        python=python,
+        quiet=True,
+    )
+    results.assert_failure()
+    normalized_stderr = "\n".join(line.strip() for line in results.error.strip().splitlines())
+    assert normalized_stderr.startswith(
+        dedent(
+            """\
+            ERROR: Cannot install colorama==0.4.1 and isort[colors]==5.7.0 because these package versions have conflicting dependencies.
+            ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/user_guide/#fixing-conflicting-dependencies
+            """
+        )
+    )
+    assert normalized_stderr.endswith(
+        dedent(
+            """\
+            The conflict is caused by:
+            The user requested colorama==0.4.1
+            isort[colors] 5.7.0 depends on colorama<0.5.0 and >=0.4.3; extra == "colors"
+
+            To fix this you could try to:
+            1. loosen the range of package versions you've specified
+            2. remove package versions to allow pip attempt to solve the dependency conflict
+            """
+        ).strip()
+    )
+
+
+def test_requirement_file_from_url(tmpdir):
+    # type: (Any) -> None
+    pex_file = os.path.join(str(tmpdir), "pex")
+    results = run_pex_command(args=["-r", EXAMPLE_PYTHON_REQUIREMENTS_URL, "-o", pex_file])
+    results.assert_success()
+    output, returncode = run_simple_pex(
+        pex_file, args=["-c", "import colors, google.protobuf, setuptools, translate"]
+    )
+    assert 0 == returncode, output
+    assert b"" == output
+
+
+def test_constraint_file_from_url(tmpdir):
+    # type: (Any) -> None
+
+    # N.B.: The fasteners library requires Python >=3.6.
+    python = ensure_python_interpreter(PY36)
+
+    pex_file = os.path.join(str(tmpdir), "pex")
+
+    # N.B.: This requirements file has fasteners==0.15.0 but fasteners 0.16.0 is available.
+    # N.B.: This requirements file has 28 requirements in addition to fasteners.
+    pants_requirements_url = (
+        "https://raw.githubusercontent.com/pantsbuild/pants/"
+        "b0fbb76112dcb61b3004c2caf3a59d3f03e3f182"
+        "/3rdparty/python/requirements.txt"
+    )
+    results = run_pex_command(
+        args=["fasteners", "--constraints", pants_requirements_url, "-o", pex_file], python=python
+    )
+    results.assert_success()
+    output, returncode = run_simple_pex(
+        pex_file,
+        args=["-c", "from fasteners.version import version_string; print(version_string())"],
+        interpreter=PythonInterpreter.from_binary(python),
+    )
+    assert 0 == returncode, output
+
+    # Strange but true: https://github.com/harlowja/fasteners/blob/0.15/fasteners/version.py
+    assert (
+        b"0.14.1" == output.strip()
+    ), "Fasteners 0.15.0 is expected to report its version as 0.14.1"
+
+    # N.B.: Fasteners 0.15.0 depends on six and monotonic>=0.1; neither of which are constrained by
+    # `pants_requirements_url`.
+    dist_paths = set(PexInfo.from_pex(pex_file).distributions.keys())
+    assert len(dist_paths) == 3
+    dist_paths.remove("fasteners-0.15-py2.py3-none-any.whl")
+    for dist_path in dist_paths:
+        assert dist_path.startswith(("six-", "monotonic-")) and dist_path.endswith(".whl")
+
+
+def test_top_level_environment_markers_issues_899(tmpdir):
+    # type: (Any) -> None
+    python27 = ensure_python_interpreter(PY27)
+    python36 = ensure_python_interpreter(PY36)
+
+    pex_file = os.path.join(str(tmpdir), "pex")
+
+    requirement = "subprocess32==3.2.7; python_version<'3'"
+    results = run_pex_command(
+        args=["--python", python27, "--python", python36, requirement, "-o", pex_file]
+    )
+    results.assert_success()
+    requirements = PexInfo.from_pex(pex_file).requirements
+    assert len(requirements) == 1
+    assert Requirement.parse(requirement) == Requirement.parse(requirements.pop())
+
+    output, returncode = run_simple_pex(
+        pex_file,
+        args=["-c", "import subprocess32"],
+        interpreter=PythonInterpreter.from_binary(python27),
+    )
+    assert 0 == returncode
+
+    py36_interpreter = PythonInterpreter.from_binary(python36)
+    output, returncode = run_simple_pex(
+        pex_file,
+        args=["-c", "import subprocess"],
+        interpreter=py36_interpreter,
+    )
+    assert 0 == returncode
+
+    py36_interpreter = PythonInterpreter.from_binary(python36)
+    output, returncode = run_simple_pex(
+        pex_file,
+        args=["-c", "import subprocess32"],
+        interpreter=py36_interpreter,
+    )
+    assert (
+        1 == returncode
+    ), "Expected subprocess32 to be present in the PEX file but not activated for Python 3."
+
+
+def test_2020_resolver_engaged_issues_1179():
+    # type: () -> None
+
+    # The Pip legacy resolver cannot solve the following requirements but the 2020 resolver can.
+    # Use this fact to prove we're plumbing Pip resolver version arguments correctly.
+    pex_args = ["boto3==1.15.6", "botocore>1.17<1.18.7", "--", "-c", "import boto3"]
+
+    results = run_pex_command(args=["--resolver-version", "pip-legacy-resolver"] + pex_args)
+    results.assert_failure()
+    assert "Failed to resolve compatible distributions:" in results.error
+    assert "1: boto3==1.15.6 requires botocore<1.19.0,>=1.18.6 but " in results.error
+
+    run_pex_command(args=["--resolver-version", "pip-2020-resolver"] + pex_args).assert_success()
+
+
+def test_isolated_pex_zip_issues_1232(tmpdir):
+    # type: (Any) -> None
+
+    pex_root = os.path.join(str(tmpdir), "pex_root")
+
+    python35 = ensure_python_interpreter(PY35)
+    python36 = ensure_python_interpreter(PY36)
+
+    pex_env = make_env(PEX_PYTHON_PATH=os.pathsep.join((python35, python36)))
+
+    def add_pex_args(*args):
+        # type: (*str) -> List[str]
+        return list(args) + [
+            "--pex-root",
+            pex_root,
+            "--runtime-pex-root",
+            pex_root,
+            "--interpreter-constraint",
+            "CPython=={version}".format(version=PY35),
+        ]
+
+    def tally_isolated_vendoreds():
+        # type: () -> Dict[str, FrozenSet[str]]
+        def vendored_toplevel(isolated_dir):
+            # type: (str) -> Iterator[str]
+            vendored_dir = os.path.join(isolated_dir, "pex/vendor/_vendored")
+            for path in os.listdir(vendored_dir):
+                if path in ("__pycache__", "__init__.py"):
+                    continue
+                if os.path.isdir(os.path.join(vendored_dir, path)):
+                    yield path
+                module, ext = os.path.splitext(path)
+                if ext == ".py":
+                    yield module
+
+        isolated_root = os.path.join(pex_root, "isolated")
+        vendored_by_isolated = {}
+        for entry in os.listdir(isolated_root):
+            path = os.path.join(isolated_root, entry)
+            if not os.path.isdir(path):
+                continue
+            vendored_by_isolated[path] = frozenset(vendored_toplevel(path))
+        return vendored_by_isolated
+
+    # 1. Isolate current loose source Pex at build-time.
+    # ===
+    current_pex_pex = os.path.join(str(tmpdir), "pex-current.pex")
+    results = run_pex_command(
+        args=add_pex_args(".", "-c", "pex", "-o", current_pex_pex), env=pex_env, python=python35
+    )
+    results.assert_success()
+
+    current_isolated_vendoreds = tally_isolated_vendoreds()
+    assert 1 == len(current_isolated_vendoreds), (
+        "Since we just ran the Pex tool and nothing else, a single isolation of the Pex loose "
+        "source in this repo should have occurred."
+    )
+    assert {"pip", "wheel"}.issubset(
+        list(current_isolated_vendoreds.values())[0]
+    ), "Expected isolation of current Pex code to be a full build-time isolation."
+
+    # 2. Isolate current Pex PEX at run-time.
+    # ===
+    modified_pex_src = os.path.join(str(tmpdir), "modified_pex_src")
+    shutil.copytree("pex", os.path.join(modified_pex_src, "pex"))
+    with open(os.path.join(modified_pex_src, "pex", "version.py"), "a") as fp:
+        fp.write("# modified\n")
+    shutil.copy("pyproject.toml", os.path.join(modified_pex_src, "pyproject.toml"))
+    # N.B.: README.rst is needed by flit since we tell it to pull the distribution description from
+    # there when building the Pex distribution.
+    shutil.copy("README.rst", os.path.join(modified_pex_src, "README.rst"))
+
+    modified_pex = os.path.join(str(tmpdir), "modified.pex")
+    subprocess.check_call(
+        args=add_pex_args(
+            python36, current_pex_pex, modified_pex_src, "-c", "pex", "-o", modified_pex
+        ),
+        env=pex_env,
+    )
+    current_pex_isolated_vendoreds = tally_isolated_vendoreds()
+    current_pex_isolation = set(current_isolated_vendoreds.keys()) ^ set(
+        current_pex_isolated_vendoreds.keys()
+    )
+    assert 1 == len(current_pex_isolation), (
+        "Since the modified Pex PEX was built from a Pex PEX an isolation of the Pex PEX bootstrap "
+        "code should have occurred bringing the total isolations up to two."
+    )
+    current_pex_vendoreds = current_pex_isolated_vendoreds[current_pex_isolation.pop()]
+    assert "pip" not in current_pex_vendoreds, "Expected a Pex runtime isolation."
+    assert "wheel" not in current_pex_vendoreds, "Expected a Pex runtime isolation."
+
+    # 3. Isolate modified Pex PEX at build-time.
+    # ===
+    ansicolors_pex = os.path.join(str(tmpdir), "ansicolors.pex")
+    subprocess.check_call(
+        args=add_pex_args(
+            python36,
+            modified_pex,
+            "ansicolors==1.1.8",
+            "-o",
+            ansicolors_pex,
+        ),
+        env=pex_env,
+    )
+    modified_pex_isolated_vendoreds = tally_isolated_vendoreds()
+    modified_pex_isolation = set(current_pex_isolated_vendoreds.keys()) ^ set(
+        modified_pex_isolated_vendoreds.keys()
+    )
+    assert 1 == len(modified_pex_isolation), (
+        "Since the ansicolors PEX was built from the modifed Pex PEX a new isolation of the "
+        "modified Pex PEX code should have occurred bringing the total isolations up to three."
+    )
+    assert {"pip", "wheel"}.issubset(
+        modified_pex_isolated_vendoreds[modified_pex_isolation.pop()]
+    ), "Expected isolation of modified Pex code to be a full build-time isolation."
+
+    # 4. Isolate modified Pex PEX at run-time.
+    # ===
+    # Force the bootstrap to run interpreter identification which will force a Pex isolation.
+    shutil.rmtree(os.path.join(pex_root, "interpreters"))
+    subprocess.check_call(args=[python36, ansicolors_pex, "-c", "import colors"], env=pex_env)
+    ansicolors_pex_isolated_vendoreds = tally_isolated_vendoreds()
+    ansicolors_pex_isolation = set(modified_pex_isolated_vendoreds.keys()) ^ set(
+        ansicolors_pex_isolated_vendoreds.keys()
+    )
+    assert 1 == len(ansicolors_pex_isolation), (
+        "Since the ansicolors PEX has modified Pex bootstrap code, a further isolation should have"
+        "occurred bringing the total isolations up to four."
+    )
+    ansicolors_pex_vendoreds = ansicolors_pex_isolated_vendoreds[ansicolors_pex_isolation.pop()]
+    assert "pip" not in ansicolors_pex_vendoreds, "Expected a Pex runtime isolation."
+    assert "wheel" not in ansicolors_pex_vendoreds, "Expected a Pex runtime isolation."
+
+    # 5. No new isolations.
+    # ===
+    ansicolors_pex = os.path.join(str(tmpdir), "ansicolors.old.pex")
+    subprocess.check_call(
+        args=add_pex_args(
+            python36,
+            modified_pex,
+            "ansicolors==1.0.2",
+            "-o",
+            ansicolors_pex,
+        ),
+        env=pex_env,
+    )
+
+    # Force the bootstrap to run interpreter identification which will force a Pex isolation.
+    shutil.rmtree(os.path.join(pex_root, "interpreters"))
+    subprocess.check_call(args=[python36, ansicolors_pex, "-c", "import colors"], env=pex_env)
+    assert (
+        ansicolors_pex_isolated_vendoreds == tally_isolated_vendoreds()
+    ), "Expecting no new Pex isolations."

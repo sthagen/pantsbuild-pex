@@ -11,19 +11,31 @@ import pytest
 from pex.common import safe_open, temporary_dir, touch
 from pex.requirements import (
     Constraint,
+    LocalProjectRequirement,
     LogicalLine,
     ParseError,
-    ReqInfo,
+    PyPIRequirement,
     Source,
     URLFetcher,
+    URLRequirement,
+    parse_requirement_file,
+    parse_requirement_from_project_name_and_specifier,
     parse_requirements,
 )
 from pex.testing import environment_as
 from pex.third_party.packaging.markers import Marker
+from pex.third_party.pkg_resources import Requirement
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Iterator, Iterable, List, Optional, Union
+    import attr  # vendor:skip
+    from typing import Any, Iterable, Iterator, List, Optional, Union
+
+    from pex.requirements import ParsedRequirement
+
+    ParsedRequirementOrConstraint = Union[ParsedRequirement, Constraint]
+else:
+    from pex.third_party import attr
 
 
 @pytest.fixture
@@ -76,13 +88,13 @@ def test_parse_requirements_failure_bad_requirement(chroot):
 
     req_iter = parse_requirements(Source.from_text("-r other-requirements.txt"))
 
-    req_info = next(req_iter)
-    assert isinstance(req_info, ReqInfo)
-    assert "GoodRequirement" == req_info.project_name
+    parsed_requirement = next(req_iter)
+    assert isinstance(parsed_requirement, PyPIRequirement)
+    assert "GoodRequirement" == parsed_requirement.requirement.project_name
 
-    req_info = next(req_iter)
-    assert isinstance(req_info, ReqInfo)
-    assert "AnotherRequirement" == req_info.project_name
+    parsed_requirement = next(req_iter)
+    assert isinstance(parsed_requirement, PyPIRequirement)
+    assert "AnotherRequirement" == parsed_requirement.requirement.project_name
 
     with pytest.raises(ParseError) as exc_info:
         next(req_iter)
@@ -111,34 +123,70 @@ class MarkerWithEq(Marker):
         return type(other) == MarkerWithEq and str(self) == str(other)
 
 
+DUMMY_LINE = LogicalLine("", "", "<string>", 1, 1)
+
+
 def req(
-    project_name=None,  # type: Optional[str]
-    url=None,  # type: Optional[str]
+    project_name,  # type: str
+    extras=None,  # type: Optional[Iterable[str]]
+    specifier=None,  # type: Optional[str]
     marker=None,  # type: Optional[str]
     editable=False,  # type: bool
-    is_local_project=False,  # type: bool
 ):
-    # type: (...) -> ReqInfo
-    return ReqInfo(
-        line=None,
-        project_name=project_name,
-        url=url,
-        marker=MarkerWithEq.wrap(marker),
+    # type: (...) -> PyPIRequirement
+    return PyPIRequirement(
+        line=DUMMY_LINE,
+        requirement=parse_requirement_from_project_name_and_specifier(
+            project_name, extras=extras, specifier=specifier, marker=marker
+        ),
         editable=editable,
-        is_local_project=is_local_project,
     )
 
 
-def normalize_results(req_infos):
-    # type: (Iterable[Union[Constraint, ReqInfo]]) -> List[Union[Constraint, ReqInfo]]
-    def normalize_req_info(req_info):
-        return req_info._replace(line=None)._replace(marker=MarkerWithEq.wrap(req_info.marker))
+def url_req(
+    url,  # type: str
+    project_name,  # type: str
+    extras=None,  # type: Optional[Iterable[str]]
+    specifier=None,  # type: Optional[str]
+    marker=None,  # type: Optional[str]
+    editable=False,  # type: bool
+):
+    # type: (...) -> URLRequirement
+    return URLRequirement(
+        line=DUMMY_LINE,
+        url=url,
+        requirement=parse_requirement_from_project_name_and_specifier(
+            project_name, extras=extras, specifier=specifier, marker=marker
+        ),
+        editable=editable,
+    )
 
+
+def local_req(
+    path,  # type: str
+    extras=None,  # type: Optional[Iterable[str]]
+    marker=None,  # type: Optional[str]
+    editable=False,  # type: bool
+):
+    # type: (...) -> LocalProjectRequirement
+    return LocalProjectRequirement(
+        line=DUMMY_LINE,
+        path=path,
+        extras=extras,
+        marker=MarkerWithEq.wrap(marker),
+        editable=editable,
+    )
+
+
+def normalize_results(parsed_requirements):
+    # type: (Iterable[ParsedRequirementOrConstraint]) -> List[ParsedRequirementOrConstraint]
     return [
-        normalize_req_info(req_info)
-        if isinstance(req_info, ReqInfo)
-        else Constraint(normalize_req_info(req_info.req_info))
-        for req_info in req_infos
+        attr.evolve(
+            parsed_requirement, line=DUMMY_LINE, marker=MarkerWithEq.wrap(parsed_requirement.marker)
+        )
+        if isinstance(parsed_requirement, LocalProjectRequirement)
+        else attr.evolve(parsed_requirement, line=DUMMY_LINE)
+        for parsed_requirement in parsed_requirements
     ]
 
 
@@ -161,7 +209,8 @@ def test_parse_requirements_stress(chroot):
                 SomeProject ==5.4 ; python_version < '2.7'
                 SomeProject; sys_platform == 'win32'
                 
-                SomeProject @ file:///somewhere/over/here
+                SomeProject @ https://example.com/somewhere/over/here
+                SomeProject @ file:somewhere/over/here
                 
                 FooProject >= 1.2 --global-option="--no-user-cfg" \\
                       --install-option="--prefix='/usr/local'" \\
@@ -177,6 +226,7 @@ def test_parse_requirements_stress(chroot):
                 """
             )
         )
+    touch("somewhere/over/here/pyproject.toml")
 
     with safe_open(os.path.join(chroot, "extra", "stress.txt"), "w") as fp:
         fp.write(
@@ -184,7 +234,7 @@ def test_parse_requirements_stress(chroot):
             # https://pip.pypa.io/en/stable/reference/pip_install/#requirements-file-format.
             dedent(
                 """\
-                -c subdir/more-requirements.txt
+                -c file:subdir/more-requirements.txt
 
                 a/local/project[foo]; python_full_version == "2.7.8"
                 ./another/local/project;python_version == "2.7.*"
@@ -204,6 +254,7 @@ def test_parse_requirements_stress(chroot):
                 Django@ git+https://github.com/django/django.git
                 Django@git+https://github.com/django/django.git@stable/2.1.x
                 Django@ git+https://github.com/django/django.git@fd209f62f1d83233cc634443cfac5ee4328d98b8
+                Django @ file:projects/django-2.3.zip; python_version >= "3.10"
                 """
             )
         )
@@ -211,6 +262,7 @@ def test_parse_requirements_stress(chroot):
     touch("extra/a/local/project/pyproject.toml")
     touch("extra/another/local/project/setup.py")
     touch("extra/tmp/tmpW8tdb_/setup.py")
+    touch("extra/projects/django-2.3.zip")
 
     with safe_open(os.path.join(chroot, "subdir", "more-requirements.txt"), "w") as fp:
         fp.write(
@@ -260,6 +312,11 @@ def test_parse_requirements_stress(chroot):
             ),
         )
     )
+
+    # Ensure local non-distribution files matching distribution names are not erroneously probed
+    # as distributions to find name and version metadata.
+    touch("nose")
+
     touch("downloads/numpy-1.9.2-cp34-none-win32.whl")
     with environment_as(PROJECT_NAME="Project"):
         results = normalize_results(req_iter)
@@ -268,101 +325,161 @@ def test_parse_requirements_stress(chroot):
         req(project_name="nose"),
         req(project_name="nose-cov"),
         req(project_name="beautifulsoup4"),
-        req(project_name="docopt"),
-        req(project_name="keyring"),
-        req(project_name="coverage"),
-        req(project_name="Mopidy-Dirble"),
+        req(project_name="docopt", specifier="==0.6.1"),
+        req(project_name="keyring", specifier=">=4.1.1"),
+        req(project_name="coverage", specifier="!=3.5"),
+        req(project_name="Mopidy-Dirble", specifier="~=1.1"),
         req(project_name="SomeProject"),
-        req(project_name="SomeProject"),
-        req(project_name="SomeProject"),
-        req(project_name="SomeProject"),
-        req(project_name="SomeProject"),
-        req(project_name="SomeProject", marker="python_version < '2.7'"),
+        req(project_name="SomeProject", specifier="==1.3"),
+        req(project_name="SomeProject", specifier=">=1.2,<2.0"),
+        req(project_name="SomeProject", extras=["foo", "bar"]),
+        req(project_name="SomeProject", specifier="~=1.4.2"),
+        req(project_name="SomeProject", specifier="==5.4", marker="python_version < '2.7'"),
         req(project_name="SomeProject", marker="sys_platform == 'win32'"),
-        req(project_name="SomeProject", url="file:///somewhere/over/here"),
-        req(project_name="FooProject"),
-        req(
+        url_req(project_name="SomeProject", url="https://example.com/somewhere/over/here"),
+        local_req(path=os.path.realpath("somewhere/over/here")),
+        req(project_name="FooProject", specifier=">=1.2"),
+        url_req(
             project_name="MyProject",
             url="git+https://git.example.com/MyProject.git@da39a3ee5e6b4b0d3255bfef95601890afd80709",
         ),
-        req(project_name="MyProject", url="git+ssh://git.example.com/MyProject"),
-        req(project_name="MyProject", url="git+file:/home/user/projects/MyProject"),
-        Constraint(req(project_name="AnotherProject")),
-        req(
-            url=os.path.realpath("extra/a/local/project"),
+        url_req(project_name="MyProject", url="git+ssh://git.example.com/MyProject"),
+        url_req(project_name="MyProject", url="git+file:/home/user/projects/MyProject"),
+        Constraint(DUMMY_LINE, Requirement.parse("AnotherProject")),
+        local_req(
+            path=os.path.realpath("extra/a/local/project"),
+            extras=["foo"],
             marker="python_full_version == '2.7.8'",
-            is_local_project=True,
         ),
-        req(
-            url=os.path.realpath("extra/another/local/project"),
+        local_req(
+            path=os.path.realpath("extra/another/local/project"),
             marker="python_version == '2.7.*'",
-            is_local_project=True,
         ),
-        req(url=os.path.realpath("extra/another/local/project"), is_local_project=True),
-        req(url=os.path.realpath("extra"), is_local_project=True),
-        req(url=os.path.realpath("extra/tmp/tmpW8tdb_"), is_local_project=True),
-        req(url=os.path.realpath("extra/tmp/tmpW8tdb_"), is_local_project=True),
-        req(
-            url=os.path.realpath("extra/tmp/tmpW8tdb_"),
+        local_req(path=os.path.realpath("extra/another/local/project")),
+        local_req(path=os.path.realpath("extra")),
+        local_req(path=os.path.realpath("extra/tmp/tmpW8tdb_")),
+        local_req(path=os.path.realpath("extra/tmp/tmpW8tdb_"), extras=["foo"]),
+        local_req(
+            path=os.path.realpath("extra/tmp/tmpW8tdb_"),
+            extras=["foo"],
             marker="python_version == '3.9'",
-            is_local_project=True,
         ),
-        req(
+        url_req(
             project_name="AnotherProject",
             url="hg+http://hg.example.com/MyProject@da39a3ee5e6b",
+            extras=["more", "extra"],
             marker="python_version == '3.9.*'",
         ),
-        req(project_name="Project", url="ftp://a/Project-1.0.tar.gz"),
-        req(project_name="Project", url="http://a/Project-1.0.zip"),
-        req(project_name="numpy", url="https://a/numpy-1.9.2-cp34-none-win32.whl"),
-        req(project_name="Django", url="git+https://github.com/django/django.git"),
-        req(project_name="Django", url="git+https://github.com/django/django.git@stable/2.1.x"),
-        req(
+        url_req(project_name="Project", url="ftp://a/Project-1.0.tar.gz", specifier="==1.0"),
+        url_req(project_name="Project", url="http://a/Project-1.0.zip", specifier="==1.0"),
+        url_req(
+            project_name="numpy",
+            url="https://a/numpy-1.9.2-cp34-none-win32.whl",
+            specifier="==1.9.2",
+        ),
+        url_req(project_name="Django", url="git+https://github.com/django/django.git"),
+        url_req(project_name="Django", url="git+https://github.com/django/django.git@stable/2.1.x"),
+        url_req(
             project_name="Django",
             url="git+https://github.com/django/django.git@fd209f62f1d83233cc634443cfac5ee4328d98b8",
         ),
-        req(
+        url_req(
+            project_name="Django",
+            url=os.path.realpath("extra/projects/django-2.3.zip"),
+            specifier="==2.3",
+            marker="python_version>='3.10'",
+        ),
+        url_req(
             project_name="numpy",
             url=os.path.realpath("./downloads/numpy-1.9.2-cp34-none-win32.whl"),
+            specifier="==1.9.2",
         ),
-        req(
+        url_req(
             project_name="wxPython_Phoenix",
             url="http://wxpython.org/Phoenix/snapshot-builds/wxPython_Phoenix-3.0.3.dev1820+49a8884-cp34-none-win_amd64.whl",
+            specifier="==3.0.3.dev1820+49a8884",
         ),
         req(project_name="rejected"),
         req(project_name="green"),
     ] == results
 
 
+EXAMPLE_PYTHON_REQUIREMENTS_URL = (
+    "https://raw.githubusercontent.com/pantsbuild/example-python/"
+    "c6052498f25a436f2639ccd0bc846cec1a55d7d5"
+    "/requirements.txt"
+)
+
+EXPECTED_EXAMPLE_PYTHON_REQ_INFOS = [
+    req(project_name="ansicolors", specifier=">=1.0.2"),
+    req(project_name="setuptools", specifier=">=42.0.0"),
+    req(project_name="translate", specifier=">=3.2.1"),
+    req(project_name="protobuf", specifier=">=3.11.3"),
+]
+
+
 def test_parse_requirements_from_url():
     # type: () -> None
     req_iter = parse_requirements(
-        Source.from_text(
-            "-r https://raw.githubusercontent.com/pantsbuild/example-python/c6052498f25a436f2639ccd0bc846cec1a55d7d5/requirements.txt"
-        ),
+        Source.from_text("-r {}".format(EXAMPLE_PYTHON_REQUIREMENTS_URL)),
+        fetcher=URLFetcher(),
+    )
+    results = normalize_results(req_iter)
+    assert EXPECTED_EXAMPLE_PYTHON_REQ_INFOS == results
+
+
+def test_parse_constraints_from_url():
+    # type: () -> None
+    req_iter = parse_requirements(
+        Source.from_text("-c {}".format(EXAMPLE_PYTHON_REQUIREMENTS_URL)),
         fetcher=URLFetcher(),
     )
     results = normalize_results(req_iter)
     assert [
-        req(project_name="ansicolors"),
-        req(project_name="setuptools"),
-        req(project_name="translate"),
-        req(project_name="protobuf"),
+        Constraint(req.line, req.requirement) for req in EXPECTED_EXAMPLE_PYTHON_REQ_INFOS
     ] == results
+
+
+def test_parse_requirement_file_from_url():
+    # type: () -> None
+    req_iter = parse_requirement_file(EXAMPLE_PYTHON_REQUIREMENTS_URL, fetcher=URLFetcher())
+    results = normalize_results(req_iter)
+    assert EXPECTED_EXAMPLE_PYTHON_REQ_INFOS == results
+
+
+def test_parse_requirement_file_from_file_url(tmpdir):
+    # type: (Any) -> None
+    requirements_file = os.path.join(str(tmpdir), "requirements.txt")
+    with open(requirements_file, "w") as fp:
+        fp.write(
+            dedent(
+                """\
+                foo==1.0.0
+                bar>3
+                """
+            )
+        )
+
+    req_iter = parse_requirement_file(requirements_file)
+    expected = normalize_results(req_iter)
+
+    req_iter = parse_requirement_file("file:{}".format(requirements_file))
+    results = normalize_results(req_iter)
+    assert expected == results
+    req_iter = parse_requirement_file("file://{}".format(requirements_file))
+    results = normalize_results(req_iter)
+    assert expected == results
 
 
 def test_parse_requirements_from_url_no_fetcher():
     # type: () -> None
-    req_iter = parse_requirements(
-        Source.from_text(
-            "-r https://raw.githubusercontent.com/pantsbuild/example-python/c6052498f25a436f2639ccd0bc846cec1a55d7d5/requirements.txt"
-        )
-    )
+    req_iter = parse_requirements(Source.from_text("-r {}".format(EXAMPLE_PYTHON_REQUIREMENTS_URL)))
     with pytest.raises(ParseError) as exec_info:
         next(req_iter)
 
     assert (
         "<string> line 1:\n"
-        "-r https://raw.githubusercontent.com/pantsbuild/example-python/c6052498f25a436f2639ccd0bc846cec1a55d7d5/requirements.txt\n"
-        "Problem resolving requirements file: The source is a url but no fetcher was supplied to resolve its contents with."
+        "-r {}\n"
+        "Problem resolving requirements file: The source is a url but no fetcher was supplied to "
+        "resolve its contents with.".format(EXAMPLE_PYTHON_REQUIREMENTS_URL)
     ) == str(exec_info.value)

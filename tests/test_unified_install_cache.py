@@ -108,9 +108,11 @@ def test_issues_789_demo():
     colorized_isort_pex_info.pex_root = ptex_cache
 
     # Force the standard pex to extract its code. An external tool like Pants would already know the
-    # orignal source code file paths, but we need to discover here.
+    # original source code file paths, but we need to discover here.
+    code_hash = colorized_isort_pex_info.code_hash
+    assert code_hash is not None
     colorized_isort_pex_code_dir = os.path.join(
-        colorized_isort_pex_info.zip_unsafe_cache, colorized_isort_pex_info.code_hash
+        colorized_isort_pex_info.zip_unsafe_cache, code_hash
     )
     env = os.environ.copy()
     env.update(PEX_ROOT=ptex_cache, PEX_INTERPRETER="1", PEX_FORCE_LOCAL="1")
