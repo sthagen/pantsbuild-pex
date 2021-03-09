@@ -10,16 +10,19 @@ import zipfile
 from contextlib import closing
 from email.message import Message
 from email.parser import Parser
+from io import StringIO
+from textwrap import dedent
 
 from pex import pex_warnings
-from pex.common import open_zip
+from pex.common import open_zip, pluralize
+from pex.compatibility import to_unicode
 from pex.third_party.packaging.specifiers import SpecifierSet
 from pex.third_party.pkg_resources import DistInfoDistribution, Distribution, Requirement
 from pex.typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     import attr  # vendor:skip
-    from typing import Dict, Iterator, Optional, Text, Union
+    from typing import Dict, Iterator, Optional, Union, List
 
     DistributionLike = Union[Distribution, str]
 else:
@@ -50,8 +53,8 @@ def _strip_sdist_path(sdist_path):
 
 
 def _parse_message(message):
-    # type: (Text) -> Message
-    return cast(Message, Parser().parsestr(message))
+    # type: (bytes) -> Message
+    return cast(Message, Parser().parse(StringIO(to_unicode(message))))
 
 
 def _parse_sdist_package_info(sdist_path):
@@ -65,7 +68,7 @@ def _parse_sdist_package_info(sdist_path):
     if zipfile.is_zipfile(sdist_path):
         with open_zip(sdist_path) as zip:
             try:
-                return _parse_message(zip.read(pkg_info_path).decode("utf-8"))
+                return _parse_message(zip.read(pkg_info_path))
             except KeyError as e:
                 pex_warnings.warn(
                     "Source distribution {} did not have the expected metadata file {}: {}".format(
@@ -82,7 +85,7 @@ def _parse_sdist_package_info(sdist_path):
                     # N.B.: `extractfile` returns None for directories and special files.
                     return None
                 with closing(pkg_info) as fp:
-                    return _parse_message(fp.read().decode("utf-8"))
+                    return _parse_message(fp.read())
             except KeyError as e:
                 pex_warnings.warn(
                     "Source distribution {} did not have the expected metadata file {}: {}".format(
@@ -102,7 +105,7 @@ def _parse_wheel_package_info(wheel_path):
     dist_info_dir = "{}-{}.dist-info".format(project_name, version)
     with open_zip(wheel_path) as whl:
         with whl.open(os.path.join(dist_info_dir, DistInfoDistribution.PKG_INFO)) as fp:
-            return _parse_message(fp.read().decode("utf-8"))
+            return _parse_message(fp.read())
 
 
 def _parse_distribution_package_info(dist):
@@ -230,15 +233,15 @@ def requires_python(dist):
     return SpecifierSet(python_requirement)
 
 
-def requires_dists(
-    dist,  # type: DistributionLike
-    include_1_1_requires=True,  # type: bool
-):
-    # type: (...) -> Iterator[Requirement]
+def requires_dists(dist):
+    # type: (DistributionLike) -> Iterator[Requirement]
     """Examines dist for and returns any declared requirements.
 
-    Looks for `Requires-Dist` metadata and, optionally, the older `Requires` metadata if
-    `include_1_1_requires`.
+    Looks for `Requires-Dist` metadata.
+
+    The older `Requires` metadata is intentionally ignored, athough we do log a warning if it is
+    found to draw attention to this ~work-around and the associated issue in case any new data
+    comes in.
 
     See:
     + https://www.python.org/dev/peps/pep-0345/#requires-dist-multiple-use
@@ -254,6 +257,28 @@ def requires_dists(
     for requires_dist in pkg_info.get_all("Requires-Dist", ()):
         yield Requirement.parse(requires_dist)
 
-    if include_1_1_requires:
-        for requires in pkg_info.get_all("Requires", ()):
-            yield Requirement.parse(requires)
+    legacy_requires = pkg_info.get_all("Requires", [])  # type: List[str]
+    if legacy_requires:
+        name_and_version = project_name_and_version(dist)
+        project_name = name_and_version.project_name if name_and_version else dist
+        pex_warnings.warn(
+            dedent(
+                """\
+                Ignoring {count} `Requires` {field} in {dist} metadata:
+                {requires}
+
+                You may have issues using the '{project_name}' distribution as a result.
+                More information on this workaround can be found here:
+                  https://github.com/pantsbuild/pex/issues/1201#issuecomment-791715585
+                """
+            ).format(
+                dist=dist,
+                project_name=project_name,
+                count=len(legacy_requires),
+                field=pluralize(legacy_requires, "field"),
+                requires=os.linesep.join(
+                    "{index}.) Requires: {req}".format(index=index, req=req)
+                    for index, req in enumerate(legacy_requires, start=1)
+                ),
+            )
+        )
