@@ -188,10 +188,10 @@ class Pip(object):
         """
         pip_pex_path = os.path.join(path, isolated().pex_hash)
         with atomic_directory(pip_pex_path, exclusive=True) as chroot:
-            if chroot is not None:
+            if not chroot.is_finalized:
                 from pex.pex_builder import PEXBuilder
 
-                isolated_pip_builder = PEXBuilder(path=chroot)
+                isolated_pip_builder = PEXBuilder(path=chroot.work_dir)
                 for dist_location in third_party.expose(["pip", "setuptools", "wheel"]):
                     isolated_pip_builder.add_dist_location(dist=dist_location)
                 with open(os.path.join(isolated_pip_builder.path(), "run_pip.py"), "w") as fp:
@@ -323,8 +323,18 @@ class Pip(object):
             from pex.pex import PEX
 
             pip = PEX(pex=self._pip_pex_path, interpreter=python_interpreter)
+
+            # Pip has no discernable stdout / stderr discipline with its logging. Pex guarantees
+            # stdout will only contain useable (parseable) data and all logging will go to stderr.
+            # To uphold the Pex standard, force Pip to comply by re-directing stdout to stderr.
+            #
+            # See:
+            # + https://github.com/pantsbuild/pex/issues/1267
+            # + https://github.com/pypa/pip/issues/9420
+            stdout = popen_kwargs.pop("stdout", sys.stderr.fileno())
+
             return pip.cmdline(command), pip.run(
-                args=command, env=env, blocking=False, **popen_kwargs
+                args=command, env=env, blocking=False, stdout=stdout, **popen_kwargs
             )
 
     def _spawn_pip_isolated_job(

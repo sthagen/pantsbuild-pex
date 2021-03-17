@@ -635,9 +635,16 @@ def configure_clp():
         "%(prog)s [-o OUTPUT.PEX] [options] [-- arg1 arg2 ...]\n\n"
         "%(prog)s builds a PEX (Python Executable) file based on the given specifications: "
         "sources, requirements, their dependencies and other options."
+        "\n"
+        "Command-line options can be provided in one or more files by prefixing the filenames "
+        "with an @ symbol. These files must contain one argument per line."
     )
 
-    parser = ArgumentParser(usage=usage, formatter_class=ArgumentDefaultsHelpFormatter)
+    parser = ArgumentParser(
+        usage=usage,
+        formatter_class=ArgumentDefaultsHelpFormatter,
+        fromfile_prefix_chars="@",
+    )
 
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("requirements", nargs="*", help="Requirements to add to the pex")
@@ -1129,10 +1136,10 @@ def seed_cache(
                     )
                 )
             with atomic_directory(unzip_dir, exclusive=True) as chroot:
-                if chroot:
+                if not chroot.is_finalized:
                     with TRACER.timed("Extracting {}".format(pex_path)):
                         with open_zip(options.pex_name) as pex_zip:
-                            pex_zip.extractall(chroot)
+                            pex_zip.extractall(chroot.work_dir)
             return [pex.interpreter.binary, unzip_dir]
         elif options.venv:
             with TRACER.timed("Creating venv from {}".format(pex_path)):

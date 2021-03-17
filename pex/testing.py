@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 PY_VER = sys.version_info[:2]
 IS_PYPY = hasattr(sys, "pypy_version_info")
+IS_PYPY2 = IS_PYPY and sys.version_info[0] == 2
 IS_PYPY3 = IS_PYPY and sys.version_info[0] == 3
 NOT_CPYTHON27 = IS_PYPY or PY_VER != (2, 7)
 NOT_CPYTHON36 = IS_PYPY or PY_VER != (3, 6)
@@ -447,13 +448,13 @@ def ensure_python_distribution(version):
     pip = os.path.join(interpreter_location, "bin", "pip")
 
     with atomic_directory(target_dir=os.path.join(pyenv_root), exclusive=True) as target_dir:
-        if target_dir:
-            bootstrap_python_installer(target_dir)
+        if not target_dir.is_finalized:
+            bootstrap_python_installer(target_dir.work_dir)
 
     with atomic_directory(
         target_dir=interpreter_location, exclusive=True
     ) as interpreter_target_dir:
-        if interpreter_target_dir:
+        if not interpreter_target_dir.is_finalized:
             subprocess.check_call(
                 [
                     "git",
