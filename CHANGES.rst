@@ -1,6 +1,45 @@
 Release Notes
 =============
 
+2.1.38
+------
+
+A hotfix that finishes work started in 2.1.37 by #1304 to align Pip
+based resolve results with ``--pex-repository`` based resolve results
+for requirements with '.' in their names as allowed by PEP-503.
+
+* Fix PEX direct requirements metadata. (#1312)
+  `PR #1312 <https://github.com/pantsbuild/pex/pull/1312>`_
+
+2.1.37
+------
+
+* Fix Pex isolation to avoid temporary pyc files. (#1308)
+  `PR #1308 <https://github.com/pantsbuild/pex/pull/1308>`_
+
+* Fix --pex-repository requirement canonicalization. (#1304)
+  `PR #1304 <https://github.com/pantsbuild/pex/pull/1304>`_
+
+* Spruce up ``pex`` and ``pex-tools`` CLIs with uniform ``-V`` /
+  ``--version`` support and default value display in help. (#1301)
+  `PR #1301 <https://github.com/pantsbuild/pex/pull/1301>`_
+
+2.1.36
+------
+
+This release brings a fix for building sdists with certain macOS
+interpreters when creating a PEX file that would then fail to resolve
+on PEX startup.
+
+* Add support for ``--seed verbose``. (#1299)
+  `PR #1299 <https://github.com/pantsbuild/pex/pull/1299>`_
+
+* Fix bytecode compilation race in PEXBuilder.build. (#1298)
+  `PR #1298 <https://github.com/pantsbuild/pex/pull/1298>`_
+
+* Fix wheel building for certain macOS system interpreters. (#1296)
+  `PR #1296 <https://github.com/pantsbuild/pex/pull/1296>`_
+
 2.1.35
 ------
 

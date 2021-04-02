@@ -41,6 +41,7 @@ from pex.pex_info import PexInfo
 from pex.pip import get_pip
 from pex.requirements import LogicalLine, PyPIRequirement, URLFetcher, parse_requirement_file
 from pex.testing import (
+    IS_MAC,
     IS_PYPY,
     IS_PYPY2,
     NOT_CPYTHON27,
@@ -2893,6 +2894,46 @@ def test_seed(
     assert pex_stderr == seed_stderr
 
 
+@pytest.mark.parametrize(
+    ["mode_args", "seeded_execute_args"],
+    [
+        pytest.param([], ["python", "pex"], id="PEX"),
+        pytest.param(["--unzip"], ["python", "pex"], id="unzip"),
+        pytest.param(["--venv"], ["pex"], id="venv"),
+    ],
+)
+def test_seed_verbose(
+    isort_pex_args,  # type: Tuple[str, List[str]]
+    mode_args,  # type: List[str]
+    seeded_execute_args,  # type: List[str]
+    tmpdir,  # type: Any
+):
+    # type: (...) -> None
+    pex_root = str(tmpdir)
+    pex_file, args = isort_pex_args
+    results = run_pex_command(
+        args=args + mode_args + ["--seed", "verbose"],
+        env=make_env(PEX_ROOT=pex_root, PEX_PYTHON_PATH=sys.executable),
+    )
+    results.assert_success()
+    verbose_info = json.loads(results.output)
+    seeded_argv0 = [verbose_info[arg] for arg in seeded_execute_args]
+
+    assert pex_root == verbose_info.pop("pex_root")
+
+    python = verbose_info.pop("python")
+    assert PythonInterpreter.get() == PythonInterpreter.from_binary(python)
+
+    verbose_info.pop("pex")
+    assert {} == verbose_info
+
+    isort_args = ["--version"]
+    seed_stdout, seed_stderr = Executor.execute(seeded_argv0 + isort_args)
+    pex_stdout, pex_stderr = Executor.execute([pex_file] + isort_args)
+    assert pex_stdout == seed_stdout
+    assert pex_stderr == seed_stderr
+
+
 def test_pip_issues_9420_workaround():
     # type: () -> None
 
@@ -3305,3 +3346,171 @@ def test_execute_module_issues_1018(tmpdir):
         args=["-D", src_dir, "-m", "issues_1018", "-o", with_module_venv_pex, "--venv"]
     ).assert_success()
     assert expected_output == subprocess.check_output(args=[with_module_venv_pex])
+
+
+@pytest.mark.skipif(
+    not IS_MAC, reason="This is a test of a problem specific to macOS interpreters."
+)
+def test_invalid_macosx_platform_tag(tmpdir):
+    # type: (Any) -> None
+    if not any((3, 8) == pi.version[:2] for pi in PythonInterpreter.iter()):
+        pytest.skip("Test requires a system Python 3.8 interpreter.")
+
+    repository_pex = os.path.join(str(tmpdir), "repository.pex")
+    ic_args = ["--interpreter-constraint", "==3.8.*"]
+    args = ic_args + ["setproctitle==1.2", "-o", repository_pex]
+    run_pex_command(args=args).assert_success()
+
+    setproctitle_pex = os.path.join(str(tmpdir), "setproctitle.pex")
+    run_pex_command(
+        args=ic_args + ["setproctitle", "--pex-repository", repository_pex, "-o", setproctitle_pex]
+    ).assert_success()
+
+    subprocess.check_call(args=[setproctitle_pex, "-c", "import setproctitle"])
+
+
+def test_pex_repository_pep503_issues_1302(tmpdir):
+    # type: (Any) -> None
+    repository_pex = os.path.join(str(tmpdir), "repository.pex")
+    with built_wheel(name="foo_bar", version="1.0.0") as wheel_path:
+        run_pex_command(
+            args=[
+                "--no-pypi",
+                "--find-links",
+                os.path.dirname(wheel_path),
+                "Foo._-BAR==1.0.0",
+                "-o",
+                repository_pex,
+                "--include-tools",
+            ]
+        ).assert_success()
+
+    repository_info = subprocess.check_output(
+        args=[repository_pex, "info"], env=make_env(PEX_TOOLS=1)
+    )
+    assert ["Foo._-BAR==1.0.0"] == json.loads(repository_info.decode("utf-8"))["requirements"]
+
+    foo_bar_pex = os.path.join(str(tmpdir), "foo-bar.pex")
+    run_pex_command(
+        args=[
+            "--pex-repository",
+            repository_pex,
+            "Foo._-BAR==1.0.0",
+            "-o",
+            foo_bar_pex,
+            "--include-tools",
+        ]
+    ).assert_success()
+
+    foo_bar_info = subprocess.check_output(args=[foo_bar_pex, "info"], env=make_env(PEX_TOOLS=1))
+    assert ["Foo._-BAR==1.0.0"] == json.loads(foo_bar_info.decode("utf-8"))["requirements"]
+
+    subprocess.check_call(args=[foo_bar_pex, "-c", "import foo_bar"])
+
+
+def test_require_hashes(tmpdir):
+    # type: (Any) -> None
+    requirements = os.path.join(str(tmpdir), "requirements.txt")
+    with open(requirements, "w") as fp:
+        fp.write(
+            dedent(
+                """\
+                # The --require-hashes flag puts Pip in a mode where all requirements must be both
+                # pinned and have a --hash specified. More on Pip hash checking mode here:
+                # https://pip.pypa.io/en/stable/reference/pip_install/#hash-checking-mode
+                #
+                # This mode causes Pip to verify that the resolved distributions have matching
+                # hashes and that the resolve closure has not expanded. It's not needed however
+                # since including even one requirement with --hash implicitly turns on hash
+                # checking mode.
+                --require-hashes
+
+                # Pip requirement files support line continuation in the customary way.
+                requests==2.25.1 \
+                    --hash sha256:c210084e36a42ae6b9219e00e48287def368a26d03a048ddad7bfee44f75871e
+
+                idna==2.10 \
+                    --hash sha256:b97d804b1e9b523befed77c48dacec60e6dcb0b5391d57af6a65a312a90648c0
+
+                # N.B.: Pip accepts flag values in either ` ` or `=` separated forms.
+                chardet==4.0.0 \
+                    --hash=sha256:f864054d66fd9118f2e67044ac8981a54775ec5b67aed0441892edb553d21da5
+
+                certifi==2020.12.5 \
+                    --hash sha256:719a74fb9e33b9bd44cc7f3a8d94bc35e4049deebe19ba7d8e108280cfd59830
+
+                # Pip supports the following three hash algorithms and it need only find one
+                # successful matching distribution.
+                urllib3==1.26.4 \
+                    --hash sha384:bad \
+                    --hash sha512:worse \
+                    --hash sha256:2f4da4594db7e1e110a944bb1b551fdf4e6c136ad42e4234131391e21eb5b0df
+                """
+            )
+        )
+    requests_pex = os.path.join(str(tmpdir), "requests.pex")
+
+    run_pex_command(args=["-r", requirements, "-o", requests_pex]).assert_success()
+    subprocess.check_call(args=[requests_pex, "-c", "import requests"])
+
+    # The hash checking mode should also work in constraints context.
+    run_pex_command(
+        args=["--constraints", requirements, "requests", "-o", requests_pex]
+    ).assert_success()
+    subprocess.check_call(args=[requests_pex, "-c", "import requests"])
+
+    with open(requirements, "w") as fp:
+        fp.write(
+            dedent(
+                """\
+                requests==2.25.1 \
+                    --hash sha256:c210084e36a42ae6b9219e00e48287def368a26d03a048ddad7bfee44f75871e
+                idna==2.10 \
+                    --hash sha256:b97d804b1e9b523befed77c48dacec60e6dcb0b5391d57af6a65a312a90648c0
+                chardet==4.0.0 \
+                    --hash=sha256:f864054d66fd9118f2e67044ac8981a54775ec5b67aed0441892edb553d21da5
+                certifi==2020.12.5 \
+                    --hash sha256:719a74fb9e33b9bd44cc7f3a8d94bc35e4049deebe19ba7d8e108280cfd59830
+                urllib3==1.26.4 \
+                    --hash sha384:bad \
+                    --hash sha512:worse \
+                    --hash sha256:2f4da4594db7e1e110a944bb1b551fdf4e6c136ad42e4234131391e21eb5b0d0
+                """
+            )
+        )
+    as_requirements_result = run_pex_command(args=["-r", requirements])
+    as_requirements_result.assert_failure()
+
+    # The hash checking mode should also work in constraints context.
+    as_constraints_result = run_pex_command(args=["--constraints", requirements, "requests"])
+    as_constraints_result.assert_failure()
+
+    error_lines = {
+        re.sub(r"\s+", " ", line.strip()): index
+        for index, line in enumerate(as_constraints_result.error.splitlines())
+    }
+    index = error_lines["Expected sha512 worse"]
+    assert (
+        index + 1
+        == error_lines[
+            "Got ca602ae6dd925648c8ff87ef00bcef2d0ebebf1090b44e8dd43b75403f07db50269e5078f709cbce8e"
+            "7cfaedaf1b754d02dda08b6970b6a157cbf4c31ebc16a7"
+        ]
+    )
+
+    index = error_lines["Expected sha384 bad"]
+    assert (
+        index + 1
+        == error_lines[
+            "Got 64ec6b63f74b7bdf161a9b38fabf59c0a691ba9ed325f0864fea984e0deabe648cbd12d619d3989b64"
+            "24488349df3b30"
+        ]
+    )
+
+    index = error_lines[
+        "Expected sha256 2f4da4594db7e1e110a944bb1b551fdf4e6c136ad42e4234131391e21eb5b0d0"
+    ]
+    assert (
+        index + 1
+        == error_lines["Got 2f4da4594db7e1e110a944bb1b551fdf4e6c136ad42e4234131391e21eb5b0df"]
+    )
