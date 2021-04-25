@@ -139,7 +139,6 @@ class MktempTeardownRegistry(object):
         self._registry = defaultdict(set)  # type: DefaultDict[int, Set[str]]
         self._lock = threading.RLock()
         self._getpid = os.getpid
-        self._exists = os.path.exists
         self._rmtree = shutil.rmtree
         atexit.register(self.teardown)
 
@@ -156,8 +155,7 @@ class MktempTeardownRegistry(object):
     def teardown(self):
         # type: () -> None
         for td in self._registry.pop(self._getpid(), []):
-            if self._exists(td):
-                self._rmtree(td)
+            self._rmtree(td, ignore_errors=True)
 
 
 _MKDTEMP_SINGLETON = MktempTeardownRegistry()
@@ -255,7 +253,7 @@ def register_rmtree(directory):
 
 
 def safe_mkdir(directory, clean=False):
-    # type: (str, bool) -> None
+    # type: (str, bool) -> str
     """Safely create a directory.
 
     Ensures a directory is present.  If it's not there, it is created.  If it is, it's a no-op. If
@@ -268,6 +266,8 @@ def safe_mkdir(directory, clean=False):
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
+    finally:
+        return directory
 
 
 def safe_open(filename, *args, **kwargs):
