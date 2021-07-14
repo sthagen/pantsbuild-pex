@@ -47,12 +47,10 @@ IS_PYPY = hasattr(sys, "pypy_version_info")
 IS_PYPY2 = IS_PYPY and sys.version_info[0] == 2
 IS_PYPY3 = IS_PYPY and sys.version_info[0] == 3
 NOT_CPYTHON27 = IS_PYPY or PY_VER != (2, 7)
-NOT_CPYTHON36 = IS_PYPY or PY_VER != (3, 6)
 IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
 IS_NOT_LINUX = not IS_LINUX
 NOT_CPYTHON27_OR_OSX = NOT_CPYTHON27 or IS_NOT_LINUX
-NOT_CPYTHON36_OR_LINUX = NOT_CPYTHON36 or IS_LINUX
 
 
 @contextlib.contextmanager
@@ -183,7 +181,7 @@ class WheelBuilder(object):
 
     def bdist(self):
         # type: () -> str
-        get_pip().spawn_build_wheels(
+        get_pip(interpreter=self._interpreter).spawn_build_wheels(
             distributions=[self._source_dir],
             wheel_dir=self._wheel_dir,
             interpreter=self._interpreter,
@@ -251,7 +249,7 @@ def make_bdist(
     ) as dist_location:
 
         install_dir = os.path.join(safe_mkdtemp(), os.path.basename(dist_location))
-        get_pip().spawn_install_wheel(
+        get_pip(interpreter=interpreter).spawn_install_wheel(
             wheel=dist_location,
             install_dir=install_dir,
             target=DistributionTarget(interpreter=interpreter),
@@ -421,12 +419,12 @@ def bootstrap_python_installer(dest):
 # otherwise encountered when fetching and building too many on a cache miss. In the past we had
 # issues with the combination of 7 total unique interpreter versions and a Travis-CI timeout of 50
 # minutes for a shard.
-PY27 = "2.7.15"
-PY35 = "3.5.6"
-PY36 = "3.6.6"
+PY27 = "2.7.18"
+PY37 = "3.7.11"
+PY38 = "3.8.11"
 
-_ALL_PY_VERSIONS = (PY27, PY35, PY36)
-_ALL_PY3_VERSIONS = (PY35, PY36)
+_ALL_PY_VERSIONS = (PY27, PY37, PY38)
+_ALL_PY3_VERSIONS = (PY37, PY38)
 
 
 def ensure_python_distribution(version):
@@ -436,7 +434,7 @@ def ensure_python_distribution(version):
 
     pyenv_root = os.path.abspath(
         os.path.join(
-            os.environ.get("_PEX_TEST_PYENV_ROOT", "{}_dev".format(ENV.PEX_ROOT)),
+            os.path.expanduser(os.environ.get("_PEX_TEST_PYENV_ROOT", "~/.pex_dev")),
             "pyenv",
         )
     )

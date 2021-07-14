@@ -5,6 +5,7 @@ from __future__ import absolute_import
 
 import json
 import os
+import zipfile
 
 from pex import pex_warnings, variables
 from pex.common import can_write_dir, open_zip, safe_mkdtemp
@@ -92,10 +93,13 @@ class PexInfo(object):
     @classmethod
     def from_pex(cls, pex):
         # type: (str) -> PexInfo
-        if os.path.isfile(pex):
+        if zipfile.is_zipfile(pex):  # Zip App
             with open_zip(pex) as zf:
                 pex_info = zf.read(cls.PATH)
-        else:
+        elif os.path.isfile(pex):  # Venv
+            with open(os.path.join(os.path.dirname(pex), cls.PATH)) as fp:
+                pex_info = fp.read()
+        else:  # Directory (Unzip mode or PEXBuilder.freeze)
             with open(os.path.join(pex, cls.PATH)) as fp:
                 pex_info = fp.read()
         return cls.from_json(pex_info)
@@ -274,6 +278,16 @@ class PexInfo(object):
             strip_pex_env=self.strip_pex_env,
             pex_path=self.pex_path,
         )
+
+    @property
+    def includes_tools(self):
+        # type: () -> bool
+        return self._pex_info.get("includes_tools", self.venv)
+
+    @includes_tools.setter
+    def includes_tools(self, value):
+        # type: (bool) -> None
+        self._pex_info["includes_tools"] = bool(value)
 
     @property
     def strip_pex_env(self):

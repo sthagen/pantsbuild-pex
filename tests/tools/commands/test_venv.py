@@ -15,12 +15,12 @@ from textwrap import dedent
 
 import pytest
 
-from pex.common import safe_open, temporary_dir, touch
+from pex.common import safe_mkdtemp, safe_open, temporary_dir, touch
 from pex.compatibility import PY2
 from pex.executor import Executor
 from pex.interpreter import PythonInterpreter
 from pex.pex_builder import CopyMode, PEXBuilder
-from pex.testing import IS_PYPY, PY36, ensure_python_interpreter, run_pex_command
+from pex.testing import IS_PYPY, PY38, ensure_python_interpreter, run_pex_command
 from pex.tools.commands.virtualenv import Virtualenv
 from pex.typing import TYPE_CHECKING, cast
 from pex.util import named_temporary_file
@@ -427,23 +427,23 @@ def test_venv_entrypoint_function_exit_code_issue_1241(tmpdir):
 def test_venv_copies(tmpdir):
     # type: (Any) -> None
 
-    python36 = ensure_python_interpreter(PY36)
+    python38 = ensure_python_interpreter(PY38)
 
     pex_file = os.path.join(str(tmpdir), "venv.pex")
-    result = run_pex_command(args=["-o", pex_file, "--include-tools"], python=python36)
+    result = run_pex_command(args=["-o", pex_file, "--include-tools"], python=python38)
     result.assert_success()
 
     PEX_TOOLS = make_env(PEX_TOOLS=1)
 
     venv_symlinks = os.path.join(str(tmpdir), "venv.symlinks")
-    subprocess.check_call(args=[python36, pex_file, "venv", venv_symlinks], env=PEX_TOOLS)
+    subprocess.check_call(args=[python38, pex_file, "venv", venv_symlinks], env=PEX_TOOLS)
     venv_symlinks_interpreter = PythonInterpreter.from_binary(
         os.path.join(venv_symlinks, "bin", "python")
     )
     assert os.path.islink(venv_symlinks_interpreter.binary)
 
     venv_copies = os.path.join(str(tmpdir), "venv.copies")
-    subprocess.check_call(args=[python36, pex_file, "venv", "--copies", venv_copies], env=PEX_TOOLS)
+    subprocess.check_call(args=[python38, pex_file, "venv", "--copies", venv_copies], env=PEX_TOOLS)
     venv_copies_interpreter = PythonInterpreter.from_binary(
         os.path.join(venv_copies, "bin", "python")
     )
@@ -631,3 +631,53 @@ def test_strip_pex_env(tmpdir):
         env=two_pex_env_vars,
     )
     assert 2 == process.wait()
+
+
+def test_warn_unused_pex_env_vars():
+    # type: () -> None
+    # N.B.: We don't use the pytest tmpdir fixture here since it creates fairly length paths under
+    # /tmp and under macOS, where TMPDIR is already fairly deeply nested, we trigger Pex warinings
+    # about script shebang length. Those warnings pollute stderr.
+    tmpdir = safe_mkdtemp()
+    venv_pex = os.path.join(tmpdir, "venv.pex")
+    run_pex_command(["--venv", "-o", venv_pex]).assert_success()
+
+    def assert_execute_venv_pex(expected_stderr, **env_vars):
+        env = os.environ.copy()
+        env.update(env_vars)
+        process = subprocess.Popen(
+            [venv_pex, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+        )
+        stdout, stderr = process.communicate()
+        assert 0 == process.returncode
+        assert not stdout
+        assert expected_stderr.strip() == stderr.decode("utf-8").strip()
+
+    assert_execute_venv_pex(expected_stderr="")
+    assert_execute_venv_pex(expected_stderr="", PEX_ROOT=os.path.join(tmpdir, "pex_root"))
+    assert_execute_venv_pex(expected_stderr="", PEX_UNZIP="1")
+    assert_execute_venv_pex(expected_stderr="", PEX_EXTRA_SYS_PATH="more")
+    assert_execute_venv_pex(expected_stderr="", PEX_VERBOSE="0")
+
+    assert_execute_venv_pex(
+        expected_stderr=dedent(
+            """\
+            Ignoring the following environment variables in Pex venv mode:
+            PEX_INHERIT_PATH=fallback
+            """
+        ),
+        PEX_INHERIT_PATH="fallback",
+    )
+
+    assert_execute_venv_pex(
+        expected_stderr=dedent(
+            """\
+            Ignoring the following environment variables in Pex venv mode:
+            PEX_EMIT_WARNINGS=0
+            PEX_INHERIT_PATH=fallback
+            """
+        ),
+        PEX_EMIT_WARNINGS="0",
+        PEX_INHERIT_PATH="fallback",
+        PEX_VERBOSE="0",
+    )

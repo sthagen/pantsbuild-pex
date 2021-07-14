@@ -9,8 +9,16 @@ on:
         description: The tag to manually run a deploy for.
         required: true
 jobs:
+  org-check:
+    name: Check GitHub Organization
+    if: ${{ github.repository_owner == 'pantsbuild' }}
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Noop
+        run: "true"
   determine-tag:
     name: Determine the release tag to operate against.
+    needs: org-check
     runs-on: ubuntu-20.04
     outputs:
       release-tag: ${{ steps.determine-tag.outputs.release-tag }}
@@ -33,9 +41,9 @@ jobs:
           fi
   pypi:
     name: Publish sdist and wheel to PyPI
+    needs: determine-tag
     runs-on: ubuntu-20.04
     environment: Release
-    needs: determine-tag
     steps:
       - name: Checkout Pex ${{ needs.determine-tag.outputs.release-tag }}
         uses: actions/checkout@v2
@@ -46,7 +54,7 @@ jobs:
         with:
           python-version: 3.9
       - name: Publish Pex ${{ needs.determine-tag.outputs.release-tag }}
-        uses: ./.github/actions/run-tox
+        uses: pantsbuild/actions/run-tox@95209b287c817c78a765962d40ac6cea790fc511
         env:
           FLIT_USERNAME: ${{ secrets.PYPI_USERNAME }}
           FLIT_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
@@ -54,9 +62,9 @@ jobs:
           tox-env: publish
   github-release:
     name: Create Github Release
+    needs: determine-tag
     runs-on: ubuntu-20.04
     environment: Release
-    needs: determine-tag
     steps:
       - name: Checkout Pex ${{ needs.determine-tag.outputs.release-tag }}
         uses: actions/checkout@v2
@@ -69,7 +77,7 @@ jobs:
         with:
           python-version: 3.9
       - name: Package Pex ${{ needs.determine-tag.outputs.release-tag }} PEX
-        uses: ./.github/actions/run-tox
+        uses: pantsbuild/actions/run-tox@95209b287c817c78a765962d40ac6cea790fc511
         with:
           tox-env: package
       - name: Create ${{ needs.determine-tag.outputs.release-tag }} Release

@@ -64,13 +64,14 @@ class PEX(object):  # noqa: T000
         self,
         pex=sys.argv[0],  # type: str
         interpreter=None,  # type: Optional[PythonInterpreter]
+        pex_info=None,  # type: Optional[PexInfo]
         env=ENV,  # type: Variables
         verify_entry_point=False,  # type: bool
     ):
         # type: (...) -> None
         self._pex = pex
         self._interpreter = interpreter or PythonInterpreter.get()
-        self._pex_info = PexInfo.from_pex(self._pex)
+        self._pex_info = pex_info or PexInfo.from_pex(self._pex)
         self._pex_info_overrides = PexInfo.from_env(env=env)
         self._vars = env
         self._envs = None  # type: Optional[Iterable[PEXEnvironment]]
@@ -468,14 +469,13 @@ class PEX(object):  # noqa: T000
 
         try:
             if self._vars.PEX_TOOLS:
-                try:
-                    from pex.tools import main as tools
-                except ImportError as e:
+                if not self._pex_info.includes_tools:
                     die(
                         "The PEX_TOOLS environment variable was set, but this PEX was not built "
-                        "with tools (Re-build the PEX file with `pex --include-tools ...`):"
-                        " {}".format(e)
+                        "with tools (Re-build the PEX file with `pex --include-tools ...`)"
                     )
+
+                from pex.tools import main as tools
 
                 exit_value = tools.main(pex=self, pex_prog_path=sys.argv[0])
             else:

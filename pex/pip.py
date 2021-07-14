@@ -2,7 +2,7 @@
 # Copyright 2019 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-from __future__ import absolute_import, print_function
+from __future__ import absolute_import
 
 import fileinput
 import functools
@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+from abc import abstractmethod
 from collections import deque
 from contextlib import closing
 from textwrap import dedent
@@ -23,14 +24,33 @@ from pex.distribution_target import DistributionTarget
 from pex.interpreter import PythonInterpreter
 from pex.jobs import Job
 from pex.network_configuration import NetworkConfiguration
+from pex.pex import PEX
+from pex.pex_bootstrapper import ensure_venv
+from pex.pex_info import PexInfo
+from pex.platforms import Platform
 from pex.third_party import isolated
-from pex.third_party.pkg_resources import safe_name, safe_version
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
+from pex.util import named_temporary_file
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    from typing import Any, Iterable, Iterator, List, Mapping, Optional, Tuple, Callable
+    import attr  # vendor:skip
+
+    from typing import (
+        Any,
+        Callable,
+        Dict,
+        Iterable,
+        Iterator,
+        List,
+        Mapping,
+        Optional,
+        Tuple,
+        Union,
+    )
+else:
+    from pex.third_party import attr
 
 
 class ResolverVersion(object):
@@ -178,44 +198,175 @@ class PackageIndexConfiguration(object):
         self.isolated = isolated  # type: bool
 
 
+class _LogAnalyzer(object):
+    @attr.s(frozen=True)
+    class Complete(object):
+        text = attr.ib(default=None)  # type: Optional[str]
+
+    @attr.s(frozen=True)
+    class Continue(object):
+        text = attr.ib(default=None)  # type: Optional[str]
+
+    @abstractmethod
+    def analyze(self, line):
+        # type: (str) -> Union[Complete, Continue]
+        """Analyze the given log line.
+
+        Returns a value indicating whether or not analysis is complete. The value may contain text
+        that should be reported as part of the error analysis.
+        """
+
+
+class _Issue9420Analyzer(_LogAnalyzer):
+    # Works around: https://github.com/pypa/pip/issues/9420
+
+    def __init__(self):
+        # type: () -> None
+        self._strip = None  # type: Optional[int]
+
+    def analyze(self, line):
+        # type: (str) -> Union[_LogAnalyzer.Complete, _LogAnalyzer.Continue]
+        # N.B.: Pip --log output looks like:
+        # 2021-01-04T16:12:01,119 ERROR: Cannot install pantsbuild-pants==1.24.0.dev2 and wheel==0.33.6 because these package versions have conflicting dependencies.
+        # 2021-01-04T16:12:01,119
+        # 2021-01-04T16:12:01,119 The conflict is caused by:
+        # 2021-01-04T16:12:01,119     The user requested wheel==0.33.6
+        # 2021-01-04T16:12:01,119     pantsbuild-pants 1.24.0.dev2 depends on wheel==0.31.1
+        # 2021-01-04T16:12:01,119
+        # 2021-01-04T16:12:01,119 To fix this you could try to:
+        # 2021-01-04T16:12:01,119 1. loosen the range of package versions you've specified
+        # 2021-01-04T16:12:01,119 2. remove package versions to allow pip attempt to solve the dependency conflict
+        # 2021-01-04T16:12:01,119 ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/user_guide/#fixing-conflicting-dependencies
+        if not self._strip:
+            match = re.match(r"^(?P<timestamp>[^ ]+) ERROR: Cannot install ", line)
+            if match:
+                self._strip = len(match.group("timestamp"))
+        else:
+            match = re.match(r"^[^ ]+ ERROR: ResolutionImpossible: ", line)
+            if match:
+                return self.Complete()
+            else:
+                return self.Continue(line[self._strip :])
+        return self.Continue()
+
+
+@attr.s(frozen=True)
+class _Issue10050Analyzer(_LogAnalyzer):
+    # Part of the workaround for: https://github.com/pypa/pip/issues/10050
+
+    _platform = attr.ib()  # type: Platform
+
+    def analyze(self, line):
+        # type: (str) -> Union[_LogAnalyzer.Complete, _LogAnalyzer.Continue]
+        # N.B.: Pip --log output looks like:
+        # 2021-06-20T19:06:00,981 pip._vendor.packaging.markers.UndefinedEnvironmentName: 'python_full_version' does not exist in evaluation environment.
+        match = re.match(
+            r"^[^ ]+ pip._vendor.packaging.markers.UndefinedEnvironmentName: "
+            r"(?P<missing_marker>.*)\.$",
+            line,
+        )
+        if match:
+            return self.Complete(
+                "Failed to resolve for platform {}. Resolve requires evaluation of unknown "
+                "environment marker: {}.".format(self._platform, match.group("missing_marker"))
+            )
+        return self.Continue()
+
+
+class _LogScrapeJob(Job):
+    def __init__(
+        self,
+        command,  # type: Iterable[str]
+        process,  # type: subprocess.Popen
+        log,  # type: str
+        log_analyzers,  # type: Iterable[_LogAnalyzer]
+    ):
+        self._log = log
+        self._log_analyzers = list(log_analyzers)
+        super(_LogScrapeJob, self).__init__(command, process)
+
+    def _check_returncode(self, stderr=None):
+        if self._process.returncode != 0:
+            collected = []
+            with open(self._log, "r") as fp:
+                for line in fp:
+                    if not self._log_analyzers:
+                        break
+                    for index, analyzer in enumerate(self._log_analyzers):
+                        result = analyzer.analyze(line)
+                        if result.text:
+                            collected.append(result.text)
+                        if isinstance(result, _LogAnalyzer.Complete):
+                            self._log_analyzers.pop(index)
+                            if not self._log_analyzers:
+                                break
+            os.unlink(self._log)
+            stderr = (stderr or b"") + "".join(collected).encode("utf-8")
+        super(_LogScrapeJob, self)._check_returncode(stderr=stderr)
+
+
 class Pip(object):
+    _PATCHED_MARKERS_FILE_ENV_VAR_NAME = "_PEX_PATCHED_MARKERS_FILE"
+
     @classmethod
-    def create(cls, path):
-        # type: (str) -> Pip
+    def create(
+        cls,
+        path,  # type: str
+        interpreter=None,  # type: Optional[PythonInterpreter]
+    ):
+        # type: (...) -> Pip
         """Creates a pip tool with PEX isolation at path.
 
-        :param path: The path to build the pip tool pex at.
+        :param path: The path to assemble the pip tool at.
+        :param interpreter: The interpreter to run Pip with. The current interpreter by default.
+        :return: The path of a PEX that can be used to execute Pip in isolation.
         """
+        pip_interpreter = interpreter or PythonInterpreter.get()
         pip_pex_path = os.path.join(path, isolated().pex_hash)
         with atomic_directory(pip_pex_path, exclusive=True) as chroot:
             if not chroot.is_finalized:
                 from pex.pex_builder import PEXBuilder
 
                 isolated_pip_builder = PEXBuilder(path=chroot.work_dir)
+                isolated_pip_builder.info.venv = True
                 for dist_location in third_party.expose(["pip", "setuptools", "wheel"]):
                     isolated_pip_builder.add_dist_location(dist=dist_location)
-                with open(os.path.join(isolated_pip_builder.path(), "run_pip.py"), "w") as fp:
+                with named_temporary_file(prefix="", suffix=".py", mode="w") as fp:
                     fp.write(
                         dedent(
                             """\
                             import os
                             import runpy
-                            import sys
-                            
-                            
-                            # Propagate un-vendored setuptools to pip for any legacy setup.py builds
-                            # it needs to perform.
-                            os.environ['__PEX_UNVENDORED__'] = '1'
-                            os.environ['PYTHONPATH'] = os.pathsep.join(sys.path)
 
-                            runpy.run_module('pip', run_name='__main__')
-                            """
+                            patched_markers_file = os.environ.pop(
+                                {patched_markers_env_var_name!r}, None
+                            )
+                            if patched_markers_file:
+                                def patch_markers():
+                                    import json
+
+                                    from pip._vendor.packaging import markers
+
+                                    with open(patched_markers_file) as fp:
+                                        patched_markers = json.load(fp)
+
+                                    markers.default_environment = patched_markers.copy
+
+                                patch_markers()
+                                del patch_markers
+
+                            runpy.run_module(mod_name="pip", run_name="__main__", alter_sys=True)
+                            """.format(
+                                patched_markers_env_var_name=cls._PATCHED_MARKERS_FILE_ENV_VAR_NAME
+                            )
                         )
                     )
-                isolated_pip_builder.set_executable(fp.name)
+                    fp.close()
+                    isolated_pip_builder.set_executable(fp.name, "__pex_patched_pip__.py")
                 isolated_pip_builder.freeze()
-
-        return cls(pip_pex_path)
+        pex_info = PexInfo.from_pex(pip_pex_path)
+        pex_info.add_interpreter_constraint(str(pip_interpreter.identity.requirement))
+        return cls(ensure_venv(PEX(pip_pex_path, interpreter=pip_interpreter, pex_info=pex_info)))
 
     def __init__(self, pip_pex_path):
         # type: (str) -> None
@@ -308,9 +459,16 @@ class Pip(object):
         if package_index_configuration:
             command.extend(package_index_configuration.args)
 
-        env = package_index_configuration.env if package_index_configuration else {}
+        extra_env = popen_kwargs.pop("env", None)
+        env = dict(extra_env) if extra_env else {}
+        if package_index_configuration:
+            env.update(package_index_configuration.env)
+
         with ENV.strip().patch(
-            PEX_ROOT=cache or ENV.PEX_ROOT, PEX_VERBOSE=str(ENV.PEX_VERBOSE), **env
+            PEX_ROOT=cache or ENV.PEX_ROOT,
+            PEX_VERBOSE=str(ENV.PEX_VERBOSE),
+            __PEX_UNVENDORED__="1",
+            **env
         ) as env:
             # Guard against API calls from environment with ambient PYTHONPATH preventing pip PEX
             # bootstrapping. See: https://github.com/pantsbuild/pex/issues/892
@@ -319,10 +477,6 @@ class Pip(object):
                 TRACER.log(
                     "Scrubbed PYTHONPATH={} from the pip PEX environment.".format(pythonpath), V=3
                 )
-
-            from pex.pex import PEX
-
-            pip = PEX(pex=self._pip_pex_path, interpreter=python_interpreter)
 
             # Pip has no discernable stdout / stderr discipline with its logging. Pex guarantees
             # stdout will only contain useable (parseable) data and all logging will go to stderr.
@@ -333,9 +487,8 @@ class Pip(object):
             # + https://github.com/pypa/pip/issues/9420
             stdout = popen_kwargs.pop("stdout", sys.stderr.fileno())
 
-            return pip.cmdline(command), pip.run(
-                args=command, env=env, blocking=False, stdout=stdout, **popen_kwargs
-            )
+            args = [self._pip_pex_path] + command
+            return args, subprocess.Popen(args=args, env=env, stdout=stdout, **popen_kwargs)
 
     def _spawn_pip_isolated_job(
         self,
@@ -423,14 +576,14 @@ class Pip(object):
                     "Cannot both ignore wheels (use_wheel=False) and refrain from building "
                     "distributions (build=False)."
                 )
-            elif target.is_foreign:
+            elif target.is_platform:
                 raise ValueError(
-                    "Cannot ignore wheels (use_wheel=False) when resolving for a foreign "
-                    "platform: {}".format(platform)
+                    "Cannot ignore wheels (use_wheel=False) when resolving for a platform: "
+                    "{}".format(platform)
                 )
 
         download_cmd = ["download", "--dest", download_dir]
-        if target.is_foreign:
+        if target.is_platform:
             # We're either resolving for a different host / platform or a different interpreter for
             # the current platform that we have no access to; so we need to let pip know and not
             # otherwise pickup platform info from the interpreter we execute pip with.
@@ -444,7 +597,7 @@ class Pip(object):
                 )
             )
 
-        if target.is_foreign or not build:
+        if target.is_platform or not build:
             download_cmd.extend(["--only-binary", ":all:"])
 
         if not use_wheel:
@@ -467,16 +620,46 @@ class Pip(object):
         if requirements:
             download_cmd.extend(requirements)
 
+        env = None
+        log_analyzers = []  # type: List[_LogAnalyzer]
+
+        # Pip evaluates environment markers in the context of the ambient interpreter instead of
+        # failing when encountering them, ignoring them or doing what we do here: evaluate those
+        # environment markers positively identified by the platform quadruple and failing for those
+        # we cannot know.
+        if target.is_platform:
+            env_markers_dir = safe_mkdtemp()
+            platform, _ = target.get_platform()
+            patched_environment = platform.marker_environment(
+                # We want to fail a resolve when it needs to evaluate environment markers we can't
+                # calculate given just the platform information.
+                default_unknown=False
+            )
+            with open(
+                os.path.join(env_markers_dir, "env_markers.{}.json".format(platform)), "w"
+            ) as fp:
+                json.dump(patched_environment, fp)
+            env = os.environ.copy()
+            env[self._PATCHED_MARKERS_FILE_ENV_VAR_NAME] = fp.name
+            log_analyzers.append(_Issue10050Analyzer(platform=platform))
+            TRACER.log(
+                "Patching environment markers for {} with {}".format(target, patched_environment),
+                V=3,
+            )
+
         # The Pip 2020 resolver hides useful dependency conflict information in stdout interspersed
         # with other information we want to suppress. We jump though some hoops here to get at that
         # information and surface it on stderr. See: https://github.com/pypa/pip/issues/9420.
-        log = None
         if (
             self._calculate_resolver_version(
                 package_index_configuration=package_index_configuration
             )
             == ResolverVersion.PIP_2020
         ):
+            log_analyzers.append(_Issue9420Analyzer())
+
+        log = None
+        if log_analyzers:
             log = os.path.join(safe_mkdtemp(), "pip.log")
             download_cmd = ["--log", log] + download_cmd
 
@@ -485,44 +668,12 @@ class Pip(object):
             package_index_configuration=package_index_configuration,
             cache=cache,
             interpreter=target.get_interpreter(),
+            env=env,
         )
-        return self._Issue9420Job(command, process, log) if log else Job(command, process)
-
-    class _Issue9420Job(Job):
-        def __init__(self, command, process, log):
-            self._log = log
-            super(Pip._Issue9420Job, self).__init__(command, process)
-
-        def _check_returncode(self, stderr=None):
-            # N.B.: Pip --log output looks like:
-            # 2021-01-04T16:12:01,119 ERROR: Cannot install pantsbuild-pants==1.24.0.dev2 and wheel==0.33.6 because these package versions have conflicting dependencies.
-            # 2021-01-04T16:12:01,119
-            # 2021-01-04T16:12:01,119 The conflict is caused by:
-            # 2021-01-04T16:12:01,119     The user requested wheel==0.33.6
-            # 2021-01-04T16:12:01,119     pantsbuild-pants 1.24.0.dev2 depends on wheel==0.31.1
-            # 2021-01-04T16:12:01,119
-            # 2021-01-04T16:12:01,119 To fix this you could try to:
-            # 2021-01-04T16:12:01,119 1. loosen the range of package versions you've specified
-            # 2021-01-04T16:12:01,119 2. remove package versions to allow pip attempt to solve the dependency conflict
-            # 2021-01-04T16:12:01,119 ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/user_guide/#fixing-conflicting-dependencies
-            if self._process.returncode != 0:
-                strip = None
-                collected = []
-                with open(self._log, "r") as fp:
-                    for line in fp:
-                        if not strip:
-                            match = re.match(r"^(?P<timestamp>[^ ]+) ERROR: Cannot install ", line)
-                            if match:
-                                strip = len(match.group("timestamp"))
-                        else:
-                            match = re.match(r"^[^ ]+ ERROR: ResolutionImpossible: ", line)
-                            if match:
-                                break
-                            else:
-                                collected.append(line[strip:].encode("utf-8"))
-                os.unlink(self._log)
-                stderr = (stderr or b"") + b"".join(collected)
-            super(Pip._Issue9420Job, self)._check_returncode(stderr=stderr)
+        if log:
+            return _LogScrapeJob(command, process, log, log_analyzers)
+        else:
+            return Job(command, process)
 
     def spawn_build_wheels(
         self,
@@ -560,12 +711,6 @@ class Pip(object):
         project_name_and_version = dist_metadata.project_name_and_version(
             dist
         ) or ProjectNameAndVersion.from_filename(dist)
-        project_name = safe_name(project_name_and_version.project_name).replace("-", "_")
-        version = safe_version(project_name_and_version.version).replace("-", "_")
-        dist_info_dir = os.path.join(
-            install_dir,
-            "{project_name}-{version}.dist-info".format(project_name=project_name, version=version),
-        )
 
         # The `direct_url.json` file is both mandatory for Pip to install and non-hermetic for
         # Pex's purpose, since it contains the absolute local filesystem path to any local wheel
@@ -578,8 +723,21 @@ class Pip(object):
         # See:
         #   https://www.python.org/dev/peps/pep-0610/
         #   https://packaging.python.org/specifications/direct-url/#specification
-        direct_url_relpath = os.path.join(os.path.basename(dist_info_dir), "direct_url.json")
-        direct_url_abspath = os.path.join(os.path.dirname(dist_info_dir), direct_url_relpath)
+        listing = [
+            os.path.relpath(os.path.join(root, f), install_dir)
+            for root, _, files in os.walk(install_dir)
+            for f in files
+        ]
+        direct_url_relpath = dist_metadata.find_dist_info_file(
+            project_name=project_name_and_version.project_name,
+            version=project_name_and_version.version,
+            filename="direct_url.json",
+            listing=listing,
+        )
+        if not direct_url_relpath:
+            return
+
+        direct_url_abspath = os.path.join(install_dir, direct_url_relpath)
         if not os.path.exists(direct_url_abspath):
             return
 
@@ -591,6 +749,7 @@ class Pip(object):
 
         # The RECORD is a csv file with the path to each installed file in the 1st column.
         # See: https://www.python.org/dev/peps/pep-0376/#record
+        dist_info_dir = os.path.dirname(direct_url_abspath)
         with closing(
             fileinput.input(files=[os.path.join(dist_info_dir, "RECORD")], inplace=True)
         ) as record_fi:
@@ -701,13 +860,14 @@ class Pip(object):
         )
 
 
-_PIP = None
+_PIP = {}  # type: Dict[Optional[PythonInterpreter], Pip]
 
 
-def get_pip():
-    # type: () -> Pip
+def get_pip(interpreter=None):
+    # type: (Optional[PythonInterpreter]) -> Pip
     """Returns a lazily instantiated global Pip object that is safe for un-coordinated use."""
-    global _PIP
-    if _PIP is None:
-        _PIP = Pip.create(path=os.path.join(ENV.PEX_ROOT, "pip.pex"))
-    return _PIP
+    pip = _PIP.get(interpreter)
+    if pip is None:
+        pip = Pip.create(path=os.path.join(ENV.PEX_ROOT, "pip.pex"), interpreter=interpreter)
+        _PIP[interpreter] = pip
+    return pip

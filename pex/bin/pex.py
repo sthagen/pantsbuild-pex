@@ -68,6 +68,10 @@ class HandleBoolAction(Action):
 
 
 class ManylinuxAction(Action):
+    def __init__(self, *args, **kwargs):
+        kwargs["nargs"] = "?"
+        super(ManylinuxAction, self).__init__(*args, **kwargs)
+
     def __call__(self, parser, namespace, value, option_str=None):
         if option_str.startswith("--no"):
             setattr(namespace, self.dest, None)
@@ -947,7 +951,6 @@ def build_pex(reqs, options, cache=None):
         interpreter=interpreter,
         preamble=preamble,
         copy_mode=CopyMode.SYMLINK,
-        include_tools=options.include_tools or options.venv,
     )
 
     if options.resources_directory:
@@ -968,8 +971,9 @@ def build_pex(reqs, options, cache=None):
     pex_info.zip_safe = options.zip_safe
     pex_info.unzip = options.unzip
     pex_info.venv = bool(options.venv)
-    pex_info.venv_bin_path = options.venv
+    pex_info.venv_bin_path = options.venv or BinPath.FALSE
     pex_info.venv_copies = options.venv_copies
+    pex_info.includes_tools = options.include_tools or options.venv
     pex_info.pex_path = options.pex_path
     pex_info.always_write_cache = options.always_write_cache
     pex_info.ignore_errors = options.ignore_errors
