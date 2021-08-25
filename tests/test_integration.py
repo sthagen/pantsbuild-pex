@@ -7,7 +7,6 @@ import errno
 import filecmp
 import functools
 import glob
-import itertools
 import json
 import multiprocessing
 import os
@@ -23,23 +22,16 @@ from zipfile import ZipFile
 
 import pytest
 
-from pex.common import (
-    safe_copy,
-    safe_mkdir,
-    safe_open,
-    safe_rmtree,
-    safe_sleep,
-    temporary_dir,
-    touch,
-)
-from pex.compatibility import WINDOWS, to_bytes
+from pex.common import safe_copy, safe_mkdir, safe_open, safe_rmtree, temporary_dir, touch
+from pex.compatibility import PY2, WINDOWS, to_bytes
 from pex.executor import Executor
+from pex.fetcher import URLFetcher
 from pex.interpreter import PythonInterpreter
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
-from pex.requirements import LogicalLine, PyPIRequirement, URLFetcher, parse_requirement_file
+from pex.requirements import LogicalLine, PyPIRequirement, parse_requirement_file
 from pex.testing import (
     IS_MAC,
     IS_PYPY,
@@ -52,10 +44,14 @@ from pex.testing import (
     IntegResults,
     WheelBuilder,
     built_wheel,
+    create_pex_command,
     ensure_python_interpreter,
     ensure_python_venv,
     get_dep_dist_names_from_pex,
+    make_env,
     make_source_dir,
+    run_command_with_jitter,
+    run_commands_with_jitter,
     run_pex_command,
     run_simple_pex,
     run_simple_pex_test,
@@ -81,16 +77,6 @@ if TYPE_CHECKING:
         Optional,
         Tuple,
     )
-
-
-def make_env(**kwargs):
-    # type: (**Any) -> Dict[str, str]
-    env = os.environ.copy()
-    env.update((k, str(v)) for k, v in kwargs.items() if v is not None)
-    for k, v in kwargs.items():
-        if v is None:
-            env.pop(k, None)
-    return env
 
 
 def test_pex_execute():
@@ -521,7 +507,6 @@ def test_interpreter_resolution_with_constraint_option():
         res.assert_success()
         pex_info = PexInfo.from_pex(pex_out_path)
         assert [">=2.7,<3"] == pex_info.interpreter_constraints
-        assert pex_info.build_properties["version"][0] < 3
 
 
 def test_interpreter_resolution_with_multiple_constraint_options():
@@ -542,7 +527,6 @@ def test_interpreter_resolution_with_multiple_constraint_options():
         res.assert_success()
         pex_info = PexInfo.from_pex(pex_out_path)
         assert {">=2.7,<3", ">=500"} == set(pex_info.interpreter_constraints)
-        assert pex_info.build_properties["version"][0] < 3
 
 
 def test_interpreter_resolution_with_pex_python_path():
@@ -1769,34 +1753,12 @@ def test_issues_539_abi3_resolution():
         subprocess.check_call([cryptography_pex, "-c", "import cryptography"])
 
 
-def assert_reproducible_build(args):
-    # type: (List[str]) -> None
+def assert_reproducible_build(
+    args,  # type: List[str]
+    pythons=None,  # type: Optional[Iterable[str]]
+):
+    # type: (...) -> None
     with temporary_dir() as td:
-        pex_root = os.path.join(td, "pex_root")
-
-        # Note that we change the `PYTHONHASHSEED` to ensure that there are no issues resulting
-        # from the random seed, such as data structures, as Tox sets this value by default. See
-        # https://tox.readthedocs.io/en/latest/example/basic.html#special-handling-of-pythonhashseed.
-        def create_pex(path, seed):
-            safe_rmtree(pex_root)
-            result = run_pex_command(
-                args + ["-o", path, "--pex-root", pex_root], env=make_env(PYTHONHASHSEED=seed)
-            )
-            result.assert_success()
-
-        def create_multiple_pexes():
-            paths = []
-            for index in range(3):
-                path = os.path.join(td, "{}.pex".format(index))
-                paths.append(path)
-                # We sleep to ensure that there is no non-reproducibility from timestamps or
-                # anything that may depend on the system time. Note that we must sleep for at least
-                # 2 seconds, because the zip format uses 2 second precision per section 4.4.6 of
-                # https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT.
-                if index > 0:
-                    safe_sleep(2)
-                create_pex(path, seed=(index * 497) + 4)
-            return paths
 
         def explode_pex(path):
             with ZipFile(path) as zf:
@@ -1805,10 +1767,26 @@ def assert_reproducible_build(args):
                 zf.extractall(path=destination_dir)
                 return [os.path.join(destination_dir, member) for member in sorted(zf.namelist())]
 
-        pexes = create_multiple_pexes()
-        pex_members = {pex: explode_pex(path=pex) for pex in pexes}
+        if pythons:
+            pexes = run_commands_with_jitter(
+                path_argument="--output-file",
+                commands=[
+                    create_pex_command(
+                        args=args + ["--python-shebang", "/usr/bin/env python"],
+                        python=python,
+                        quiet=True,
+                    )
+                    for python in pythons
+                ],
+            )
+        else:
+            pexes = run_command_with_jitter(
+                create_pex_command(args=args, quiet=True), path_argument="--output-file", count=3
+            )
 
-        for pex1, pex2 in itertools.combinations(pexes, r=2):
+        pex_members = {pex: explode_pex(path=pex) for pex in pexes}
+        pex1 = pexes.pop()
+        for pex2 in pexes:
             # First compare file-by-file for easier debugging.
             for member1, member2 in zip(pex_members[pex1], pex_members[pex2]):
                 assert not os.path.isdir(member1) ^ os.path.isdir(member2)
@@ -1825,9 +1803,22 @@ def assert_reproducible_build(args):
             assert filecmp.cmp(pex1, pex2, shallow=False)
 
 
+MAJOR_COMPATIBLE_PYTHONS = (
+    (sys.executable, ensure_python_interpreter(PY27))
+    if PY2
+    else (sys.executable, ensure_python_interpreter(PY37), ensure_python_interpreter(PY38))
+)
+MIXED_MAJOR_PYTHONS = (
+    sys.executable,
+    ensure_python_interpreter(PY27),
+    ensure_python_interpreter(PY37),
+    ensure_python_interpreter(PY38),
+)
+
+
 def test_reproducible_build_no_args():
     # type: () -> None
-    assert_reproducible_build([])
+    assert_reproducible_build([], pythons=MIXED_MAJOR_PYTHONS)
 
 
 def test_reproducible_build_bdist_requirements():
@@ -1838,16 +1829,24 @@ def test_reproducible_build_bdist_requirements():
 
 def test_reproducible_build_sdist_requirements():
     # type: () -> None
-    assert_reproducible_build(["python-crontab==2.3.6"])
+    # The python-crontab sdist will be built as py2-none-any or py3-none-any depending on the
+    # Python major version since it is not marked as universal in the sdist.
+    assert_reproducible_build(["python-crontab==2.3.6"], pythons=MAJOR_COMPATIBLE_PYTHONS)
 
 
 def test_reproducible_build_m_flag():
     # type: () -> None
-    assert_reproducible_build(["-m", "pydoc"])
+    assert_reproducible_build(["-m", "pydoc"], pythons=MIXED_MAJOR_PYTHONS)
 
 
 def test_reproducible_build_c_flag_from_source():
     # type: () -> None
+    setup_cfg = dedent(
+        """\
+        [wheel]
+        universal = 1
+        """
+    )
     setup_py = dedent(
         """\
         from setuptools import setup
@@ -1856,7 +1855,7 @@ def test_reproducible_build_c_flag_from_source():
             name='my_app',
             entry_points={'console_scripts': ['my_app_function = my_app:do_something']},
         )
-  """
+        """
     )
     my_app = dedent(
         """\
@@ -1864,22 +1863,31 @@ def test_reproducible_build_c_flag_from_source():
             return "reproducible"
         """
     )
-    with temporary_content({"setup.py": setup_py, "my_app.py": my_app}) as project_dir:
-        assert_reproducible_build([project_dir, "-c", "my_app_function"])
+    with temporary_content(
+        {"setup.cfg": setup_cfg, "setup.py": setup_py, "my_app.py": my_app}
+    ) as project_dir:
+        assert_reproducible_build(
+            [project_dir, "-c", "my_app_function"], pythons=MIXED_MAJOR_PYTHONS
+        )
 
 
 def test_reproducible_build_c_flag_from_dependency():
     # type: () -> None
-    assert_reproducible_build(["future==0.17.1", "-c", "futurize"])
+    # The futurize script installed depends on the version of python being used; so we don't try
+    # to mix Python 2 with Python 3 as in many other reproducibility tests.
+    assert_reproducible_build(
+        ["future==0.17.1", "-c", "futurize"], pythons=MAJOR_COMPATIBLE_PYTHONS
+    )
 
 
 def test_reproducible_build_python_flag():
     # type: () -> None
-    assert_reproducible_build(["--python=python2.7"])
+    assert_reproducible_build(["--python=python2.7"], pythons=MIXED_MAJOR_PYTHONS)
 
 
 def test_reproducible_build_python_shebang_flag():
     # type: () -> None
+    # Passing `python_versions` override `--python-shebang`; so we don't do that here.
     assert_reproducible_build(["--python-shebang=/usr/bin/python"])
 
 
@@ -3549,3 +3557,22 @@ def test_pip_leak_issues_1336(tmpdir):
     pip = os.path.join(os.path.dirname(python), "pip")
     subprocess.check_call(args=[pip, "install", "setuptools_scm==6.0.1"])
     run_pex_command(args=["--python", python, "bitstring==3.1.7"], python=python).assert_success()
+
+
+@pytest.mark.parametrize(
+    "mode_args",
+    [
+        pytest.param([], id="PEX"),
+        pytest.param(["--unzip"], id="unzip"),
+        pytest.param(["--venv"], id="venv"),
+    ],
+)
+def test_binary_scripts(tmpdir, mode_args):
+    # The py-spy distribution has a `py-spy` "script" that is a native executable that we should
+    # not try to parse as a traditional script but should still be able to execute.
+    py_spy_pex = os.path.join(str(tmpdir), "py-spy.pex")
+    run_pex_command(
+        args=["py-spy==0.3.8", "-c", "py-spy", "-o", py_spy_pex] + mode_args
+    ).assert_success()
+    output = subprocess.check_output(args=[py_spy_pex, "-V"])
+    assert output == b"py-spy 0.3.8\n"

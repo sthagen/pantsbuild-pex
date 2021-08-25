@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 DETERMINISTIC_DATETIME = datetime(
     year=1980, month=1, day=1, hour=0, minute=0, second=0, tzinfo=None
 )
+_UNIX_EPOCH = datetime(year=1970, month=1, day=1, hour=0, minute=0, second=0, tzinfo=None)
+DETERMINISTIC_DATETIME_TIMESTAMP = (DETERMINISTIC_DATETIME - _UNIX_EPOCH).total_seconds()
 
 
 def filter_pyc_dirs(dirs):
@@ -306,7 +308,7 @@ def safe_rmtree(directory):
 
 
 def safe_sleep(seconds):
-    # type: (int) -> None
+    # type: (float) -> None
     """Ensure that the thread sleeps at a minimum the requested seconds.
 
     Until Python 3.5, there was no guarantee that time.sleep() would actually sleep the requested
@@ -479,9 +481,32 @@ def is_exe(path):
     """Determines if the given path is a file executable by the current user.
 
     :param path: The path to check.
-    :return: `True if the given path is an file executable by the current user.
+    :return: `True if the given path is a file executable by the current user.
     """
     return os.path.isfile(path) and os.access(path, os.R_OK | os.X_OK)
+
+
+def is_script(
+    path,  # type: str
+    pattern=None,  # type: Optional[str]
+):
+    # type: (...) -> bool
+    """Determines if the given path is a script executable by the current user.
+
+    A script is an executable (`is_exe` is True) that starts with a shebang (#!...) line.
+
+    :param path: The path to check.
+    :param pattern: An optional pattern to match against the shebang (excluding the leading #!).
+    :return: `True if the given path is a script executable by the current user.
+    """
+    if not is_exe(path):
+        return False
+    with open(path, "rb") as fp:
+        if b"#!" != fp.read(2):
+            return False
+        if not pattern:
+            return True
+        return bool(re.match(pattern, fp.readline().decode("utf-8")))
 
 
 def can_write_dir(path):

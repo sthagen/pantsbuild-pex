@@ -3,10 +3,12 @@
 
 from __future__ import absolute_import
 
+import ast
 import os
 
+from pex.common import is_script
 from pex.third_party.pkg_resources import Distribution
-from pex.typing import TYPE_CHECKING
+from pex.typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     import attr  # vendor:skip
@@ -17,6 +19,10 @@ else:
 
 @attr.s(frozen=True)
 class DistributionScript(object):
+    @staticmethod
+    def is_python_script(path):
+        return is_script(path, pattern=r"(?i)^.*(?:python|pypy)")
+
     @classmethod
     def find(
         cls,
@@ -31,9 +37,21 @@ class DistributionScript(object):
     path = attr.ib()  # type: str
 
     def read_contents(self):
-        # type: () -> str
-        with open(self.path) as fp:
+        # type: () -> bytes
+        with open(self.path, "rb") as fp:
             return fp.read()
+
+    def python_script(self):
+        # type: () -> Optional[ast.AST]
+        if not self.is_python_script(self.path):
+            return None
+
+        try:
+            return cast(
+                ast.AST, compile(self.read_contents(), self.path, "exec", flags=0, dont_inherit=1)
+            )
+        except (SyntaxError, TypeError):
+            return None
 
 
 def get_script_from_distributions(name, dists):
