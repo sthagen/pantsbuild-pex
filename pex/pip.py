@@ -21,7 +21,7 @@ from textwrap import dedent
 
 from pex import dist_metadata, third_party
 from pex.common import atomic_directory, safe_mkdtemp
-from pex.compatibility import urlparse
+from pex.compatibility import MODE_READ_UNIVERSAL_NEWLINES, urlparse
 from pex.dist_metadata import ProjectNameAndVersion
 from pex.distribution_target import DistributionTarget
 from pex.finders import DistributionScript
@@ -318,6 +318,7 @@ class _LogScrapeJob(Job):
         super(_LogScrapeJob, self)._check_returncode(stderr=stderr)
 
 
+@attr.s(frozen=True)
 class Pip(object):
     _PATCHED_MARKERS_FILE_ENV_VAR_NAME = "_PEX_PATCHED_MARKERS_FILE"
 
@@ -377,13 +378,9 @@ class Pip(object):
                     fp.close()
                     isolated_pip_builder.set_executable(fp.name, "__pex_patched_pip__.py")
                 isolated_pip_builder.freeze()
-        pex_info = PexInfo.from_pex(pip_pex_path)
-        pex_info.add_interpreter_constraint(str(pip_interpreter.identity.requirement))
-        return cls(ensure_venv(PEX(pip_pex_path, interpreter=pip_interpreter, pex_info=pex_info)))
+        return cls(ensure_venv(PEX(pip_pex_path, interpreter=pip_interpreter)))
 
-    def __init__(self, pip_pex_path):
-        # type: (str) -> None
-        self._pip_pex_path = pip_pex_path  # type: str
+    _pip_pex_path = attr.ib()  # type: str
 
     @staticmethod
     def _calculate_resolver_version(package_index_configuration=None):
@@ -786,7 +783,9 @@ class Pip(object):
 
         # The RECORD is a csv file with the path to each installed file in the 1st column.
         # See: https://www.python.org/dev/peps/pep-0376/#record
-        with closing(fileinput.input(files=[record_abspath], inplace=True, mode="rU")) as record_fi:
+        with closing(
+            fileinput.input(files=[record_abspath], inplace=True, mode=MODE_READ_UNIVERSAL_NEWLINES)
+        ) as record_fi:
             csv_writer = None  # type: Optional[CSVWriter]
             for path, existing_hash, existing_size in csv.reader(
                 record_fi, delimiter=",", quotechar='"'
