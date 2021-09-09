@@ -45,29 +45,6 @@ def yield_pex_builder(zip_safe=True, interpreter=None):
         yield pb
 
 
-def test_force_local():
-    # type: () -> None
-    with yield_pex_builder() as pb, temporary_dir() as pex_root, temporary_filename() as pex_file:
-        pb.info.pex_root = pex_root
-        pb.build(pex_file)
-
-        code_cache = PEXEnvironment(pex_file)._force_local()
-
-        assert os.path.exists(pb.info.zip_unsafe_cache)
-        listing = set(os.listdir(pb.info.zip_unsafe_cache))
-
-        # The code_cache should be a write-locked directory.
-        assert len(listing) == 2
-        listing.remove(os.path.basename(code_cache))
-        lockfile = listing.pop()
-        assert os.path.isfile(os.path.join(pb.info.zip_unsafe_cache, lockfile))
-
-        assert set(os.listdir(code_cache)) == {PexInfo.PATH, "__main__.py", "__main__.pyc"}
-
-        # idempotence
-        assert PEXEnvironment(pex_file)._force_local() == code_cache
-
-
 def assert_force_local_implicit_ns_packages_issues_598(
     interpreter=None, requirements=(), create_ns_packages=True
 ):
@@ -156,7 +133,7 @@ def assert_force_local_implicit_ns_packages_issues_598(
         # type: (PEXBuilder, str) -> None
         for installed_dist in resolver.resolve(
             requirements, cache=cache, interpreters=[builder.interpreter]
-        ):
+        ).installed_distributions:
             builder.add_distribution(installed_dist.distribution)
             if installed_dist.direct_requirement:
                 builder.add_requirement(installed_dist.direct_requirement)
@@ -175,7 +152,6 @@ def assert_force_local_implicit_ns_packages_issues_598(
 
     with temporary_dir() as root, temporary_dir() as cache:
         pex_info1 = PexInfo.default()
-        pex_info1.zip_safe = False
         pex1 = os.path.join(root, "pex1.pex")
         builder1 = PEXBuilder(interpreter=interpreter, pex_info=pex_info1)
         add_requirements(builder1, cache)
@@ -243,54 +219,6 @@ def test_issues_598_implicit_explicit_mixed(python_37_interpreter):
     )
 
 
-def normalize(path):
-    # type: (str) -> str
-    return os.path.normpath(os.path.realpath(path)).lower()
-
-
-def assert_dist_cache(zip_safe):
-    # type: (bool) -> None
-    with yield_pex_builder(
-        zip_safe=zip_safe
-    ) as pb, temporary_dir() as pex_root, temporary_filename() as pex_file:
-        pb.info.pex_root = pex_root
-        pb.build(pex_file)
-
-        with open_zip(pex_file) as zf:
-            dists = PEXEnvironment(pex_file)._write_zipped_internal_cache(zf=zf)
-            assert len(dists) == 1
-            original_location = normalize(dists[0].location)
-            assert original_location.startswith(normalize(pb.info.install_cache))
-
-        # Call a second time to validate idempotence of caching.
-        dists = PEXEnvironment(pex_file)._write_zipped_internal_cache(zf=None)
-        assert len(dists) == 1
-        assert normalize(dists[0].location) == original_location
-
-
-def test_write_zipped_internal_cache():
-    # type: () -> None
-    assert_dist_cache(zip_safe=False)
-
-    # Zip_safe pexes still always should have dists written to install cache, only the pex code (
-    # sources and resources) should be imported from the pex zip when zip safe.
-    assert_dist_cache(zip_safe=True)
-
-
-def test_load_internal_cache_unzipped():
-    # type: () -> None
-    # Unzipped pexes should use distributions from the pex internal cache.
-    with yield_pex_builder(zip_safe=True) as pb, temporary_dir() as pex_root:
-        pb.info.pex_root = pex_root
-        pb.freeze()
-
-        dists = list(PEXEnvironment(pb.path())._load_internal_cache())
-        assert len(dists) == 1
-        assert normalize(dists[0].location).startswith(
-            normalize(os.path.join(pb.path(), pb.info.internal_cache))
-        )
-
-
 _KNOWN_BAD_APPLE_INTERPRETER = (
     "/System/Library/Frameworks/Python.framework/Versions/"
     "2.7/Resources/Python.app/Contents/MacOS/Python"
@@ -324,7 +252,7 @@ def test_osx_platform_intel_issue_523():
         ) as pb, temporary_filename() as pex_file:
             for installed_dist in resolver.resolve(
                 ["psutil==5.4.3"], cache=cache, interpreters=[pb.interpreter]
-            ):
+            ).installed_distributions:
                 pb.add_dist_location(installed_dist.distribution.location)
             pb.build(pex_file)
 
@@ -380,7 +308,7 @@ def test_activate_extras_issue_615():
     with yield_pex_builder() as pb:
         for installed_dist in resolver.resolve(
             ["pex[requests]==1.6.3"], interpreters=[pb.interpreter]
-        ):
+        ).installed_distributions:
             if installed_dist.direct_requirement:
                 pb.add_requirement(installed_dist.direct_requirement)
             pb.add_dist_location(installed_dist.distribution.location)
@@ -404,7 +332,7 @@ def assert_namespace_packages_warning(distribution, version, expected_warning):
     # type: (str, str, bool) -> None
     requirement = "{}=={}".format(distribution, version)
     pb = PEXBuilder()
-    for installed_dist in resolver.resolve([requirement]):
+    for installed_dist in resolver.resolve([requirement]).installed_distributions:
         pb.add_dist_location(installed_dist.distribution.location)
     pb.freeze()
 

@@ -96,20 +96,13 @@ def populate_venv_with_pex(
             provenance[dst].append(src)
 
     pex_info = pex.pex_info()
-    if zipfile.is_zipfile(pex.path()):
-        record_provenance(
-            PEXEnvironment(pex.path()).explode_code(
-                venv.site_packages_dir, exclude=("__main__.py", pex_info.PATH)
-            )
+    record_provenance(
+        _copytree(
+            src=PEXEnvironment.mount(pex.path()).path,
+            dst=venv.site_packages_dir,
+            exclude=(pex_info.internal_cache, pex_info.bootstrap, "__main__.py", pex_info.PATH),
         )
-    else:
-        record_provenance(
-            _copytree(
-                src=pex.path(),
-                dst=venv.site_packages_dir,
-                exclude=(pex_info.internal_cache, pex_info.bootstrap, "__main__.py", pex_info.PATH),
-            )
-        )
+    )
 
     with open(os.path.join(venv.venv_dir, pex_info.PATH), "w") as fp:
         fp.write(pex_info.dump())
@@ -197,7 +190,9 @@ def populate_venv_with_pex(
                     "PEX_PYTHON_PATH",
                     "PEX_VERBOSE",
                     "PEX_EMIT_WARNINGS",
+                    # This is used in re-exec.
                     "__PEX_EXE__",
+                    # This is used by the vendoring system.
                     "__PEX_UNVENDORED__",
                     # This is _not_ used (it is ignored), but it's present under CI and simplest to
                     # add an exception for here and not warn about in CI runs.

@@ -10,6 +10,7 @@ from __future__ import absolute_import, print_function
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from argparse import Action, ArgumentDefaultsHelpFormatter, ArgumentParser, ArgumentTypeError
@@ -24,22 +25,24 @@ from pex.interpreter_constraints import (
     validate_constraints,
 )
 from pex.jobs import DEFAULT_MAX_JOBS
+from pex.layout import Layout, maybe_install
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pex import PEX
 from pex.pex_bootstrapper import ensure_venv, iter_compatible_interpreters
 from pex.pex_builder import CopyMode, PEXBuilder
+from pex.pex_info import PexInfo
 from pex.pip import ResolverVersion
 from pex.platforms import Platform
 from pex.resolver import Unsatisfiable, parsed_platform, resolve, resolve_from_pex
 from pex.tracer import TRACER
-from pex.typing import TYPE_CHECKING
+from pex.typing import TYPE_CHECKING, cast
 from pex.variables import ENV, Variables
 from pex.venv_bin_path import BinPath
 from pex.version import __version__
 
 if TYPE_CHECKING:
-    from typing import List, Iterable, Dict
+    from typing import List, Dict
     from argparse import Namespace
 
 
@@ -347,11 +350,35 @@ def configure_clp_pex_options(parser):
         "--zip-safe",
         "--not-zip-safe",
         dest="zip_safe",
-        default=True,
+        metavar="DEPRECATED",
+        default=None,
         action=HandleBoolAction,
-        help="Whether or not the sources in the pex file are zip safe.  If they are not zip safe, "
-        "they will be written to disk prior to execution. Also see --unzip which will cause the "
-        "complete pex file, including dependencies, to be unzipped.",
+        help=(
+            "Deprecated: This option is no longer used since user code is now always unzipped "
+            "before execution."
+        ),
+    )
+    group.add_argument(
+        "--layout",
+        dest="layout",
+        default=Layout.ZIPAPP.value,
+        choices=[choice.value for choice in Layout.values],
+        help=(
+            "By default, a PEX is created as a single file zipapp when `-o` is specified, but "
+            "either a packed or loose directory tree based layout can be chosen instead. A packed "
+            "layout PEX is an executable directory structure designed to have cache-friendly "
+            "characteristics for syncing incremental updates to PEXed applications over a network. "
+            "At the top level of the packed directory tree there is an executable `__main__.py`"
+            "script. The directory can also be executed by passing its path to a Python "
+            "executable; e.g: `python packed-pex-dir/`. The Pex bootstrap code and all dependency "
+            "code are packed into individual zip files for efficient caching and syncing. A loose "
+            "layout PEX is similar to a packed PEX, except that neither the Pex bootstrap code nor "
+            "the dependency code are packed into zip files, but are instead present as collections "
+            "of loose files in the directory tree providing different caching and syncing "
+            "tradeoffs. Both zipapp and packed layouts install themselves in the PEX_ROOT as loose "
+            "apps by default before executing, but these layouts compose with `--venv` execution "
+            "mode as well and support `--seed`ing."
+        ),
     )
 
     runtime_mode = group.add_mutually_exclusive_group()
@@ -359,11 +386,13 @@ def configure_clp_pex_options(parser):
         "--unzip",
         "--no-unzip",
         dest="unzip",
-        default=False,
+        metavar="DEPRECATED",
+        default=None,
         action=HandleBoolAction,
-        help="Whether or not the pex file should be unzipped before executing it. If the pex file will "
-        "be run multiple times under a stable runtime PEX_ROOT the unzipping will only be "
-        "performed once and subsequent runs will enjoy lower startup latency.",
+        help=(
+            "Deprecated: This option is no longer used since unzipping PEX zip files before "
+            "execution is now the default."
+        ),
     )
     runtime_mode.add_argument(
         "--venv",
@@ -392,11 +421,12 @@ def configure_clp_pex_options(parser):
     group.add_argument(
         "--always-write-cache",
         dest="always_write_cache",
-        default=False,
+        default=None,
         action="store_true",
-        help="Always write the internally cached distributions to disk prior to invoking "
-        "the pex source code.  This can use less memory in RAM constrained "
-        "environments.",
+        help=(
+            "Deprecated: This option is no longer used; all internally cached distributions in a "
+            "PEX are always installed into the local Pex dependency cache."
+        ),
     )
 
     group.add_argument(
@@ -959,6 +989,25 @@ def build_pex(reqs, options, cache=None):
             "`-D/--sources-directory` instead."
         )
 
+    if options.zip_safe is not None:
+        pex_warnings.warn(
+            "The `--zip-safe/--not-zip-safe` option is deprecated. This option is no longer used "
+            "since user code is now always unzipped before execution."
+        )
+
+    if options.unzip is not None:
+        pex_warnings.warn(
+            "The `--unzip/--no-unzip` option is deprecated. This option is no longer used since "
+            "unzipping PEX zip files before execution is now the default."
+        )
+
+    if options.always_write_cache is not None:
+        pex_warnings.warn(
+            "The `--always-write-cache` option is deprecated. This option is no longer used; all "
+            "internally cached distributions in a PEX are always installed into the local Pex "
+            "dependency cache."
+        )
+
     for directory in OrderedSet(options.sources_directory + options.resources_directory):
         src_dir = os.path.normpath(directory)
         for root, _, files in os.walk(src_dir):
@@ -968,14 +1017,11 @@ def build_pex(reqs, options, cache=None):
                 pex_builder.add_source(src_file_path, dst_path)
 
     pex_info = pex_builder.info
-    pex_info.zip_safe = options.zip_safe
-    pex_info.unzip = options.unzip
     pex_info.venv = bool(options.venv)
     pex_info.venv_bin_path = options.venv or BinPath.FALSE
     pex_info.venv_copies = options.venv_copies
     pex_info.includes_tools = options.include_tools or options.venv
     pex_info.pex_path = options.pex_path
-    pex_info.always_write_cache = options.always_write_cache
     pex_info.ignore_errors = options.ignore_errors
     pex_info.emit_warnings = options.emit_warnings
     pex_info.inherit_path = InheritPath.for_value(options.inherit_path)
@@ -1010,7 +1056,7 @@ def build_pex(reqs, options, cache=None):
                 with TRACER.timed(
                     "Resolving requirements from PEX {}.".format(options.pex_repository)
                 ):
-                    resolveds = resolve_from_pex(
+                    result = resolve_from_pex(
                         pex=options.pex_repository,
                         requirements=reqs,
                         requirement_files=options.requirement_files,
@@ -1024,7 +1070,7 @@ def build_pex(reqs, options, cache=None):
                     )
             else:
                 with TRACER.timed("Resolving requirements."):
-                    resolveds = resolve(
+                    result = resolve(
                         requirements=reqs,
                         requirement_files=options.requirement_files,
                         constraint_files=options.constraint_files,
@@ -1045,10 +1091,10 @@ def build_pex(reqs, options, cache=None):
                         ignore_errors=options.ignore_errors,
                     )
 
-            for resolved_dist in resolveds:
-                pex_builder.add_distribution(resolved_dist.distribution)
-                if resolved_dist.direct_requirement:
-                    pex_builder.add_requirement(resolved_dist.direct_requirement)
+            for installed_dist in result.installed_distributions:
+                pex_builder.add_distribution(installed_dist.distribution)
+                if installed_dist.direct_requirement:
+                    pex_builder.add_requirement(installed_dist.direct_requirement)
         except Unsatisfiable as e:
             die(str(e))
 
@@ -1160,6 +1206,7 @@ def main(args=None):
                 options.pex_name,
                 bytecode_compile=options.compile,
                 deterministic_timestamp=not options.use_system_time,
+                layout=Layout.for_value(options.layout),
             )
             if options.seed != Seed.NONE:
                 seed_info = seed_cache(options, pex, verbose=options.seed == Seed.VERBOSE)
@@ -1187,48 +1234,40 @@ def seed_cache(
     verbose=False,  # type : bool
 ):
     # type: (...) -> str
-    pex_path = pex.path()
+
+    pex_path = cast(str, options.pex_name)
     with TRACER.timed("Seeding local caches for {}".format(pex_path)):
         pex_info = pex.pex_info()
+        pex_root = pex_info.pex_root
 
         def create_verbose_info(final_pex_path):
             # type: (str) -> Dict[str, str]
-            return dict(
-                pex_root=pex_info.pex_root, python=pex.interpreter.binary, pex=final_pex_path
-            )
+            return dict(pex_root=pex_root, python=pex.interpreter.binary, pex=final_pex_path)
 
-        if options.unzip:
-            unzip_dir = pex_info.unzip_dir
-            if unzip_dir is None:
-                raise AssertionError(
-                    "Expected PEX-INFO for {} to have the components of an unzip directory".format(
-                        pex_path
-                    )
-                )
-            with atomic_directory(unzip_dir, exclusive=True) as chroot:
-                if not chroot.is_finalized:
-                    with TRACER.timed("Extracting {}".format(pex_path)):
-                        with open_zip(options.pex_name) as pex_zip:
-                            pex_zip.extractall(chroot.work_dir)
-            if verbose:
-                return json.dumps(create_verbose_info(final_pex_path=unzip_dir))
-            else:
-                return "{} {}".format(pex.interpreter.binary, unzip_dir)
-        elif options.venv:
+        if options.venv:
             with TRACER.timed("Creating venv from {}".format(pex_path)):
                 venv_pex = ensure_venv(pex)
                 if verbose:
                     return json.dumps(create_verbose_info(final_pex_path=venv_pex))
                 else:
                     return venv_pex
-        else:
-            with TRACER.timed("Extracting code and distributions for {}".format(pex_path)):
-                pex.activate()
-            pex_path = os.path.abspath(options.pex_name)
+
+        pex_hash = pex_info.pex_hash
+        if pex_hash is None:
+            raise AssertionError(
+                "There was no pex_hash stored in {} for {}.".format(PexInfo.PATH, pex_path)
+            )
+
+        with TRACER.timed("Seeding caches for {}".format(pex_path)):
+            final_pex_path = os.path.join(
+                maybe_install(pex=pex_path, pex_root=pex_root, pex_hash=pex_hash)
+                or os.path.abspath(pex_path),
+                "__main__.py",
+            )
             if verbose:
-                return json.dumps(create_verbose_info(final_pex_path=pex_path))
+                return json.dumps(create_verbose_info(final_pex_path=final_pex_path))
             else:
-                return pex_path
+                return final_pex_path
 
 
 if __name__ == "__main__":
