@@ -1,5 +1,6 @@
 # Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
+
 import hashlib
 import os
 
@@ -7,17 +8,9 @@ import pytest
 
 from pex import dist_metadata, resolver
 from pex.distribution_target import DistributionTarget
-from pex.locked_resolve import (
-    Artifact,
-    LockConfiguration,
-    LockedRequirement,
-    LockedResolve,
-    LockStyle,
-    Pin,
-)
-from pex.pep_503 import ProjectName
+from pex.resolve.locked_resolve import LockConfiguration, LockStyle, Pin
+from pex.resolve.testing import normalize_locked_resolve
 from pex.resolver import Downloaded, LocalDistribution
-from pex.third_party.pkg_resources import Requirement
 from pex.typing import TYPE_CHECKING
 from pex.util import CacheHelper
 
@@ -35,62 +28,6 @@ def normalize_local_dist(local_dist):
     return attr.evolve(local_dist, path=os.path.basename(local_dist.path))
 
 
-def normalize_artifact(
-    artifact,  # type: Artifact
-    skip_urls=False,  # type: bool
-):
-    # type: (...) -> Artifact
-    return attr.evolve(artifact, url="") if skip_urls else artifact
-
-
-def normalize_locked_req(
-    locked_req,  # type: LockedRequirement
-    skip_additional_artifacts=False,  # type: bool
-    skip_urls=False,  # type: bool
-):
-    # type: (...) -> LockedRequirement
-
-    # We always normalize the following:
-    # 1. If an input requirement is not pinned, its locked equivalent always will be; so just check
-    #    matching project names.
-    # 2. A download using a lock file will differ from a download using requirement strings in its
-    #    via descriptions for each requirement; so don't compare vias at all.
-    return attr.evolve(
-        locked_req,
-        artifact=normalize_artifact(locked_req.artifact, skip_urls=skip_urls),
-        requirement=Requirement.parse(str(ProjectName(locked_req.requirement.project_name))),
-        additional_artifacts=()
-        if skip_additional_artifacts
-        else tuple(
-            sorted(
-                normalize_artifact(a, skip_urls=skip_urls) for a in locked_req.additional_artifacts
-            )
-        ),
-        via=(),
-    )
-
-
-def normalize_lock(
-    lock,  # type: LockedResolve
-    skip_additional_artifacts=False,  # type: bool
-    skip_urls=False,  # type: bool
-):
-    # type: (...) -> LockedResolve
-    return attr.evolve(
-        lock,
-        locked_requirements=tuple(
-            sorted(
-                normalize_locked_req(
-                    locked_req,
-                    skip_additional_artifacts=skip_additional_artifacts,
-                    skip_urls=skip_urls,
-                )
-                for locked_req in lock.locked_requirements
-            )
-        ),
-    )
-
-
 def normalize(
     downloaded,  # type: Downloaded
     skip_additional_artifacts=False,  # type: bool
@@ -104,12 +41,12 @@ def normalize(
                 normalize_local_dist(local_dist) for local_dist in downloaded.local_distributions
             )
         ),
-        locks=tuple(
+        locked_resolves=tuple(
             sorted(
-                normalize_lock(
+                normalize_locked_resolve(
                     lock, skip_additional_artifacts=skip_additional_artifacts, skip_urls=skip_urls
                 )
-                for lock in downloaded.locks
+                for lock in downloaded.locked_resolves
             )
         ),
     )
@@ -140,10 +77,10 @@ def test_lock_single_target(
 
     downloaded = resolver.download(requirements=requirements, lock_configuration=lock_configuration)
 
-    assert 1 == len(downloaded.locks)
-    lock = downloaded.locks[0]
+    assert 1 == len(downloaded.locked_resolves)
+    lock = downloaded.locked_resolves[0]
 
-    assert DistributionTarget.current() == lock.target
+    assert DistributionTarget.current().get_supported_tags()[0] == lock.platform_tag
 
     def pin(local_distribution):
         # type: (LocalDistribution) -> Pin

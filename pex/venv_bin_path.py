@@ -3,35 +3,13 @@
 
 from __future__ import absolute_import
 
+from pex.enum import Enum
 
-class BinPath(object):
-    class Value(object):
-        def __init__(self, value):
-            # type: (str) -> None
-            self.value = value
 
-        def __str__(self):
-            # type: () -> str
-            return str(self.value)
-
-        def __repr__(self):
-            # type: () -> str
-            return repr(self.value)
+class BinPath(Enum["BinPath.Value"]):
+    class Value(Enum.Value):
+        pass
 
     FALSE = Value("false")
     PREPEND = Value("prepend")
     APPEND = Value("append")
-
-    values = FALSE, PREPEND, APPEND
-
-    @classmethod
-    def for_value(cls, value):
-        # type: (str) -> BinPath.Value
-        for v in cls.values:
-            if v.value == value:
-                return v
-        raise ValueError(
-            "{!r} of type {} must be one of {}".format(
-                value, type(value), ", ".join(map(repr, cls.values))
-            )
-        )

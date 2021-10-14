@@ -1521,7 +1521,7 @@ def test_venv_mode(
     "execution_mode_args", [pytest.param([], id="PEX"), pytest.param(["--venv"], id="VENV")]
 )
 @pytest.mark.parametrize(
-    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values]
+    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values()]
 )
 def test_seed(
     isort_pex_args,  # type: Tuple[str, List[str]]
@@ -1536,7 +1536,7 @@ def test_seed(
     results.assert_success()
 
     # Setting posix=False works around this issue under pypy: https://bugs.python.org/issue1170.
-    seed_argv = shlex.split(results.output, posix=False)
+    seed_argv = shlex.split(str(results.output), posix=False)
     isort_args = ["--version"]
     seed_stdout = subprocess.check_output(seed_argv + isort_args)
     pex_args = [pex_file] if os.path.isfile(pex_file) else [sys.executable, pex_file]
@@ -1548,7 +1548,7 @@ def test_seed(
     "execution_mode_args", [pytest.param([], id="PEX"), pytest.param(["--venv"], id="VENV")]
 )
 @pytest.mark.parametrize(
-    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values]
+    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values()]
 )
 @pytest.mark.parametrize(
     "seeded_execute_args",
@@ -1628,7 +1628,8 @@ def test_requirement_file_from_url(tmpdir):
 
     constraints = os.path.join(str(tmpdir), "constraints.txt")
     with open(constraints, "w") as fp:
-        fp.write("translate>=3.2.1,<3.6.0")
+        print("translate>=3.2.1,<3.6.0", file=fp)
+        print("protobuf<=3.17.3", file=fp)
 
     pex_file = os.path.join(str(tmpdir), "pex")
 
@@ -1832,7 +1833,7 @@ def test_require_hashes(tmpdir):
     "execution_mode_args", [pytest.param([], id="PEX"), pytest.param(["--venv"], id="VENV")]
 )
 @pytest.mark.parametrize(
-    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values]
+    "layout", [pytest.param(layout, id=layout.value) for layout in Layout.values()]
 )
 def test_binary_scripts(
     tmpdir,  # type: Any

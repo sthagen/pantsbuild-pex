@@ -10,10 +10,11 @@ import sys
 from contextlib import closing
 
 from pex.common import AtomicDirectory, is_exe, safe_mkdir
+from pex.compatibility import get_stdout_bytes_buffer
 from pex.interpreter import PythonInterpreter
 from pex.third_party.pkg_resources import resource_string
 from pex.tracer import TRACER
-from pex.typing import TYPE_CHECKING
+from pex.typing import TYPE_CHECKING, cast
 from pex.util import named_temporary_file
 
 if TYPE_CHECKING:
@@ -89,21 +90,33 @@ class Virtualenv(object):
             )
             interpreter = base_interpreter
 
+        # Guard against API calls from environment with ambient PYTHONPATH preventing pip virtualenv
+        # creation. See: https://github.com/pantsbuild/pex/issues/1451
+        env = os.environ.copy()
+        pythonpath = env.pop("PYTHONPATH", None)
+        if pythonpath:
+            TRACER.log(
+                "Scrubbed PYTHONPATH={} from the virtualenv creation environment.".format(
+                    pythonpath
+                ),
+                V=3,
+            )
+
         if interpreter.version[0] >= 3 and not interpreter.identity.interpreter == "PyPy":
             # N.B.: PyPy3 comes equipped with a venv module but it does not seem to work.
             args = ["-m", "venv", "--without-pip", venv_dir]
             if copies:
                 args.append("--copies")
-            interpreter.execute(args=args)
+            interpreter.execute(args=args, env=env)
         else:
-            virtualenv_py = resource_string(__name__, "virtualenv_16.7.10_py")
+            virtualenv_py = resource_string(__name__, "virtualenv_16.7.12_py")
             with named_temporary_file(mode="wb") as fp:
                 fp.write(virtualenv_py)
                 fp.close()
                 args = [fp.name, "--no-pip", "--no-setuptools", "--no-wheel", venv_dir]
                 if copies:
                     args.append("--always-copy")
-                interpreter.execute(args=args)
+                interpreter.execute(args=args, env=env)
         return cls(venv_dir)
 
     @classmethod
@@ -214,20 +227,25 @@ class Virtualenv(object):
                 continue
             python_scripts.append(executable)
         if python_scripts:
-            with closing(fileinput.input(files=sorted(python_scripts), inplace=True)) as fi:
+            with closing(
+                fileinput.input(files=sorted(python_scripts), inplace=True, mode="rb")
+            ) as fi:
                 # N.B.: `fileinput` is strange, but useful: the context manager above monkey-patches
                 # sys.stdout to print to the corresponding original input file, which is has moved
                 # aside.
                 for line in fi:
+                    buffer = get_stdout_bytes_buffer()
                     if fi.isfirstline():
                         shebang = [python or self._interpreter.binary]
                         if python_args:
                             shebang.append(python_args)
-                        print("#!{shebang}".format(shebang=" ".join(shebang)))
+                        buffer.write(
+                            "#!{shebang}\n".format(shebang=" ".join(shebang)).encode("utf-8")
+                        )
                         yield fi.filename()
                     else:
                         # N.B.: These lines include the newline already.
-                        sys.stdout.write(line)
+                        buffer.write(cast(bytes, line))
 
     def install_pip(self):
         # type: () -> None

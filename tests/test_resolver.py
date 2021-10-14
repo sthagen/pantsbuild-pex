@@ -398,10 +398,8 @@ def test_issues_892():
         python27 = PythonInterpreter.from_binary({python27!r})
         result = resolver.resolve(requirements=['packaging==19.2'], interpreters=[python27])
         print('Resolved: {{}}'.format(result))
-  """.format(
-            python27=python27
-        )
-    )
+        """
+    ).format(python27=python27)
 
     python38 = ensure_python_interpreter(PY38)
     cmd, process = PythonInterpreter.from_binary(python38).open_process(
@@ -669,7 +667,7 @@ def test_resolve_from_pex(
         requirements=direct_requirements,
         interpreters=[py27, py38],
         platforms=[foreign_platform],
-        manylinux=manylinux,
+        assume_manylinux=manylinux,
     )
 
     distribution_locations_by_key = defaultdict(set)  # type: DefaultDict[str, Set[str]]
@@ -715,7 +713,7 @@ def test_resolve_from_pex_subset(
         pex=pex_repository,
         requirements=["cffi"],
         platforms=[foreign_platform],
-        manylinux=manylinux,
+        assume_manylinux=manylinux,
     )
 
     assert {"cffi", "pycparser"} == {
@@ -771,7 +769,7 @@ def test_resolve_from_pex_intransitive(
         transitive=False,
         interpreters=[py27, py38],
         platforms=[foreign_platform],
-        manylinux=manylinux,
+        assume_manylinux=manylinux,
     ).installed_distributions
     assert 3 == len(
         installed_distributions

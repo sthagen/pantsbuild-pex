@@ -1,6 +1,27 @@
 Release Notes
 =============
 
+2.1.52
+------
+
+This release makes a wider array of distributions resolvable for
+``--platform`` resolves by inferring the ``platform_machine``
+environment marker corresponding to the requested ``--platform``.
+
+* Populate ``platform_machine`` in ``--platform`` resolve. (#1489)
+  `PR #1489 <https://github.com/pantsbuild/pex/pull/1489>`_
+
+2.1.51
+------
+
+This release fixes both PEX creation and ``--venv`` creation to handle
+distributions that contain scripts with non-ascii characters in them
+when running in environments with a default encoding that does not
+contain those characters under PyPy3, Python 3.5 and Python 3.6.
+
+* Fix non-ascii script shebang re-writing. (#1480)
+  `PR #1480 <https://github.com/pantsbuild/pex/pull/1480>`_
+
 2.1.50
 ------
 

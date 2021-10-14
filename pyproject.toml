@@ -39,11 +39,12 @@ subprocess = ["subprocess32>=3.2.7; python_version<'3'"]
 
 [tool.flit.scripts]
 pex = "pex.bin.pex:main"
+pex3 = "pex.cli.pex:main"
 pex-tools = "pex.tools.main:main"
 
 [tool.flit.entrypoints."distutils.commands"]
 # Make bdist_pex available for folks who install the pex distribution.
-bdist_pex = "pex.commands.bdist_pex:bdist_pex"
+bdist_pex = "pex.distutils.commands.bdist_pex:bdist_pex"
 
 [tool.flit.sdist]
 include = ["CHANGES.rst"]

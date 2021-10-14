@@ -6,16 +6,16 @@ from __future__ import absolute_import
 import errno
 import os
 import shutil
-import zipfile
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 from collections import defaultdict
 from textwrap import dedent
 
 from pex import pex_warnings
+from pex.commands.command import Error, Ok, Result
 from pex.common import chmod_plus_x, pluralize, safe_mkdir
 from pex.environment import PEXEnvironment
 from pex.pex import PEX
-from pex.tools.command import Command, Error, Ok, Result
+from pex.tools.command import PEXCommand
 from pex.tools.commands.virtualenv import PipUnavailableError, Virtualenv
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
@@ -333,10 +333,11 @@ def populate_venv_with_pex(
     return shebang
 
 
-class Venv(Command):
+class Venv(PEXCommand):
     """Creates a venv from the PEX file."""
 
-    def add_arguments(self, parser):
+    @classmethod
+    def add_arguments(cls, parser):
         # type: (ArgumentParser) -> None
         parser.add_argument(
             "venv",
@@ -347,8 +348,9 @@ class Venv(Command):
         parser.add_argument(
             "-b",
             "--bin-path",
-            choices=[choice.value for choice in BinPath.values],
             default=BinPath.FALSE.value,
+            choices=BinPath.values(),
+            type=BinPath.for_value,
             help="Add the venv bin dir to the PATH in the __main__.py script.",
         )
         parser.add_argument(
@@ -386,25 +388,25 @@ class Venv(Command):
             default=False,
             help="Compile all `.py` files in the venv.",
         )
+        cls.register_global_arguments(parser, include_verbosity=False)
 
-    def run(
-        self,
-        pex,  # type: PEX
-        options,  # type: Namespace
-    ):
-        # type: (...) -> Result
+    def run(self, pex):
+        # type: (PEX) -> Result
 
-        venv_dir = options.venv[0]
+        venv_dir = self.options.venv[0]
         venv = Virtualenv.create(
-            venv_dir, interpreter=pex.interpreter, force=options.force, copies=options.copies
+            venv_dir,
+            interpreter=pex.interpreter,
+            force=self.options.force,
+            copies=self.options.copies,
         )
         populate_venv_with_pex(
             venv,
             pex,
-            bin_path=BinPath.for_value(options.bin_path),
-            collisions_ok=options.collisions_ok,
+            bin_path=self.options.bin_path,
+            collisions_ok=self.options.collisions_ok,
         )
-        if options.pip:
+        if self.options.pip:
             try:
                 venv.install_pip()
             except PipUnavailableError as e:
@@ -412,6 +414,6 @@ class Venv(Command):
                     "The virtual environment was successfully created, but Pip was not "
                     "installed:\n{}".format(e)
                 )
-        if options.compile:
+        if self.options.compile:
             pex.interpreter.execute(["-m", "compileall", venv_dir])
         return Ok()

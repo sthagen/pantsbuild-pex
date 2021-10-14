@@ -5,30 +5,27 @@
 from __future__ import absolute_import
 
 import functools
-import itertools
 import os
 import zipfile
 from collections import OrderedDict, defaultdict
 
+from pex import environment
 from pex.common import AtomicDirectory, atomic_directory, safe_mkdtemp
 from pex.distribution_target import DistributionTarget
-from pex.environment import PEXEnvironment, ResolveError
-from pex.fetcher import URLFetcher
+from pex.environment import PEXEnvironment
 from pex.interpreter import PythonInterpreter
 from pex.jobs import Raise, SpawnedJob, execute_parallel
-from pex.locked_resolve import LockConfiguration, LockedResolve
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pep_503 import ProjectName, distribution_satisfies_requirement
 from pex.pex_info import PexInfo
-from pex.pip import Locker, PackageIndexConfiguration, ResolverVersion, get_pip
+from pex.pip import Locker, PackageIndexConfiguration, get_pip
 from pex.platforms import Platform
-from pex.requirements import (
-    Constraint,
-    LocalProjectRequirement,
-    parse_requirement_file,
-    parse_requirement_strings,
-)
+from pex.requirements import Constraint, LocalProjectRequirement
+from pex.resolve.locked_resolve import LockConfiguration, LockedResolve
+from pex.resolve.requirement_configuration import RequirementConfiguration
+from pex.resolve.resolver_configuration import ResolverVersion
+from pex.resolve.target_configuration import TargetConfiguration
 from pex.third_party.pkg_resources import Distribution, Requirement
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
@@ -43,11 +40,15 @@ else:
     from pex.third_party import attr
 
 
-class Untranslatable(Exception):
+class ResolveError(Exception):
+    """Indicates an error resolving requirements for a PEX."""
+
+
+class Untranslatable(ResolveError):
     pass
 
 
-class Unsatisfiable(Exception):
+class Unsatisfiable(ResolveError):
     pass
 
 
@@ -70,20 +71,6 @@ class InstalledDistribution(object):
         return InstalledDistribution(
             self.target, self.distribution, direct_requirement=direct_requirement
         )
-
-
-def parsed_platform(platform=None):
-    # type: (Optional[Union[str, Platform]]) -> Optional[Platform]
-    """Parse the given platform into a `Platform` object.
-
-    Unlike `Platform.create`, this function supports the special platform of 'current' or `None`. This
-    maps to the platform of any local python interpreter.
-
-    :param platform: The platform string to parse. If `None` or 'current', return `None`. If already a
-                     `Platform` object, return it.
-    :return: The parsed platform or `None` for the current platform.
-    """
-    return Platform.create(platform) if platform and platform != "current" else None
 
 
 def _uniqued_targets(targets=None):
@@ -166,7 +153,7 @@ class DownloadRequest(object):
         return SpawnedJob.and_then(
             job=download_job,
             result_func=lambda: DownloadResult(
-                target, download_dir, lock=locker.lock() if locker else None
+                target, download_dir, locked_resolve=locker.lock() if locker else None
             ),
         )
 
@@ -180,7 +167,7 @@ class DownloadResult(object):
 
     target = attr.ib()  # type: DistributionTarget
     download_dir = attr.ib()  # type: str
-    lock = attr.ib(default=None)  # type: Optional[LockedResolve]
+    locked_resolve = attr.ib(default=None)  # type: Optional[LockedResolve]
 
     def _iter_distribution_paths(self):
         # type: () -> Iterator[str]
@@ -789,20 +776,10 @@ def _parse_reqs(
     network_configuration=None,  # type: Optional[NetworkConfiguration]
 ):
     # type: (...) -> Iterable[ParsedRequirement]
-    parsed_requirements = []  # type: List[ParsedRequirement]
-    if requirements:
-        parsed_requirements.extend(parse_requirement_strings(requirements))
-    if requirement_files:
-        fetcher = URLFetcher(network_configuration=network_configuration)
-        for requirement_file in requirement_files:
-            parsed_requirements.extend(
-                requirement_or_constraint
-                for requirement_or_constraint in parse_requirement_file(
-                    requirement_file, is_constraints=False, fetcher=fetcher
-                )
-                if not isinstance(requirement_or_constraint, Constraint)
-            )
-    return parsed_requirements
+    requirement_configuration = RequirementConfiguration(
+        requirements=requirements, requirement_files=requirement_files
+    )
+    return requirement_configuration.parse_requirements(network_configuration=network_configuration)
 
 
 @attr.s(frozen=True)
@@ -818,7 +795,7 @@ def resolve(
     allow_prereleases=False,  # type: bool
     transitive=True,  # type: bool
     interpreters=None,  # type: Optional[Iterable[PythonInterpreter]]
-    platforms=None,  # type: Optional[Iterable[Union[str, Platform]]]
+    platforms=None,  # type: Optional[Iterable[Union[str, Optional[Platform]]]]
     indexes=None,  # type: Optional[Sequence[str]]
     find_links=None,  # type: Optional[Sequence[str]]
     resolver_version=None,  # type: Optional[ResolverVersion.Value]
@@ -937,7 +914,7 @@ def resolve(
         cache=cache,
         build=build,
         use_wheel=use_wheel,
-        manylinux=manylinux,
+        assume_manylinux=manylinux,
         dest=workspace,
         max_parallel_jobs=max_parallel_jobs,
         lock_configuration=lock_configuration,
@@ -946,8 +923,8 @@ def resolve(
     install_requests = []  # type: List[InstallRequest]
     locks = []  # type: List[LockedResolve]
     for download_result in download_results:
-        if download_result.lock:
-            locks.append(download_result.lock)
+        if download_result.locked_resolve:
+            locks.append(download_result.locked_resolve)
         build_requests.extend(download_result.build_requests())
         install_requests.extend(download_result.install_requests())
 
@@ -970,40 +947,6 @@ def resolve(
     return Resolved(installed_distributions=installed_distributions, locks=tuple(locks))
 
 
-def _unique_targets(
-    interpreters=None,  # type: Optional[Iterable[PythonInterpreter]]
-    platforms=None,  # type: Optional[Iterable[Union[str, Platform]]]
-    manylinux=None,  # type: Optional[str]
-):
-    # type: (...) -> OrderedSet[DistributionTarget]
-    parsed_platforms = [parsed_platform(platform) for platform in platforms] if platforms else []
-
-    def iter_targets():
-        # type: () -> Iterator[DistributionTarget]
-        if not interpreters and not parsed_platforms:
-            # No specified targets, so just build for the current interpreter (on the current
-            # platform).
-            yield DistributionTarget.current()
-            return
-
-        if interpreters:
-            for interpreter in interpreters:
-                # Build for the specified local interpreters (on the current platform).
-                yield DistributionTarget.for_interpreter(interpreter)
-
-        if parsed_platforms:
-            for platform in parsed_platforms:
-                if platform is None and not interpreters:
-                    # Build for the current platform (None) only if not done already (ie: no
-                    # intepreters were specified).
-                    yield DistributionTarget.current()
-                elif platform is not None:
-                    # Build for specific platforms.
-                    yield DistributionTarget.for_platform(platform, manylinux=manylinux)
-
-    return OrderedSet(iter_targets())
-
-
 def _download_internal(
     direct_requirements,  # type: Iterable[ParsedRequirement]
     requirements=None,  # type: Optional[Iterable[str]]
@@ -1012,21 +955,21 @@ def _download_internal(
     allow_prereleases=False,  # type: bool
     transitive=True,  # type: bool
     interpreters=None,  # type: Optional[Iterable[PythonInterpreter]]
-    platforms=None,  # type: Optional[Iterable[Union[str, Platform]]]
+    platforms=None,  # type: Optional[Iterable[Union[str, Optional[Platform]]]]
     package_index_configuration=None,  # type: Optional[PackageIndexConfiguration]
     cache=None,  # type: Optional[str]
     build=True,  # type: bool
     use_wheel=True,  # type: bool
-    manylinux=None,  # type: Optional[str]
+    assume_manylinux=None,  # type: Optional[str]
     dest=None,  # type: Optional[str]
     max_parallel_jobs=None,  # type: Optional[int]
     lock_configuration=None,  # type: Optional[LockConfiguration]
 ):
     # type: (...) -> Tuple[List[BuildRequest], List[DownloadResult]]
 
-    unique_targets = _unique_targets(
-        interpreters=interpreters, platforms=platforms, manylinux=manylinux
-    )
+    unique_targets = TargetConfiguration(
+        interpreters=interpreters, platforms=platforms, assume_manylinux=assume_manylinux
+    ).unique_targets()
     download_request = DownloadRequest(
         targets=unique_targets,
         direct_requirements=direct_requirements,
@@ -1069,7 +1012,7 @@ class LocalDistribution(object):
 @attr.s(frozen=True)
 class Downloaded(object):
     local_distributions = attr.ib()  # type: Tuple[LocalDistribution, ...]
-    locks = attr.ib(default=())  # type: Tuple[LockedResolve, ...]
+    locked_resolves = attr.ib(default=())  # type: Tuple[LockedResolve, ...]
 
 
 def download(
@@ -1079,7 +1022,7 @@ def download(
     allow_prereleases=False,  # type: bool
     transitive=True,  # type: bool
     interpreters=None,  # type: Optional[Iterable[PythonInterpreter]]
-    platforms=None,  # type: Optional[Iterable[Union[str, Platform]]]
+    platforms=None,  # type: Optional[Iterable[Union[str, Optional[Platform]]]]
     indexes=None,  # type: Optional[Sequence[str]]
     find_links=None,  # type: Optional[Sequence[str]]
     resolver_version=None,  # type: Optional[ResolverVersion.Value]
@@ -1087,7 +1030,7 @@ def download(
     cache=None,  # type: Optional[str]
     build=True,  # type: bool
     use_wheel=True,  # type: bool
-    manylinux=None,  # type: Optional[str]
+    assume_manylinux=None,  # type: Optional[str]
     dest=None,  # type: Optional[str]
     max_parallel_jobs=None,  # type: Optional[int]
     lock_configuration=None,  # type: Optional[LockConfiguration]
@@ -1122,7 +1065,7 @@ def download(
       Defaults to ``True``.
     :keyword use_wheel: Whether to allow resolution of pre-built wheel distributions.
       Defaults to ``True``.
-    :keyword manylinux: The upper bound manylinux standard to support when targeting foreign linux
+    :keyword assume_manylinux: The upper bound manylinux standard to support when targeting foreign linux
       platforms. Defaults to ``None``.
     :keyword dest: A directory path to download distributions to.
     :keyword max_parallel_jobs: The maximum number of parallel jobs to use when resolving,
@@ -1153,14 +1096,14 @@ def download(
         cache=cache,
         build=build,
         use_wheel=use_wheel,
-        manylinux=manylinux,
+        assume_manylinux=assume_manylinux,
         dest=dest,
         max_parallel_jobs=max_parallel_jobs,
         lock_configuration=lock_configuration,
     )
 
     local_distributions = []
-    locks = []
+    locked_resolves = []
 
     def add_build_requests(requests):
         # type: (Iterable[BuildRequest]) -> None
@@ -1175,8 +1118,8 @@ def download(
 
     add_build_requests(build_requests)
     for download_result in download_results:
-        if download_result.lock:
-            locks.append(download_result.lock)
+        if download_result.locked_resolve:
+            locked_resolves.append(download_result.locked_resolve)
         add_build_requests(download_result.build_requests())
         for install_request in download_result.install_requests():
             local_distributions.append(
@@ -1187,7 +1130,9 @@ def download(
                 )
             )
 
-    return Downloaded(local_distributions=tuple(local_distributions), locks=tuple(locks))
+    return Downloaded(
+        local_distributions=tuple(local_distributions), locked_resolves=tuple(locked_resolves)
+    )
 
 
 def install(
@@ -1267,17 +1212,23 @@ def resolve_from_pex(
     network_configuration=None,  # type: Optional[NetworkConfiguration]
     transitive=True,  # type: bool
     interpreters=None,  # type: Optional[Iterable[PythonInterpreter]]
-    platforms=None,  # type: Optional[Iterable[Union[str, Platform]]]
-    manylinux=None,  # type: Optional[str]
+    platforms=None,  # type: Optional[Iterable[Union[str, Optional[Platform]]]]
+    assume_manylinux=None,  # type: Optional[str]
     ignore_errors=False,  # type: bool
 ):
     # type: (...) -> Resolved
 
-    direct_requirements = _parse_reqs(requirements, requirement_files, network_configuration)
+    requirement_configuration = RequirementConfiguration(
+        requirements=requirements,
+        requirement_files=requirement_files,
+        constraint_files=constraint_files,
+    )
     direct_requirements_by_project_name = (
         OrderedDict()
     )  # type: OrderedDict[ProjectName, Requirement]
-    for direct_requirement in direct_requirements:
+    for direct_requirement in requirement_configuration.parse_requirements(
+        network_configuration=network_configuration
+    ):
         if isinstance(direct_requirement, LocalProjectRequirement):
             raise Untranslatable(
                 "Cannot resolve local projects from PEX repositories. Asked to resolve {path} "
@@ -1290,30 +1241,22 @@ def resolve_from_pex(
     constraints_by_project_name = defaultdict(
         list
     )  # type: DefaultDict[ProjectName, List[Constraint]]
-    if not ignore_errors and (requirement_files or constraint_files):
-        fetcher = URLFetcher(network_configuration=network_configuration)
-        for location, is_constraints in itertools.chain(
-            ((requirement_file, False) for requirement_file in requirement_files or ()),
-            ((constraint_file, True) for constraint_file in constraint_files or ()),
+    if not ignore_errors:
+        for contraint in requirement_configuration.parse_constraints(
+            network_configuration=network_configuration
         ):
-            for parsed_item in parse_requirement_file(
-                location, is_constraints=is_constraints, fetcher=fetcher
-            ):
-                if isinstance(parsed_item, Constraint):
-                    constraints_by_project_name[ProjectName(parsed_item.requirement)].append(
-                        parsed_item
-                    )
+            constraints_by_project_name[ProjectName(contraint.requirement)].append(contraint)
 
     all_reqs = direct_requirements_by_project_name.values()
-    unique_targets = _unique_targets(
-        interpreters=interpreters, platforms=platforms, manylinux=manylinux
-    )
+    unique_targets = TargetConfiguration(
+        interpreters=interpreters, platforms=platforms, assume_manylinux=assume_manylinux
+    ).unique_targets()
     installed_distributions = OrderedSet()  # type: OrderedSet[InstalledDistribution]
     for target in unique_targets:
         pex_env = PEXEnvironment.mount(pex, target=target)
         try:
             distributions = pex_env.resolve_dists(all_reqs)
-        except ResolveError as e:
+        except environment.ResolveError as e:
             raise Unsatisfiable(str(e))
 
         for distribution in distributions:

@@ -22,13 +22,18 @@ from textwrap import dedent
 
 from pex import dist_metadata, third_party
 from pex.common import atomic_directory, is_python_script, safe_mkdtemp
-from pex.compatibility import MODE_READ_UNIVERSAL_NEWLINES, urlparse
+from pex.compatibility import MODE_READ_UNIVERSAL_NEWLINES, get_stdout_bytes_buffer, urlparse
 from pex.dist_metadata import ProjectNameAndVersion
 from pex.distribution_target import DistributionTarget
 from pex.fetcher import URLFetcher
 from pex.interpreter import PythonInterpreter
 from pex.jobs import Job
-from pex.locked_resolve import (
+from pex.network_configuration import NetworkConfiguration
+from pex.orderedset import OrderedSet
+from pex.pex import PEX
+from pex.pex_bootstrapper import ensure_venv
+from pex.platforms import Platform
+from pex.resolve.locked_resolve import (
     Artifact,
     Fingerprint,
     LockConfiguration,
@@ -37,11 +42,7 @@ from pex.locked_resolve import (
     LockStyle,
     Pin,
 )
-from pex.network_configuration import NetworkConfiguration
-from pex.orderedset import OrderedSet
-from pex.pex import PEX
-from pex.pex_bootstrapper import ensure_venv
-from pex.platforms import Platform
+from pex.resolve.resolver_configuration import ResolverVersion
 from pex.third_party import isolated
 from pex.third_party.pkg_resources import Requirement
 from pex.tracer import TRACER
@@ -77,34 +78,6 @@ if TYPE_CHECKING:
 
 else:
     from pex.third_party import attr
-
-
-class ResolverVersion(object):
-    class Value(object):
-        def __init__(self, value):
-            # type: (str) -> None
-            self.value = value
-
-        def __repr__(self):
-            # type: () -> str
-            return repr(self.value)
-
-    PIP_LEGACY = Value("pip-legacy-resolver")
-    PIP_2020 = Value("pip-2020-resolver")
-
-    values = PIP_LEGACY, PIP_2020
-
-    @classmethod
-    def for_value(cls, value):
-        # type: (str) -> ResolverVersion.Value
-        for v in cls.values:
-            if v.value == value:
-                return v
-        raise ValueError(
-            "{!r} of type {} must be one of {}".format(
-                value, type(value), ", ".join(map(repr, cls.values))
-            )
-        )
 
 
 class PackageIndexConfiguration(object):
@@ -377,11 +350,11 @@ class ResolvedRequirement(object):
             )
 
         for resolved_requirement in resolved_requirements:
-            yield LockedRequirement(
+            yield LockedRequirement.create(
                 pin=resolved_requirement.pin,
                 artifact=resolve_fingerprint(resolved_requirement.artifact),
                 requirement=resolved_requirement.requirement,
-                additional_artifacts=tuple(
+                additional_artifacts=(
                     resolve_fingerprint(artifact)
                     for artifact in resolved_requirement.additional_artifacts
                 ),
@@ -504,7 +477,7 @@ class Locker(_LogAnalyzer):
                 "Lock retrieval was attempted before Pip log analysis was complete."
             )
         if self._locked_resolve is None:
-            self._locked_resolve = LockedResolve(
+            self._locked_resolve = LockedResolve.from_target(
                 target=self._target,
                 locked_requirements=tuple(
                     ResolvedRequirement.lock_all(self._resolved_requirements, self._url_fetcher)
@@ -1078,17 +1051,18 @@ class Pip(object):
         if not scripts:
             return
 
-        with closing(fileinput.input(files=scripts, inplace=True)) as script_fi:
+        with closing(fileinput.input(files=scripts, inplace=True, mode="rb")) as script_fi:
             for line in script_fi:
+                buffer = get_stdout_bytes_buffer()
                 if script_fi.isfirstline():
                     # Ensure python shebangs are reproducible. The only place these can be used is
                     # in venv mode PEXes where the `#!python` placeholder shebang will be re-written
                     # to use the venv's python interpreter.
-                    print("#!python")
+                    buffer.write(b"#!python\n")
                     yield os.path.relpath(script_fi.filename(), install_dir)
                 else:
                     # N.B.: These lines include the newline already.
-                    sys.stdout.write(line)
+                    buffer.write(cast(bytes, line))
 
     def spawn_install_wheel(
         self,
