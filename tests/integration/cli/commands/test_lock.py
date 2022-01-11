@@ -105,11 +105,42 @@ def test_create_style(tmpdir):
     assert 1 == len(create_lock("sources").additional_artifacts)
 
 
+def test_create_local_unsupported(pex_project_dir):
+    # type: (str) -> None
+
+    result = run_pex3("lock", "create", pex_project_dir)
+    result.assert_failure()
+    assert (
+        "Cannot create a lock for project requirements built from local or version controlled "
+        "sources. Given 1 such project:\n"
+        "1.) local project at {path}\n".format(path=pex_project_dir)
+    ) == result.error
+
+
+def test_create_vcs_unsupported():
+    # type: () -> None
+
+    result = run_pex3(
+        "lock",
+        "create",
+        "pex @ git+https://github.com/pantsbuild/pex@473c6ac7",
+        "git+https://github.com/pypa/pip@f0f67af3#egg=pip",
+    )
+    result.assert_failure()
+    assert (
+        "Cannot create a lock for project requirements built from local or version controlled "
+        "sources. Given 2 such projects:\n"
+        "1.) git project pex at https://github.com/pantsbuild/pex@473c6ac7\n"
+        "2.) git project pip at https://github.com/pypa/pip@f0f67af3\n"
+    ) == result.error
+
+
 UPDATE_LOCKFILE_CONTENTS = """\
 {
   "allow_builds": true,
   "allow_prereleases": false,
   "allow_wheels": true,
+  "build_isolation": true,
   "constraints": [],
   "locked_resolves": [
     {
@@ -196,12 +227,14 @@ UPDATE_LOCKFILE_CONTENTS = """\
     }
   ],
   "pex_version": "2.1.50",
+  "prefer_older_binary": false,
   "requirements": [
     "requests"
   ],
   "resolver_version": "pip-2020-resolver",
   "style": "strict",
-  "transitive": true
+  "transitive": true,
+  "use_pep517": null
 }
 """
 
@@ -423,6 +456,7 @@ DUAL_UPDATE_LOCKFILE_CONTENTS = """\
   "allow_builds": true,
   "allow_prereleases": false,
   "allow_wheels": true,
+  "build_isolation": true,
   "constraints": [],
   "locked_resolves": [
     {
@@ -471,12 +505,14 @@ DUAL_UPDATE_LOCKFILE_CONTENTS = """\
     }
   ],
   "pex_version": "2.1.50",
+  "prefer_older_binary": false,
   "requirements": [
     "p537"
   ],
   "resolver_version": "pip-2020-resolver",
   "style": "strict",
-  "transitive": true
+  "transitive": true,
+  "use_pep517": null
 }
 """
 
@@ -524,3 +560,86 @@ def test_update_partial(tmpdir):
     )
     result.assert_success()
     assert DUAL_UPDATE_LOCKFILE == lockfile.load(lock_file_path)
+
+
+def test_excludes_pep517_build_requirements_issue_1565(tmpdir):
+    # type: (Any) -> None
+
+    # Here we resolve ansicolors 1.0.2 and find 2020.12.3 which are both pure legacy sdist
+    # distributions that will need to download build requirements using Pip since we force PEP-517.
+    # The cowsay 4.0 requirement is satisfied by a universal wheel and has no build requirements as
+    # a result.
+
+    result = run_pex3(
+        "lock",
+        "create",
+        "ansicolors==1.0.2",
+        "find==2020.12.3",
+        "cowsay==4.0",
+        "--force-pep517",
+    )
+    result.assert_success()
+    lock = lockfile.loads(result.output)
+
+    assert 1 == len(lock.locked_resolves)
+    assert (
+        SortedTuple(
+            [
+                LockedRequirement.create(
+                    pin=Pin(
+                        project_name=ProjectName(project_name="ansicolors"),
+                        version=Version(version="1.0.2"),
+                    ),
+                    artifact=Artifact(
+                        url=(
+                            "https://files.pythonhosted.org/packages/ac/c1/"
+                            "e21f0a1258ff927d124a72179669dcc7efcb57b22df8cd0e49ed8f1a308c/"
+                            "ansicolors-1.0.2.tar.gz"
+                        ),
+                        fingerprint=Fingerprint(
+                            algorithm="sha256",
+                            hash="7664530bb992e3847b61e3aab1580b4df9ed00c5898e80194a9933bc9c80950a",
+                        ),
+                    ),
+                    requirement=Requirement.parse("ansicolors==1.0.2"),
+                ),
+                LockedRequirement.create(
+                    pin=Pin(
+                        project_name=ProjectName(project_name="find"),
+                        version=Version(version="2020.12.3"),
+                    ),
+                    artifact=Artifact(
+                        url=(
+                            "https://files.pythonhosted.org/packages/91/1c/"
+                            "90cac4602ec146ce6f055b2e9598f46da08e941dd860f0498af764407b7e/"
+                            "find-2020.12.3.tar.gz"
+                        ),
+                        fingerprint=Fingerprint(
+                            algorithm="sha256",
+                            hash="7dadadb63e13de019463f13d83e0e0567a963cad99a568d0f0001ac1104d8210",
+                        ),
+                    ),
+                    requirement=Requirement.parse("find==2020.12.3"),
+                ),
+                LockedRequirement.create(
+                    pin=Pin(
+                        project_name=ProjectName(project_name="cowsay"),
+                        version=Version(version="4"),
+                    ),
+                    artifact=Artifact(
+                        url=(
+                            "https://files.pythonhosted.org/packages/b7/65/"
+                            "38f31ef16efc312562f68732098d6f7ba3b2c108a4aaa8ac8ba673ee0871/"
+                            "cowsay-4.0-py2.py3-none-any.whl"
+                        ),
+                        fingerprint=Fingerprint(
+                            algorithm="sha256",
+                            hash="2594b11d6624fff4bf5147b6bdd510ada54a7b5b4e3f2b15ac2a6d3cf99e0bf8",
+                        ),
+                    ),
+                    requirement=Requirement.parse("cowsay==4.0"),
+                ),
+            ]
+        )
+        == lock.locked_resolves[0].locked_requirements
+    )
