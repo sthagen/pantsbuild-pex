@@ -46,9 +46,9 @@ SINGLE_PLATFORM_UNIVERSAL_WHEEL = lockfile.loads(
                     }
                   ],
                   "project_name": "ansicolors",
-                  "requirement": "ansicolors",
-                  "version": "1.1.8",
-                  "via": []
+                  "requires_dists": [],
+                  "requires_python": null,
+                  "version": "1.1.8"
                 }
               ],
               "platform_tag": [
@@ -63,6 +63,7 @@ SINGLE_PLATFORM_UNIVERSAL_WHEEL = lockfile.loads(
           "requirements": [
             "ansicolors"
           ],
+          "requires_python": [],
           "resolver_version": "pip-legacy-resolver",
           "style": "strict",
           "transitive": true,
@@ -139,9 +140,9 @@ DUAL_PLATFORM_NATIVE_WHEEL = lockfile.loads(
                     }
                   ],
                   "project_name": "p537",
-                  "requirement": "p537",
-                  "version": "1.0.4",
-                  "via": []
+                  "requires_dists": [],
+                  "requires_python": null,
+                  "version": "1.0.4"
                 }
               ],
               "platform_tag": [
@@ -161,9 +162,9 @@ DUAL_PLATFORM_NATIVE_WHEEL = lockfile.loads(
                     }
                   ],
                   "project_name": "p537",
-                  "requirement": "p537",
-                  "version": "1.0.4",
-                  "via": []
+                  "requires_dists": [],
+                  "requires_python": null,
+                  "version": "1.0.4"
                 }
               ],
               "platform_tag": [
@@ -178,6 +179,7 @@ DUAL_PLATFORM_NATIVE_WHEEL = lockfile.loads(
           "requirements": [
             "p537"
           ],
+          "requires_python": [],
           "resolver_version": "pip-legacy-resolver",
           "style": "strict",
           "transitive": true,
@@ -230,9 +232,9 @@ LOCK_STYLE_SOURCES = lockfile.loads(
                     }
                   ],
                   "project_name": "p537",
-                  "requirement": "p537==1.0.4",
-                  "version": "1.0.4",
-                  "via": []
+                  "requires_dists": [],
+                  "requires_python": null,
+                  "version": "1.0.4"
                 }
               ],
               "platform_tag": [
@@ -247,6 +249,7 @@ LOCK_STYLE_SOURCES = lockfile.loads(
           "requirements": [
             "p537==1.0.4"
           ],
+          "requires_python": [],
           "resolver_version": "pip-legacy-resolver",
           "style": "sources",
           "transitive": true,
