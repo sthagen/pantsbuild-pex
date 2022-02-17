@@ -3,22 +3,31 @@
 
 from __future__ import absolute_import
 
+import json
+import os.path
 import sys
 from argparse import ArgumentTypeError, Namespace, _ActionsContainer
 
 from pex.argparse import HandleBoolAction
 from pex.interpreter import PythonIdentity, PythonInterpreter
 from pex.orderedset import OrderedSet
+from pex.pep_425 import CompatibilityTags
+from pex.pep_508 import MarkerEnvironment
 from pex.platforms import Platform
 from pex.resolve.resolver_options import _ManylinuxAction
-from pex.resolve.target_configuration import TargetConfiguration
+from pex.resolve.target_configuration import InterpreterConfiguration, TargetConfiguration
+from pex.targets import CompletePlatform
 
 
-def register(parser):
-    # type: (_ActionsContainer) -> None
+def register(
+    parser,  # type: _ActionsContainer
+    include_platforms=True,  # type: bool
+):
+    # type: (...) -> None
     """Register resolve target selection options with the given parser.
 
     :param parser: The parser to register target selection options with.
+    :param include_platforms: Whether to include options to select targets by platform.
     """
 
     parser.add_argument(
@@ -28,11 +37,9 @@ def register(parser):
         type=str,
         action="append",
         help=(
-            "The Python interpreter to use to build the PEX (default: current interpreter). This "
-            "cannot be used with `--interpreter-constraint`, which will instead cause PEX to "
-            "search for valid interpreters. Either specify an absolute path to an interpreter, or "
-            "specify a binary accessible on $PATH like `python3.7`. This option can be passed "
-            "multiple times to create a multi-interpreter compatible PEX."
+            "The Python interpreter to use (default: current interpreter). Either specify an "
+            "absolute path to an interpreter, or specify a binary accessible on $PATH like "
+            "`python3.7`. This option can be passed multiple times."
         ),
     )
     parser.add_argument(
@@ -41,10 +48,14 @@ def register(parser):
         default=None,
         type=str,
         help=(
-            "Colon-separated paths to search for interpreters when `--interpreter-constraint` "
-            "and/or `--resolve-local-platforms` are specified (default: $PATH). Each element "
+            "Colon-separated paths to search for interpreters in when `--interpreter-constraint` "
+            "{and_maybe_platforms} specified (default: $PATH). Each element "
             "can be the absolute path of an interpreter binary or a directory containing "
-            "interpreter binaries."
+            "interpreter binaries.".format(
+                and_maybe_platforms="and/or `--resolve-local-platforms` are"
+                if include_platforms
+                else "is"
+            )
         ),
     )
 
@@ -80,8 +91,22 @@ def register(parser):
         ),
     )
 
+    if include_platforms:
+        _register_platform_options(
+            parser, current_interpreter, singe_interpreter_info_cmd, all_interpreters_info_cmd
+        )
+
+
+def _register_platform_options(
+    parser,  # type: _ActionsContainer
+    current_interpreter,  # type: PythonInterpreter
+    singe_interpreter_info_cmd,  # type: str
+    all_interpreters_info_cmd,  # type: str
+):
+    # type: (...) -> None
     parser.add_argument(
         "--platform",
+        "--abbreviated-platform",
         dest="platforms",
         default=[],
         type=str,
@@ -103,6 +128,30 @@ def register(parser):
                 singe_interpreter_info_cmd=singe_interpreter_info_cmd,
                 all_interpreters_info_cmd=all_interpreters_info_cmd,
             )
+        ),
+    )
+
+    parser.add_argument(
+        "--complete-platform",
+        dest="complete_platforms",
+        default=[],
+        type=str,
+        action="append",
+        help=(
+            "The complete platform information describing the platform for which to build the PEX. "
+            "This option can be passed multiple times to create a multi-platform pex. Values "
+            "should be either JSON object literal strings or paths to files containing them. The "
+            "JSON object is expected to have two fields with any other fields ignored. The "
+            "'marker_environment' field should have an object value with string field values "
+            "corresponding to PEP-508 marker environment entries (See: "
+            "https://www.python.org/dev/peps/pep-0508/#environment-markers). It is OK to only have "
+            "a subset of valid marker environment fields but it is not valid to present entries "
+            "not defined in PEP-508. The 'compatible_tags' field should have an array of strings "
+            "value containing the compatible tags in order from most specific first to least "
+            "specific last as defined in PEP-425 (See: https://www.python.org/dev/peps/pep-0425). "
+            "Pex can create complete platform JSON for you by running it on the target platform "
+            "like so: `pex3 interpreter inspect --markers --tags`. For more options, particularly "
+            "to select the desired target interpreter see: `pex3 interpreter inspect --help`."
         ),
     )
 
@@ -133,11 +182,11 @@ def register(parser):
     )
 
 
-def configure(options):
-    # type: (Namespace) -> TargetConfiguration
-    """Creates a target configuration from options registered by `register`.
+def configure_interpreters(options):
+    # type: (Namespace) -> InterpreterConfiguration
+    """Creates an interpreter configuration from options registered by `register`.
 
-    :param options: The target configuration options.
+    :param options: The interpreter configuration options.
     """
     try:
         interpreter_constraints = tuple(
@@ -149,6 +198,64 @@ def configure(options):
     except ValueError as e:
         raise ArgumentTypeError(str(e))
 
+    return InterpreterConfiguration(
+        interpreter_constraints=interpreter_constraints,
+        python_path=options.python_path,
+        pythons=tuple(OrderedSet(options.python)),
+    )
+
+
+def _create_complete_platform(value):
+    # type: (str) -> CompletePlatform
+    if os.path.isfile(value):
+        try:
+            with open(value) as fp:
+                data = json.load(fp)
+        except (OSError, ValueError) as e:
+            raise ArgumentTypeError(
+                "Failed to load complete platform data from {path}: {err}".format(path=value, err=e)
+            )
+    else:
+        try:
+            data = json.loads(value)
+        except ValueError as e:
+            raise ArgumentTypeError(
+                "Failed to load complete platform data from json string: {err}".format(err=e)
+            )
+
+    try:
+        marker_environment = MarkerEnvironment(**data["marker_environment"])
+    except KeyError:
+        raise ArgumentTypeError(
+            "The complete platform JSON object did not have the required 'marker_environment' "
+            "key:\n{json_object}".format(json_object=json.dumps(data, indent=4))
+        )
+    except TypeError as e:
+        raise ArgumentTypeError(
+            "Invalid environment entry provided: {err}\n"
+            "See https://www.python.org/dev/peps/pep-0508/#environment-markers for valid "
+            "entries.".format(err=e)
+        )
+
+    try:
+        supported_tags = CompatibilityTags.from_strings(data["compatible_tags"])
+    except KeyError:
+        raise ArgumentTypeError(
+            "The complete platform JSON object did not have the required 'compatible_tags' "
+            "key:\n{json_object}".format(json_object=json.dumps(data, indent=4))
+        )
+
+    return CompletePlatform.create(marker_environment, supported_tags)
+
+
+def configure(options):
+    # type: (Namespace) -> TargetConfiguration
+    """Creates a target configuration from options via `register(..., include_platforms=True)`.
+
+    :param options: The target configuration options.
+    """
+    interpreter_configuration = configure_interpreters(options)
+
     try:
         platforms = tuple(
             OrderedSet(
@@ -159,11 +266,14 @@ def configure(options):
     except Platform.InvalidPlatformError as e:
         raise ArgumentTypeError(str(e))
 
+    complete_platforms = tuple(
+        OrderedSet(_create_complete_platform(value) for value in options.complete_platforms)
+    )
+
     return TargetConfiguration(
-        interpreter_constraints=interpreter_constraints,
-        python_path=options.python_path,
-        pythons=tuple(OrderedSet(options.python)),
+        interpreter_configuration=interpreter_configuration,
         platforms=platforms,
+        complete_platforms=complete_platforms,
         resolve_local_platforms=options.resolve_local_platforms,
         assume_manylinux=options.assume_manylinux,
     )

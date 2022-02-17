@@ -23,7 +23,6 @@ from pex.commands.command import (
     register_global_arguments,
 )
 from pex.common import die, safe_mkdtemp
-from pex.distribution_target import DistributionTargets
 from pex.enum import Enum
 from pex.inherit_path import InheritPath
 from pex.layout import Layout, maybe_install
@@ -38,6 +37,7 @@ from pex.resolve.requirement_configuration import RequirementConfiguration
 from pex.resolve.resolver_configuration import PexRepositoryConfiguration, PipConfiguration
 from pex.resolve.resolvers import Unsatisfiable
 from pex.resolver import resolve
+from pex.targets import Targets
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast
 from pex.variables import ENV, Variables
@@ -45,8 +45,8 @@ from pex.venv_bin_path import BinPath
 from pex.version import __version__
 
 if TYPE_CHECKING:
-    from typing import Dict, List, Optional, Union
     from argparse import Namespace
+    from typing import Dict, List, Optional, Union
 
 
 CANNOT_SETUP_INTERPRETER = 102
@@ -287,8 +287,11 @@ def configure_clp_pex_options(parser):
 def configure_clp_pex_environment(parser):
     # type: (ArgumentParser) -> None
     group = parser.add_argument_group(
-        "PEX environment options",
-        "Tailor the interpreter and platform targets for the PEX environment.",
+        "PEX target environment options",
+        "Specify which target environments the PEX should run on. If more than one interpreter or "
+        "platform is specified, a multi-platform PEX will be created that can run on all specified "
+        "targets. N.B.: You may need to adjust the `--python-shebang` so that it works in all "
+        "the specified target environments.",
     )
 
     target_options.register(group)
@@ -487,7 +490,7 @@ def configure_clp():
 def build_pex(
     requirement_configuration,  # type: RequirementConfiguration
     resolver_configuration,  # type: Union[PipConfiguration, PexRepositoryConfiguration]
-    targets,  # type: DistributionTargets
+    targets,  # type: Targets
     options,  # type: Namespace
     cache=None,  # type: Optional[str]
 ):
@@ -697,7 +700,7 @@ def do_main(
     options,  # type: Namespace
     requirement_configuration,  # type: RequirementConfiguration
     resolver_configuration,  # type: Union[PipConfiguration, PexRepositoryConfiguration]
-    targets,  # type: DistributionTargets
+    targets,  # type: Targets
     cmdline,  # type: List[str]
     env,  # type: Dict[str, str]
 ):

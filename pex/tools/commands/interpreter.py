@@ -85,11 +85,13 @@ class Interpreter(JsonMixin, OutputMixin, PEXCommand):
                             "platform": str(interpreter.platform),
                         }  # type: Dict[str, Any]
                         if self.options.verbose >= 2:
-                            interpreter_info["supported_tags"] = [
-                                str(tag) for tag in interpreter.identity.supported_tags
-                            ]
+                            interpreter_info[
+                                "supported_tags"
+                            ] = interpreter.identity.supported_tags.to_string_list()
                         if self.options.verbose >= 3:
-                            interpreter_info["env_markers"] = interpreter.identity.env_markers
+                            interpreter_info[
+                                "env_markers"
+                            ] = interpreter.identity.env_markers.as_dict()
                             interpreter_info["venv"] = interpreter.is_venv
                             if interpreter.is_venv:
                                 interpreter_info[

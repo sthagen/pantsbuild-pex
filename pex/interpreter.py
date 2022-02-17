@@ -22,9 +22,11 @@ from pex.compatibility import string
 from pex.executor import Executor
 from pex.jobs import ErrorHandler, Job, Retain, SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
+from pex.pep_425 import CompatibilityTags
+from pex.pep_508 import MarkerEnvironment
 from pex.platforms import Platform
 from pex.pyenv import Pyenv
-from pex.third_party.packaging import markers, tags
+from pex.third_party.packaging import tags
 from pex.third_party.pkg_resources import Distribution, Requirement
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast, overload
@@ -116,10 +118,10 @@ class PythonIdentity(object):
             prefix=sys.prefix,
             base_prefix=(
                 # Old virtualenv (16 series and lower) sets `sys.real_prefix` in all cases.
-                getattr(sys, "real_prefix", None)
+                cast("Optional[str]", getattr(sys, "real_prefix", None))
                 # Both pyvenv and virtualenv 20+ set `sys.base_prefix` as per
                 # https://www.python.org/dev/peps/pep-0405/.
-                or getattr(sys, "base_prefix", sys.prefix)
+                or cast(str, getattr(sys, "base_prefix", sys.prefix))
             ),
             sys_path=sys_path,
             python_tag=preferred_tag.interpreter,
@@ -127,7 +129,7 @@ class PythonIdentity(object):
             platform_tag=preferred_tag.platform,
             version=sys.version_info[:3],
             supported_tags=supported_tags,
-            env_markers=markers.default_environment(),
+            env_markers=MarkerEnvironment.default(),
             configured_macosx_deployment_target=configured_macosx_deployment_target,
         )
 
@@ -150,9 +152,11 @@ class PythonIdentity(object):
             values.pop("configured_macosx_deployment_target")
         )
 
+        env_markers = MarkerEnvironment(**values.pop("env_markers"))
         return cls(
             supported_tags=iter_tags(),
             configured_macosx_deployment_target=configured_macosx_deployment_target,
+            env_markers=env_markers,
             **values
         )
 
@@ -174,7 +178,7 @@ class PythonIdentity(object):
         platform_tag,  # type: str
         version,  # type: Iterable[int]
         supported_tags,  # type: Iterable[tags.Tag]
-        env_markers,  # type: Dict[str, str]
+        env_markers,  # type: MarkerEnvironment
         configured_macosx_deployment_target,  # type: Optional[str]
     ):
         # type: (...) -> None
@@ -190,8 +194,8 @@ class PythonIdentity(object):
         self._abi_tag = abi_tag
         self._platform_tag = platform_tag
         self._version = tuple(version)
-        self._supported_tags = tuple(supported_tags)
-        self._env_markers = dict(env_markers)
+        self._supported_tags = CompatibilityTags(tags=supported_tags)
+        self._env_markers = env_markers
         self._configured_macosx_deployment_target = configured_macosx_deployment_target
 
     def encode(self):
@@ -207,7 +211,7 @@ class PythonIdentity(object):
             supported_tags=[
                 (tag.interpreter, tag.abi, tag.platform) for tag in self._supported_tags
             ],
-            env_markers=self._env_markers,
+            env_markers=self._env_markers.as_dict(),
             configured_macosx_deployment_target=self._configured_macosx_deployment_target,
         )
         return json.dumps(values, sort_keys=True)
@@ -259,13 +263,13 @@ class PythonIdentity(object):
 
     @property
     def supported_tags(self):
-        # type: () -> Tuple[tags.Tag, ...]
+        # type: () -> CompatibilityTags
         return self._supported_tags
 
     @property
     def env_markers(self):
-        # type: () -> Dict[str, str]
-        return dict(self._env_markers)
+        # type: () -> MarkerEnvironment
+        return self._env_markers
 
     @property
     def configured_macosx_deployment_target(self):
@@ -744,7 +748,7 @@ class PythonInterpreter(object):
 
                         encoded_identity = PythonIdentity.get(binary={binary!r}).encode()
                         with atomic_directory({cache_dir!r}, exclusive=False) as cache_dir:
-                            if not cache_dir.is_finalized:
+                            if not cache_dir.is_finalized():
                                 with safe_open(
                                     os.path.join(cache_dir.work_dir, {info_file!r}), 'w'
                                 ) as fp:

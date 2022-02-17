@@ -3,15 +3,13 @@
 
 import os
 import re
-import subprocess
-import sys
 from textwrap import dedent
 
 import pytest
 
 from pex.cli.commands import lockfile
 from pex.cli.commands.lockfile import Lockfile
-from pex.distribution_target import DistributionTarget
+from pex.cli.testing import run_pex3
 from pex.interpreter import PythonInterpreter
 from pex.pep_440 import Version
 from pex.pep_503 import ProjectName
@@ -19,33 +17,18 @@ from pex.resolve.locked_resolve import Artifact, Fingerprint, LockedRequirement,
 from pex.resolve.resolver_configuration import ResolverVersion
 from pex.resolve.testing import normalize_locked_resolve
 from pex.sorted_tuple import SortedTuple
+from pex.targets import LocalInterpreter
 from pex.testing import IS_MAC, IS_PYPY, PY310, PY_VER, IntegResults, ensure_python_interpreter
 from pex.third_party.pkg_resources import Requirement
 from pex.typing import TYPE_CHECKING
 from pex.version import __version__
 
 if TYPE_CHECKING:
-    import attr  # vendor:skip
     from typing import Any, Optional
+
+    import attr  # vendor:skip
 else:
     from pex.third_party import attr
-
-
-def run_pex3(
-    *args,  # type: str
-    **popen_kwargs  # type: Any
-):
-    # type: (...) -> IntegResults
-    process = subprocess.Popen(
-        args=[sys.executable, "-mpex.cli"] + list(args),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **popen_kwargs
-    )
-    stdout, stderr = process.communicate()
-    return IntegResults(
-        output=stdout.decode("utf-8"), error=stderr.decode("utf-8"), return_code=process.returncode
-    )
 
 
 def normalize_lockfile(
@@ -492,9 +475,7 @@ def test_update_targeted_impossible(
     ] == error_lines[:9]
     assert re.match(
         r"^1\.\) {platform}: pid [\d]+ -> ".format(
-            platform=DistributionTarget.for_interpreter(
-                PythonInterpreter.from_binary(py310)
-            ).get_supported_tags()[0]
+            platform=LocalInterpreter.create(PythonInterpreter.from_binary(py310)).platform.tag
         ),
         error_lines[9],
     )

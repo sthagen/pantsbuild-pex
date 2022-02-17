@@ -10,14 +10,16 @@ from textwrap import dedent
 
 from pex import compatibility
 from pex.common import atomic_directory, safe_open, safe_rmtree
+from pex.pep_425 import CompatibilityTags
 from pex.third_party.packaging import tags
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    import attr  # vendor:skip
     from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+
+    import attr  # vendor:skip
 else:
     from pex.third_party import attr
 
@@ -169,10 +171,10 @@ class Platform(object):
 
     _SUPPORTED_TAGS_BY_PLATFORM = (
         {}
-    )  # type: Dict[Tuple[Platform, Optional[str]], Tuple[tags.Tag, ...]]
+    )  # type: Dict[Tuple[Platform, Optional[str]], CompatibilityTags]
 
     def supported_tags(self, manylinux=None):
-        # type: (Optional[str]) -> Tuple[tags.Tag, ...]
+        # type: (Optional[str]) -> CompatibilityTags
 
         # We use a 2 level cache, probing memory first and then a json file on disk in order to
         # avoid calculating tags when possible since it's an O(500ms) operation that involves
@@ -190,7 +192,7 @@ class Platform(object):
             components.append(manylinux)
         disk_cache_key = os.path.join(ENV.PEX_ROOT, "platforms", self.SEP.join(components))
         with atomic_directory(target_dir=disk_cache_key, exclusive=False) as cache_dir:
-            if not cache_dir.is_finalized:
+            if not cache_dir.is_finalized():
                 # Missed both caches - spawn calculation.
                 plat_info = attr.asdict(self)
                 plat_info.update(
@@ -249,7 +251,9 @@ class Platform(object):
             return tags.Tag(interpreter=interpreter, abi=abi, platform=platform)
 
         try:
-            supported_tags = tuple(parse_tag(index, tag) for index, tag in enumerate(sup_tags))
+            supported_tags = CompatibilityTags(
+                tags=[parse_tag(index, tag) for index, tag in enumerate(sup_tags)]
+            )
             # Write level 1.
             self._SUPPORTED_TAGS_BY_PLATFORM[memory_cache_key] = supported_tags
             return supported_tags
@@ -260,90 +264,6 @@ class Platform(object):
             )
             safe_rmtree(disk_cache_key)
             return self.supported_tags(manylinux=manylinux)
-
-    def marker_environment(self, default_unknown=True):
-        # type: (bool) -> Dict[str, str]
-        """Populate a partial marker environment given what we know from platform information.
-
-        Since Pex support is (currently) restricted to:
-        + interpreters: CPython and PyPy
-        + os: Linux and Mac
-
-        We can fill in most of the environment markers used in these environments in practice in the
-        wild.
-
-        For any environment markers that can't be derived from the platform information, the value
-        is either defaulted as specified in PEP 508 or else omitted entirely as per
-        `default_unknown`. Defaulting will cause tests against those environment markers to always
-        fail; thus marking the requirement as not applying. Leaving the marker out will cause the
-        same test to error; thus failing the resolve outright.
-
-        See: https://www.python.org/dev/peps/pep-0508/#environment-markers
-        """
-        env = (
-            {
-                "implementation_name": "",
-                "implementation_version": "0",
-                "os_name": "",
-                "platform_machine": "",
-                "platform_python_implementation": "",
-                "platform_release": "",
-                "platform_system": "",
-                "platform_version": "",
-                "python_full_version": "0",
-                "python_version": "0",
-                "sys_platform": "",
-            }
-            if default_unknown
-            else {}
-        )
-
-        major_version = int(self.version[0])
-
-        if major_version == 2:
-            env["implementation_name"] = ""
-            env["implementation_version"] = "0"
-        elif self.impl == "cp":
-            env["implementation_name"] = "cpython"
-        elif self.impl == "pp":
-            env["implementation_name"] = "pypy"
-
-        if "linux" in self.platform:
-            env["os_name"] = "posix"
-            if self.platform.startswith(
-                ("linux_", "manylinux1_", "manylinux2010_", "manylinux2014_")
-            ):
-                # E.G.:
-                # + linux_x86_64
-                # + manylinux{1,2010,2014}_x86_64
-                # For the manylinux* See:
-                # + manylinux1: https://www.python.org/dev/peps/pep-0513/
-                # + manylinux2010: https://www.python.org/dev/peps/pep-0571/
-                # + manylinux2014: https://www.python.org/dev/peps/pep-0599/
-                env["platform_machine"] = self.platform.split("_", 1)[-1]
-            else:
-                # E.G.: manylinux_<glibc major>_<glibc_minor>_x86_64
-                # See: https://www.python.org/dev/peps/pep-0600/
-                env["platform_machine"] = self.platform.split("_", 3)[-1]
-            env["platform_system"] = "Linux"
-            env["sys_platform"] = "linux2" if major_version == 2 else "linux"
-        elif "mac" in self.platform:
-            env["os_name"] = "posix"
-            # E.G:
-            # + macosx_10_15_x86_64
-            # + macosx_11_0_arm64
-            env["platform_machine"] = self.platform.split("_", 3)[-1]
-            env["platform_system"] = "Darwin"
-            env["sys_platform"] = "darwin"
-
-        if self.impl == "cp":
-            env["platform_python_implementation"] = "CPython"
-        elif self.impl == "pp":
-            env["platform_python_implementation"] = "PyPy"
-
-        env["python_version"] = ".".join(self.version)
-
-        return env
 
     def __str__(self):
         # type: () -> str

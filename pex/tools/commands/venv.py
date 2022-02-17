@@ -282,6 +282,17 @@ def populate_venv_with_pex(
                 os.environ[current_interpreter_blessed_env_var] = "1"
                 os.execv(python, [python, "-sE"] + sys.argv)
 
+            pex_file = os.environ.get("PEX", None)
+            if pex_file:
+                try:
+                    from setproctitle import setproctitle
+
+                    setproctitle("{{python}} {{pex_file}} {{args}}".format(
+                        python=sys.executable, pex_file=pex_file, args=" ".join(sys.argv[1:]))
+                    )
+                except ImportError:
+                    pass
+
             ignored_pex_env_vars = [
                 "{{}}={{}}".format(name, value)
                 for name, value in os.environ.items()
@@ -309,9 +320,10 @@ def populate_venv_with_pex(
                     # This is _not_ used (it is ignored), but it's present under CI and simplest to
                     # add an exception for here and not warn about in CI runs.
                     "_PEX_TEST_PYENV_ROOT",
-                    # This is used by Pex's Pip venv to work around
-                    # https://github.com/pypa/pip/issues/10050:
+                    # These are used by Pex's Pip venv to provide foreign platform support and work
+                    # around https://github.com/pypa/pip/issues/10050:
                     "_PEX_PATCHED_MARKERS_FILE",
+                    "_PEX_PATCHED_TAGS_FILE",
                     # These are used by Pex's Pip venv to implement universal locks.
                     "_PEX_SKIP_MARKERS",
                     "_PEX_PYTHON_VERSIONS_FILE",

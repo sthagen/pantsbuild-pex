@@ -20,7 +20,7 @@ from pex.typing import TYPE_CHECKING
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    from typing import Iterator, IO, Tuple
+    from typing import IO, Iterator, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class Graph(OutputMixin, PEXCommand):
                 pex.path(), pex.interpreter.binary, pex.interpreter.identity.requirement
             ),
         )
-        marker_environment = pex.interpreter.identity.env_markers.copy()
+        marker_environment = pex.interpreter.identity.env_markers.as_dict()
         marker_environment["extra"] = ""
         present_dists = frozenset(dist.project_name for dist in pex.resolve())
         for dist in pex.resolve():

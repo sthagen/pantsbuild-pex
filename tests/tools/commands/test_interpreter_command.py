@@ -16,8 +16,9 @@ from pex.tools.commands.virtualenv import Virtualenv
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from typing import Any, Dict, Iterable
+
     import attr  # vendor:skip
-    from typing import Iterable, Dict, Any
 else:
     from pex.third_party import attr
 
@@ -147,7 +148,7 @@ def test_verbose_all(
 def expected_verbose_verbose(interpreter):
     # type: (PythonInterpreter) -> Dict[str, Any]
     expected = expected_verbose(interpreter)
-    expected.update(supported_tags=[str(tag) for tag in interpreter.identity.supported_tags])
+    expected.update(supported_tags=interpreter.identity.supported_tags.to_string_list())
     return expected
 
 
@@ -167,7 +168,7 @@ def test_verbose_verbose_verbose(
     # type: (...) -> None
     output = interpreter_tool.run("-vvv")
     expected = expected_verbose_verbose(python37)
-    expected.update(env_markers=python37.identity.env_markers, venv=False)
+    expected.update(env_markers=python37.identity.env_markers.as_dict(), venv=False)
     assert expected == json.loads(output)
 
 
@@ -184,7 +185,7 @@ def test_verbose_verbose_verbose_venv(
 
     expected = expected_verbose_verbose(venv.interpreter)
     expected.update(
-        env_markers=venv.interpreter.identity.env_markers,
+        env_markers=venv.interpreter.identity.env_markers.as_dict(),
         venv=True,
         base_interpreter=python310.binary,
     )

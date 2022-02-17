@@ -23,19 +23,18 @@ from pex.common import (
     temporary_dir,
 )
 from pex.compatibility import to_unicode
-from pex.distribution_target import DistributionTarget
 from pex.executor import Executor
 from pex.interpreter import PythonInterpreter
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
+from pex.targets import LocalInterpreter
 from pex.third_party.pkg_resources import Distribution
 from pex.typing import TYPE_CHECKING
 from pex.util import DistributionHelper, named_temporary_file
 
 if TYPE_CHECKING:
-    import attr  # vendor:skip
     from typing import (
         Any,
         Callable,
@@ -50,6 +49,8 @@ if TYPE_CHECKING:
         Tuple,
         Union,
     )
+
+    import attr  # vendor:skip
 else:
     from pex.third_party import attr
 
@@ -263,7 +264,7 @@ def make_bdist(
         get_pip(interpreter=interpreter).spawn_install_wheel(
             wheel=dist_location,
             install_dir=install_dir,
-            target=DistributionTarget(interpreter=interpreter),
+            target=LocalInterpreter.create(interpreter),
         ).wait()
         dist = DistributionHelper.distribution_from_path(install_dir)
         assert dist is not None
@@ -471,13 +472,13 @@ def ensure_python_distribution(version):
     pip = os.path.join(interpreter_location, "bin", "pip")
 
     with atomic_directory(target_dir=os.path.join(pyenv_root), exclusive=True) as target_dir:
-        if not target_dir.is_finalized:
+        if not target_dir.is_finalized():
             bootstrap_python_installer(target_dir.work_dir)
 
     with atomic_directory(
         target_dir=interpreter_location, exclusive=True
     ) as interpreter_target_dir:
-        if not interpreter_target_dir.is_finalized:
+        if not interpreter_target_dir.is_finalized():
             subprocess.check_call(
                 [
                     "git",

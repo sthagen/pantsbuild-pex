@@ -347,9 +347,9 @@ def isolated():
     if _ISOLATED is None:
         from pex import vendor
         from pex.common import atomic_directory, is_pyc_temporary_file
+        from pex.third_party.pkg_resources import resource_isdir, resource_listdir, resource_stream
         from pex.util import CacheHelper
         from pex.variables import ENV
-        from pex.third_party.pkg_resources import resource_isdir, resource_listdir, resource_stream
 
         module = "pex"
 
@@ -398,7 +398,7 @@ def isolated():
 
         with _tracer().timed("Isolating pex"):
             with atomic_directory(isolated_dir, exclusive=True) as chroot:
-                if not chroot.is_finalized:
+                if not chroot.is_finalized():
                     with _tracer().timed("Extracting pex to {}".format(isolated_dir)):
                         recursive_copy("", os.path.join(chroot.work_dir, "pex"))
 

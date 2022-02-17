@@ -17,7 +17,6 @@ from pex import third_party
 from pex.bootstrap import Bootstrap
 from pex.common import die
 from pex.compatibility import PY3
-from pex.distribution_target import DistributionTarget
 from pex.environment import PEXEnvironment
 from pex.executor import Executor
 from pex.finders import get_entry_point_from_console_script, get_script_from_distributions
@@ -25,6 +24,7 @@ from pex.inherit_path import InheritPath
 from pex.interpreter import PythonInterpreter
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
+from pex.targets import LocalInterpreter
 from pex.third_party.pkg_resources import Distribution, EntryPoint, find_distributions
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
@@ -97,7 +97,7 @@ class PEX(object):  # noqa: T000
         if self._envs is None:
             # set up the local .pex environment
             pex_info = self.pex_info()
-            target = DistributionTarget.for_interpreter(self._interpreter)
+            target = LocalInterpreter.create(self._interpreter)
             envs = [PEXEnvironment.mount(self._pex, pex_info, target=target)]
             # N.B. by this point, `pex_info.pex_path` will contain a single pex path
             # merged from pex_path in `PEX-INFO` and `PEX_PATH` set in the environment.
@@ -473,6 +473,26 @@ class PEX(object):  # noqa: T000
                 exit_value = tools.main(pex=PEX(sys.argv[0]))
             else:
                 self.activate()
+
+                pex_file = os.environ.get("PEX", None)
+                if pex_file:
+                    try:
+                        from setproctitle import setproctitle  # type: ignore[import]
+
+                        setproctitle(
+                            "{python} {pex_file} {args}".format(
+                                python=sys.executable,
+                                pex_file=pex_file,
+                                args=" ".join(sys.argv[1:]),
+                            )
+                        )
+                    except ImportError:
+                        TRACER.log(
+                            "Not setting process title since setproctitle is not available in "
+                            "{pex_file}".format(pex_file=pex_file),
+                            V=3,
+                        )
+
                 exit_value = self._wrap_coverage(self._wrap_profiling, self._execute)
             sys.exit(exit_value)
         except Exception:

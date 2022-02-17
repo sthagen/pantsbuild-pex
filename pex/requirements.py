@@ -19,16 +19,9 @@ from pex.third_party.pkg_resources import Requirement, RequirementParseError
 from pex.typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from typing import Iterable, Iterator, Match, Optional, Text, Tuple, Union
+
     import attr  # vendor:skip
-    from typing import (
-        Iterable,
-        Iterator,
-        Match,
-        Optional,
-        Text,
-        Tuple,
-        Union,
-    )
 else:
     from pex.third_party import attr
 
@@ -152,7 +145,7 @@ class URLRequirement(object):
     editable = attr.ib(default=False)  # type: bool
 
 
-class VCS(Enum):
+class VCS(Enum["VCS.Value"]):
     class Value(Enum.Value):
         pass
 
@@ -267,7 +260,7 @@ def _strip_requirement_options(line):
     return editable, re.sub(r"\s--(global-option|install-option|hash).*$", "", processed_text)
 
 
-class ArchiveScheme(Enum):
+class ArchiveScheme(Enum["ArchiveScheme.Value"]):
     class Value(Enum.Value):
         pass
 

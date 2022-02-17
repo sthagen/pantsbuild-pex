@@ -6,8 +6,7 @@ import os
 
 import pytest
 
-from pex import dist_metadata, resolver
-from pex.distribution_target import DistributionTarget
+from pex import dist_metadata, resolver, targets
 from pex.resolve.locked_resolve import LockConfiguration, LockStyle, Pin
 from pex.resolve.testing import normalize_locked_resolve
 from pex.resolver import Downloaded, LocalDistribution
@@ -15,8 +14,9 @@ from pex.typing import TYPE_CHECKING
 from pex.util import CacheHelper
 
 if TYPE_CHECKING:
+    from typing import Any, Dict, Iterable
+
     import attr  # vendor:skip
-    from typing import Any, Iterable, Dict
 else:
     from pex.third_party import attr
 
@@ -80,7 +80,7 @@ def test_lock_single_target(
     assert 1 == len(downloaded.locked_resolves)
     lock = downloaded.locked_resolves[0]
 
-    assert DistributionTarget.current().get_supported_tags()[0] == lock.platform_tag
+    assert targets.current().platform.tag == lock.platform_tag
 
     def pin(local_distribution):
         # type: (LocalDistribution) -> Pin

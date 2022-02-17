@@ -10,9 +10,9 @@ import os
 import zipfile
 from collections import OrderedDict, defaultdict
 
+from pex import targets
 from pex.common import AtomicDirectory, atomic_directory, pluralize, safe_mkdtemp
 from pex.dist_metadata import DistMetadata
-from pex.distribution_target import DistributionTarget, DistributionTargets
 from pex.environment import FingerprintedDistribution
 from pex.jobs import Raise, SpawnedJob, execute_parallel
 from pex.network_configuration import NetworkConfiguration
@@ -25,13 +25,13 @@ from pex.resolve.locked_resolve import LockConfiguration, LockedResolve
 from pex.resolve.requirement_configuration import RequirementConfiguration
 from pex.resolve.resolver_configuration import ResolverVersion
 from pex.resolve.resolvers import InstalledDistribution, Resolved, Unsatisfiable, Untranslatable
+from pex.targets import Target, Targets
 from pex.third_party.pkg_resources import Requirement
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
 from pex.util import CacheHelper, DistributionHelper
 
 if TYPE_CHECKING:
-    import attr  # vendor:skip
     from typing import (
         DefaultDict,
         Dict,
@@ -44,19 +44,21 @@ if TYPE_CHECKING:
         Tuple,
     )
 
+    import attr  # vendor:skip
+
     from pex.requirements import ParsedRequirement
 else:
     from pex.third_party import attr
 
 
 def _uniqued_targets(targets=None):
-    # type: (Optional[Iterable[DistributionTarget]]) -> Tuple[DistributionTarget, ...]
+    # type: (Optional[Iterable[Target]]) -> Tuple[Target, ...]
     return tuple(OrderedSet(targets)) if targets is not None else ()
 
 
 @attr.s(frozen=True)
 class DownloadRequest(object):
-    targets = attr.ib(converter=_uniqued_targets)  # type: Tuple[DistributionTarget, ...]
+    targets = attr.ib(converter=_uniqued_targets)  # type: Tuple[Target, ...]
     direct_requirements = attr.ib()  # type: Iterable[ParsedRequirement]
     requirements = attr.ib(default=None)  # type: Optional[Iterable[str]]
     requirement_files = attr.ib(default=None)  # type: Optional[Iterable[str]]
@@ -101,7 +103,7 @@ class DownloadRequest(object):
         self,
         resolved_dists_dir,  # type: str
         max_parallel_jobs,  # type: Optional[int]
-        target,  # type: DistributionTarget
+        target,  # type: Target
     ):
         # type: (...) -> SpawnedJob[DownloadResult]
         download_dir = os.path.join(resolved_dists_dir, target.id)
@@ -192,7 +194,7 @@ class DownloadResult(object):
         # type: (str) -> bool
         return os.path.isfile(path) and path.endswith(".whl")
 
-    target = attr.ib()  # type: DistributionTarget
+    target = attr.ib()  # type: Target
     download_dir = attr.ib()  # type: str
     locked_resolve = attr.ib(default=None)  # type: Optional[LockedResolve]
 
@@ -232,7 +234,7 @@ class BuildRequest(object):
     @classmethod
     def create(
         cls,
-        target,  # type: DistributionTarget
+        target,  # type: Target
         source_path,  # type: str
     ):
         # type: (...) -> BuildRequest
@@ -254,7 +256,7 @@ class BuildRequest(object):
             )
         return request
 
-    target = attr.ib()  # type: DistributionTarget
+    target = attr.ib()  # type: Target
     source_path = attr.ib()  # type: str
     fingerprint = attr.ib()  # type: str
 
@@ -298,7 +300,7 @@ class BuildResult(object):
     @property
     def is_built(self):
         # type: () -> bool
-        return self._atomic_dir.is_finalized
+        return self._atomic_dir.is_finalized()
 
     @property
     def build_dir(self):
@@ -349,14 +351,14 @@ class InstallRequest(object):
     @classmethod
     def create(
         cls,
-        target,  # type: DistributionTarget
+        target,  # type: Target
         wheel_path,  # type: str
     ):
         # type: (...) -> InstallRequest
         fingerprint = fingerprint_path(wheel_path)
         return cls(target=target, wheel_path=wheel_path, fingerprint=fingerprint)
 
-    target = attr.ib()  # type: DistributionTarget
+    target = attr.ib()  # type: Target
     wheel_path = attr.ib()  # type: str
     fingerprint = attr.ib()  # type: str
 
@@ -395,7 +397,7 @@ class InstallResult(object):
     @property
     def is_installed(self):
         # type: () -> bool
-        return self._atomic_dir.is_finalized
+        return self._atomic_dir.is_finalized()
 
     @property
     def build_chroot(self):
@@ -465,7 +467,7 @@ class InstallResult(object):
         wheel_dir_hash = CacheHelper.dir_hash(self.install_chroot)
         runtime_key_dir = os.path.join(self._installation_root, wheel_dir_hash)
         with atomic_directory(runtime_key_dir, exclusive=False) as atomic_dir:
-            if not atomic_dir.is_finalized:
+            if not atomic_dir.is_finalized():
                 # Note: Create a relative path symlink between the two directories so that the
                 # PEX_ROOT can be used within a chroot environment where the prefix of the path may
                 # change between programs running inside and outside of the chroot.
@@ -847,7 +849,7 @@ def _parse_reqs(
 
 
 def resolve(
-    targets=DistributionTargets(),  # type: DistributionTargets
+    targets=Targets(),  # type: Targets
     requirements=None,  # type: Optional[Iterable[str]]
     requirement_files=None,  # type: Optional[Iterable[str]]
     constraint_files=None,  # type: Optional[Iterable[str]]
@@ -1009,7 +1011,7 @@ def resolve(
 
 
 def _download_internal(
-    targets,  # type: DistributionTargets
+    targets,  # type: Targets
     direct_requirements,  # type: Iterable[ParsedRequirement]
     requirements=None,  # type: Optional[Iterable[str]]
     requirement_files=None,  # type: Optional[Iterable[str]]
@@ -1061,7 +1063,7 @@ def _download_internal(
 class LocalDistribution(object):
     path = attr.ib()  # type: str
     fingerprint = attr.ib()  # type: str
-    target = attr.ib(default=DistributionTarget.current())  # type: DistributionTarget
+    target = attr.ib(default=targets.current())  # type: Target
 
     @fingerprint.default
     def _calculate_fingerprint(self):
@@ -1079,7 +1081,7 @@ class Downloaded(object):
 
 
 def download(
-    targets=DistributionTargets(),  # type: DistributionTargets
+    targets=Targets(),  # type: Targets
     requirements=None,  # type: Optional[Iterable[str]]
     requirement_files=None,  # type: Optional[Iterable[str]]
     constraint_files=None,  # type: Optional[Iterable[str]]
