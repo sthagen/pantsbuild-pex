@@ -4,12 +4,6 @@
 
 from __future__ import absolute_import, print_function
 
-import base64
-import csv
-import fileinput
-import functools
-import hashlib
-import itertools
 import json
 import os
 import re
@@ -17,39 +11,30 @@ import subprocess
 import sys
 from abc import abstractmethod
 from collections import defaultdict, deque
-from contextlib import closing
 from textwrap import dedent
 
-from pex import dist_metadata, targets, third_party
-from pex.common import atomic_directory, is_python_script, safe_mkdtemp
-from pex.compatibility import MODE_READ_UNIVERSAL_NEWLINES, get_stdout_bytes_buffer, urlparse
-from pex.dist_metadata import DistMetadata, ProjectNameAndVersion
-from pex.fetcher import URLFetcher
+from pex import targets, third_party
+from pex.common import atomic_directory, safe_mkdtemp
+from pex.compatibility import urlparse
+from pex.dist_metadata import ProjectNameAndVersion
 from pex.interpreter import PythonInterpreter
 from pex.interpreter_constraints import iter_compatible_versions
 from pex.jobs import Job
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
+from pex.pep_376 import Record
 from pex.pex import PEX
 from pex.pex_bootstrapper import ensure_venv
 from pex.platforms import Platform
-from pex.resolve.locked_resolve import (
-    Artifact,
-    Fingerprint,
-    LockConfiguration,
-    LockedRequirement,
-    LockedResolve,
-    LockStyle,
-    Pin,
-)
+from pex.resolve.locked_resolve import LockRequest, LockStyle
+from pex.resolve.resolved_requirement import Fingerprint, PartialArtifact, Pin, ResolvedRequirement
 from pex.resolve.resolver_configuration import ResolverVersion
-from pex.sorted_tuple import SortedTuple
 from pex.targets import AbbreviatedPlatform, CompletePlatform, LocalInterpreter, Target
 from pex.third_party import isolated
-from pex.third_party.pkg_resources import EntryPoint, Requirement
+from pex.third_party.pkg_resources import Requirement
 from pex.tracer import TRACER
-from pex.typing import TYPE_CHECKING, Generic, cast
-from pex.util import CacheHelper, named_temporary_file
+from pex.typing import TYPE_CHECKING, Generic
+from pex.util import DistributionHelper, named_temporary_file
 from pex.variables import ENV
 
 if TYPE_CHECKING:
@@ -316,90 +301,6 @@ class _Issue10050Analyzer(_ErrorAnalyzer):
         return self.Continue()
 
 
-@attr.s(frozen=True)
-class PartialArtifact(object):
-    url = attr.ib()  # type: str
-    fingerprint = attr.ib(default=None)  # type: Optional[Fingerprint]
-
-
-@attr.s(frozen=True)
-class ResolvedRequirement(object):
-    @classmethod
-    def lock_all(
-        cls,
-        resolved_requirements,  # type: Iterable[ResolvedRequirement]
-        dist_metadatas,  # type: Iterable[DistMetadata]
-        url_fetcher,  # type: URLFetcher
-    ):
-        # type: (...) -> Iterator[LockedRequirement]
-
-        # TODO(John Sirois): Introduce a thread pool and pump these fetches to workers via a Queue.
-        def fingerprint_url(url):
-            # type: (str) -> Fingerprint
-            with url_fetcher.get_body_stream(url) as body_stream:
-                return Fingerprint.from_stream(body_stream)
-
-        fingerprint_by_url = {
-            url: fingerprint_url(url)
-            for url in set(
-                itertools.chain.from_iterable(
-                    resolved_requirement._iter_urls_to_fingerprint()
-                    for resolved_requirement in resolved_requirements
-                )
-            )
-        }
-
-        def resolve_fingerprint(partial_artifact):
-            # type: (PartialArtifact) -> Artifact
-            return Artifact(
-                url=partial_artifact.url,
-                fingerprint=partial_artifact.fingerprint
-                or fingerprint_by_url[partial_artifact.url],
-            )
-
-        dist_metadata_by_pin = {
-            Pin(dist_info.project_name, dist_info.version): dist_info
-            for dist_info in dist_metadatas
-        }
-        for resolved_requirement in resolved_requirements:
-            distribution_metadata = dist_metadata_by_pin.get(resolved_requirement.pin)
-            if distribution_metadata is None:
-                raise ValueError(
-                    "No distribution metadata found for {project}.\n"
-                    "Given distribution metadata for:\n"
-                    "{projects}".format(
-                        project=resolved_requirement.pin.as_requirement(),
-                        projects="\n".join(
-                            sorted(str(pin.as_requirement()) for pin in dist_metadata_by_pin)
-                        ),
-                    )
-                )
-            yield LockedRequirement.create(
-                pin=resolved_requirement.pin,
-                artifact=resolve_fingerprint(resolved_requirement.artifact),
-                requires_dists=distribution_metadata.requires_dists,
-                requires_python=distribution_metadata.requires_python,
-                additional_artifacts=(
-                    resolve_fingerprint(artifact)
-                    for artifact in resolved_requirement.additional_artifacts
-                ),
-            )
-
-    pin = attr.ib()  # type: Pin
-    artifact = attr.ib()  # type: PartialArtifact
-    requirement = attr.ib()  # type: Requirement
-    additional_artifacts = attr.ib(default=())  # type: Tuple[PartialArtifact, ...]
-    via = attr.ib(default=())  # type: Tuple[str, ...]
-
-    def _iter_urls_to_fingerprint(self):
-        # type: () -> Iterator[str]
-        if not self.artifact.fingerprint:
-            yield self.artifact.url
-        for artifact in self.additional_artifacts:
-            if not artifact.fingerprint:
-                yield artifact.url
-
-
 class Locker(_LogAnalyzer):
     class StateError(Exception):
         """Indicates the Locker lifecycle was violated.
@@ -408,33 +309,23 @@ class Locker(_LogAnalyzer):
         be requested.
         """
 
-    def __init__(
-        self,
-        target,  # type: Target
-        lock_configuration,  # type: LockConfiguration
-        network_configuration=None,  # type: Optional[NetworkConfiguration]
-    ):
-        # type: (...) -> None
-        self._target = target
-        self._lock_configuration = lock_configuration
+    def __init__(self, lock_request):
+        # type: (LockRequest) -> None
+        self._lock_request = lock_request
+
         self._resolved_requirements = []  # type: List[ResolvedRequirement]
         self._links = defaultdict(OrderedSet)  # type: DefaultDict[Pin, OrderedSet[PartialArtifact]]
-        self._url_fetcher = URLFetcher(
-            network_configuration=network_configuration, handle_file_urls=True
-        )
-        self._analysis_completed = False
-        self._locked_resolve = None  # type: Optional[LockedResolve]
         self._done_building_re = None  # type: Optional[Pattern]
 
     @property
     def style(self):
         # type: () -> LockStyle.Value
-        return self._lock_configuration.style
+        return self._lock_request.lock_configuration.style
 
     @property
     def requires_python(self):
         # type: () -> Tuple[str, ...]
-        return self._lock_configuration.requires_python
+        return self._lock_request.lock_configuration.requires_python
 
     def should_collect(self, returncode):
         # type: (int) -> bool
@@ -475,9 +366,6 @@ class Locker(_LogAnalyzer):
         # requirements (If a build proceeds differently tomorrow than today then we don't care as
         # long as the final built artifact hashes the same. In other words, we completely rely on a
         # cryptographic fingerprint for reproducibility and security guarantees from a lock).
-
-        if self._analysis_completed:
-            raise self.StateError("Line analysis was requested after the log analysis completed.")
 
         if self._done_building_re:
             if self._done_building_re.search(line):
@@ -542,27 +430,7 @@ class Locker(_LogAnalyzer):
 
     def analysis_completed(self):
         # type: () -> None
-        self._analysis_completed = True
-
-    def lock(
-        self,
-        dist_metadatas,  # type: Iterable[DistMetadata]
-    ):
-        # type: (...) -> LockedResolve
-        if not self._analysis_completed:
-            raise self.StateError(
-                "Lock retrieval was attempted before Pip log analysis was complete."
-            )
-        if self._locked_resolve is None:
-            self._locked_resolve = LockedResolve(
-                platform_tag=self._target.platform.tag,
-                locked_requirements=SortedTuple(
-                    ResolvedRequirement.lock_all(
-                        self._resolved_requirements, dist_metadatas, self._url_fetcher
-                    )
-                ),
-            )
-        return self._locked_resolve
+        self._lock_request.resolve_handler(self._resolved_requirements)
 
 
 class _LogScrapeJob(Job):
@@ -1067,10 +935,11 @@ class Pip(object):
         prefer_older_binary=False,  # type: bool
         use_pep517=None,  # type: Optional[bool]
         build_isolation=True,  # type: bool
-        locker=None,  # type: Optional[Locker]
+        lock_request=None,  # type: Optional[LockRequest]
     ):
         # type: (...) -> Job
         target = target or targets.current()
+        locker = Locker(lock_request) if lock_request else None
 
         if not use_wheel:
             if not build:
@@ -1165,7 +1034,7 @@ class Pip(object):
                     )
                 )
             elif isinstance(target, CompletePlatform):
-                compatible_tags = target.get_supported_tags()
+                compatible_tags = target.supported_tags
                 if compatible_tags:
                     with open(os.path.join(patches_dir, "tags.json"), "w") as tags_fp:
                         json.dump(compatible_tags.to_string_list(), tags_fp)
@@ -1255,196 +1124,6 @@ class Pip(object):
             extra_env=extra_env,
         )
 
-    @classmethod
-    def _fixup_install(
-        cls,
-        dist,  # type: str
-        install_dir,  # type: str
-    ):
-        # type: (...) -> None
-
-        # The dist-info metadata directory is named as specifed in:
-        #   https://www.python.org/dev/peps/pep-0427/
-        #   https://packaging.python.org/specifications/recording-installed-packages/#the-dist-info-directory
-        project_name_and_version = dist_metadata.project_name_and_version(
-            dist
-        ) or ProjectNameAndVersion.from_filename(dist)
-
-        # The `direct_url.json` file is both mandatory for Pip to install and non-hermetic for
-        # Pex's purpose, since it contains the absolute local filesystem path to any local wheel
-        # file Pex installs via Pip. We remove the file and its entry in RECORD so that PEX files
-        # are bytewise reproducible. The absence of the direct_url.json file only affects Pex venvs
-        # where further mutation by PEP-compatible packaging tooling (e.g.: Pip) may be hindered.
-        # In particular, `pip freeze` for any distributions provided by local projects or archives
-        # will produce unuseful entries for those distributions.
-        #
-        # See:
-        #   https://www.python.org/dev/peps/pep-0610/
-        #   https://packaging.python.org/specifications/direct-url/#specification
-        listing = [
-            os.path.relpath(os.path.join(root, f), install_dir)
-            for root, _, files in os.walk(install_dir)
-            for f in files
-        ]
-
-        def find_dist_info_file(filename):
-            # type: (str) -> Optional[str]
-            return dist_metadata.find_dist_info_file(
-                project_name=project_name_and_version.project_name,
-                version=project_name_and_version.version,
-                filename=filename,
-                listing=listing,
-            )
-
-        entry_points_relpath = find_dist_info_file("entry_points.txt")
-        modified_scripts = list(
-            cls._fixup_scripts(install_dir, entry_points_relpath=entry_points_relpath)
-        )
-        record_relpath = find_dist_info_file("RECORD")
-        if record_relpath:
-            direct_url_relpath = find_dist_info_file("direct_url.json")
-            cls._fixup_record(
-                install_dir,
-                record_relpath,
-                direct_url_relpath=direct_url_relpath,
-                modified_scripts=modified_scripts,
-            )
-
-    @staticmethod
-    def _fixup_record(
-        install_dir,  # type: str
-        record_relpath,  # type: str
-        direct_url_relpath,  # type: Optional[str]
-        modified_scripts=None,  # type: Optional[Iterable[str]]
-    ):
-        # type: (...) -> None
-
-        exclude_relpaths = []
-
-        record_abspath = os.path.join(install_dir, record_relpath)
-
-        if direct_url_relpath:
-            direct_url_abspath = os.path.join(install_dir, direct_url_relpath)
-            with open(direct_url_abspath) as fp:
-                if urlparse.urlparse(json.load(fp)["url"]).scheme == "file":
-                    exclude_relpaths.append(os.path.relpath(direct_url_abspath, install_dir))
-                    os.unlink(direct_url_abspath)
-
-        to_rehash = {}
-        if modified_scripts:
-            for modified_script in modified_scripts:
-                # N.B.: Pip installs wheels with RECORD entries like `../../bin/script` even when
-                # it's called in `--target <dir>` mode which installs the script in `bin/script`.
-                record_relpath = os.path.join(os.pardir, os.pardir, modified_script)
-                modified_script_abspath = os.path.join(install_dir, modified_script)
-                to_rehash[record_relpath] = modified_script_abspath
-
-        # The RECORD is a csv file with the path to each installed file in the 1st column.
-        # See: https://www.python.org/dev/peps/pep-0376/#record
-        with closing(
-            fileinput.input(files=[record_abspath], inplace=True, mode=MODE_READ_UNIVERSAL_NEWLINES)
-        ) as record_fi:
-            csv_writer = None  # type: Optional[CSVWriter]
-            for path, existing_hash, existing_size in csv.reader(
-                record_fi, delimiter=",", quotechar='"'
-            ):
-                if csv_writer is None:
-                    # N.B.: The raw input lines include a newline that varies between '\r\n' and
-                    # '\n' when the wheel was built from an sdist by Pip depending on whether the
-                    # interpreter used was Python 2 or Python 3 respectively. As such, we normalize
-                    # all RECORD files to use '\n' regardless of interpreter.
-                    csv_writer = cast(
-                        "CSVWriter",
-                        csv.writer(sys.stdout, delimiter=",", quotechar='"', lineterminator="\n"),
-                    )
-
-                abspath_to_rehash = to_rehash.pop(path, None)
-                if existing_hash and abspath_to_rehash is not None:
-                    algorithm = existing_hash.split("=")[0]
-                    hasher = hashlib.new(algorithm)
-                    with open(abspath_to_rehash, "rb") as rehash_fp:
-                        CacheHelper.update_hash(rehash_fp, digest=hasher)
-
-                    fingerprint = base64.urlsafe_b64encode(hasher.digest()).decode("ascii")
-                    de_padded, pad, rest = fingerprint.rpartition("=")
-                    new_hash = str(de_padded if pad and not rest else fingerprint)
-                    new_size = os.stat(abspath_to_rehash).st_size
-                    csv_writer.writerow((path, new_hash, new_size))
-                elif path != direct_url_relpath:
-                    csv_writer.writerow((path, existing_hash, existing_size))
-
-    @staticmethod
-    def _fixup_scripts(
-        install_dir,  # type: str
-        entry_points_relpath,  # type: Optional[str]
-    ):
-        # type: (...) -> Iterator[str]
-        bin_dir = os.path.join(install_dir, "bin")
-        if not os.path.isdir(bin_dir):
-            return
-
-        console_scripts = {}  # type: Dict[str, EntryPoint]
-        if entry_points_relpath:
-            entry_points_abspath = os.path.join(install_dir, entry_points_relpath)
-            with open(entry_points_abspath) as fp:
-                console_scripts.update(EntryPoint.parse_map(fp.read()).get("console_scripts", {}))
-
-        scripts = {}  # type: Dict[str, Optional[bytes]]
-        for script_name in os.listdir(bin_dir):
-            script_path = os.path.join(bin_dir, script_name)
-            if is_python_script(script_path):
-                scripts[script_path] = None
-            elif script_name in console_scripts:
-                # When a wheel is installed by Pip and that wheel contains console_scripts, they are
-                # normally written with a faux-shebang of:
-                # #!python
-                #
-                # Pex relies on this hermetic shebang and only ever reifies it when creating venvs.
-                #
-                # If Pip is being run under a Python executable with a path length >127 characters
-                # on Linux though, it writes a shebang / header of:
-                # #!/bin/sh
-                # '''exec' <too long path to Pip venv python> "$0" "$@"'
-                # ' '''
-                #
-                # That header is immediately followed by the expected console_script shim contents:
-                # # -*- coding: utf-8 -*-
-                # import re
-                # import sys
-                # from <ep_module> import <ep_func>
-                # if __name__ == '__main__':
-                #     sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
-                #     sys.exit(main())
-                #
-                # Instead of guessing that 127 characters is the shebang length limit and using
-                # Pip's safety-hatch `/bin/sh` trick, we forcibly re-write the header to be just the
-                # expected `#!python` shebang. We detect the end of the header with the known 1st
-                # line of console_script shim ~code defined in
-                # pex/vendor/_vendored/pip/pip/_vendor/distlib/scripts.py on line 41:
-                # https://github.com/pantsbuild/pex/blob/196b4cd5b8dd4b4af2586460530e9a777262be7d/pex/vendor/_vendored/pip/pip/_vendor/distlib/scripts.py#L41
-                scripts[script_path] = b"# -*- coding: utf-8 -*-"
-        if not scripts:
-            return
-
-        with closing(fileinput.input(files=scripts.keys(), inplace=True, mode="rb")) as script_fi:
-            first_non_shebang_line = None  # type: Optional[bytes]
-            for line in script_fi:
-                buffer = get_stdout_bytes_buffer()
-                if script_fi.isfirstline():
-                    first_non_shebang_line = scripts[script_fi.filename()]
-                    # Ensure python shebangs are reproducible. The only place these can be used is
-                    # in venv mode PEXes where the `#!python` placeholder shebang will be re-written
-                    # to use the venv's python interpreter.
-                    buffer.write(b"#!python\n")
-                    yield os.path.relpath(script_fi.filename(), install_dir)
-                elif (
-                    not first_non_shebang_line
-                    or cast(bytes, line).strip() == first_non_shebang_line
-                ):
-                    # N.B.: These lines include the newline already.
-                    buffer.write(cast(bytes, line))
-                    first_non_shebang_line = None
-
     def spawn_install_wheel(
         self,
         wheel,  # type: str
@@ -1466,6 +1145,7 @@ class Pip(object):
             install_dir,
         ]
 
+        wheel_path = wheel
         interpreter = target.get_interpreter()
         if target.is_foreign:
             if compile:
@@ -1502,16 +1182,23 @@ class Pip(object):
             TRACER.log(
                 "Re-named {} to {} to perform foreign wheel install.".format(wheel, renamed_wheel)
             )
-            wheel = renamed_wheel
+            wheel_path = renamed_wheel
 
         install_cmd.append("--compile" if compile else "--no-compile")
-        install_cmd.append(wheel)
+        install_cmd.append(wheel_path)
+
+        def fixup_install():
+            if wheel_path != wheel:
+                os.unlink(wheel_path)
+            distribution = DistributionHelper.distribution_from_path(install_dir)
+            record = Record.load(distribution)
+            record.fixup_install()
 
         return self._spawn_pip_isolated_job(
             args=install_cmd,
             cache=cache,
             interpreter=interpreter,
-            finalizer=functools.partial(self._fixup_install, dist=wheel, install_dir=install_dir),
+            finalizer=fixup_install,
         )
 
     def spawn_debug(
