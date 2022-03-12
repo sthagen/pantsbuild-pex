@@ -6,9 +6,10 @@ import pytest
 
 from pex import targets
 from pex.interpreter import PythonInterpreter
-from pex.pep_425 import TagRank
+from pex.pep_425 import CompatibilityTags, TagRank
 from pex.pep_440 import Version
 from pex.pep_503 import ProjectName
+from pex.pep_508 import MarkerEnvironment
 from pex.platforms import Platform
 from pex.resolve.locked_resolve import (
     Artifact,
@@ -22,7 +23,7 @@ from pex.resolve.locked_resolve import (
 from pex.resolve.resolved_requirement import Fingerprint, Pin
 from pex.result import Error, try_
 from pex.sorted_tuple import SortedTuple
-from pex.targets import AbbreviatedPlatform, LocalInterpreter, Target
+from pex.targets import AbbreviatedPlatform, CompletePlatform, LocalInterpreter, Target
 from pex.third_party.packaging.specifiers import SpecifierSet
 from pex.third_party.packaging.tags import Tag
 from pex.third_party.pkg_resources import Requirement
@@ -181,6 +182,39 @@ def test_use_wheel(
                 hash="cafebabe",
             ),
             satisfied_direct_requirements=requirements("ansicolors==1.1.7"),
+        ),
+    )
+
+
+def test_constraints(
+    current_target,  # type: Target
+    ansicolors_simple,  # type: LockedResolve
+):
+    # type: (...) -> None
+    assert_resolved(
+        ansicolors_simple.resolve(current_target, [req("ansicolors")]),
+        DownloadableArtifact.create(
+            pin=pin("ansicolors", "1.1.8"),
+            artifact=artifact(
+                url="https://example.org/ansicolors-1.1.8.tar.gz",
+                algorithm="md5",
+                hash="cafebabe",
+            ),
+            satisfied_direct_requirements=requirements("ansicolors"),
+        ),
+    )
+    assert_resolved(
+        ansicolors_simple.resolve(
+            current_target, [req("ansicolors")], constraints=[req("ansicolors<1.1.8")]
+        ),
+        DownloadableArtifact.create(
+            pin=pin("ansicolors", "1.1.7"),
+            artifact=artifact(
+                url="https://example.org/ansicolors-1.1.7-py2.py3-none-any.whl",
+                algorithm="blake256",
+                hash="cafebabe",
+            ),
+            satisfied_direct_requirements=requirements("ansicolors"),
         ),
     )
 
@@ -453,6 +487,60 @@ def test_requires_python_mismatch(
     )
 
 
+def test_constraint_mismatch(
+    current_target,  # type: Target
+    ansicolors_simple,  # type: LockedResolve
+):
+    # type: (...) -> None
+    locked_resolve = LockedResolve(
+        platform_tag=Tag("cp37", "cp37m", "exotic"),
+        locked_requirements=locked_requirements(
+            LockedRequirement.create(
+                pin=pin("ansicolors", "1.1.7"),
+                artifact=artifact(
+                    url="https://example.org/ansicolors-1.1.7-py2.py3-none-any.whl",
+                    algorithm="blake256",
+                    hash="cafebabe",
+                ),
+            ),
+        ),
+    )
+
+    assert_error(
+        locked_resolve.resolve(
+            current_target, [req("ansicolors")], constraints=[req("ansicolors>=2")]
+        ),
+        dedent(
+            """\
+            Failed to resolve all requirements for {target_description}:
+
+            Configured with:
+                build: True
+                use_wheel: True
+
+            Dependency on ansicolors not satisfied, 1 incompatible candidate found:
+            1.) ansicolors 1.1.7 does not satisfy the following requirements:
+                >=2 (via: constraint)
+            """
+        ).format(target_description=current_target.render_description()),
+    )
+
+    assert_resolved(
+        locked_resolve.resolve(
+            current_target, [req("ansicolors")], constraints=[req("irrelevant==1.0.0")]
+        ),
+        DownloadableArtifact.create(
+            pin=pin("ansicolors", "1.1.7"),
+            artifact=artifact(
+                url="https://example.org/ansicolors-1.1.7-py2.py3-none-any.whl",
+                algorithm="blake256",
+                hash="cafebabe",
+            ),
+            satisfied_direct_requirements=requirements("ansicolors"),
+        ),
+    )
+
+
 def test_prefer_older_binary(current_target):
     # type: (Target) -> None
 
@@ -692,3 +780,59 @@ def test_multiple_errors(
             """
         ).format(target_description=current_target.render_description()),
     )
+
+
+def test_resolved():
+    # type: () -> None
+
+    def assert_resolved(
+        expected_target_specificity,  # type: float
+        supported_tag_count,  # type: int
+        artifact_ranks,  # type: Iterable[int]
+    ):
+        # type: (...) -> None
+        direct_requirements = requirements("foo")
+
+        resolved_artifacts = tuple(
+            resolved_artifact(
+                project_name="foo",
+                version=str(rank),
+                artifact_basename="foo-{}.tar.gz".format(rank),
+                rank_value=rank,
+            )
+            for rank in artifact_ranks
+        )
+
+        downloadable_artifacts = tuple(
+            DownloadableArtifact.create(
+                pin=resolved_art.locked_requirement.pin,
+                artifact=resolved_art.artifact,
+                satisfied_direct_requirements=direct_requirements,
+            )
+            for resolved_art in resolved_artifacts
+        )
+
+        target = CompletePlatform.create(
+            MarkerEnvironment(),
+            CompatibilityTags.from_strings(
+                "py3-none-manylinux_2_{glibc_minor}_x86_64".format(glibc_minor=glibc_minor)
+                for glibc_minor in range(supported_tag_count)
+            ),
+        )
+
+        assert Resolved(
+            target_specificity=expected_target_specificity,
+            downloadable_artifacts=downloadable_artifacts,
+        ) == Resolved.create(
+            target=target,
+            direct_requirements=direct_requirements,
+            downloadable_requirements=resolved_artifacts,
+        )
+
+    # For tag ranks of 1, 2, 1 should rank 100% target specific (best match) and 2 should rank 0%
+    # (worst match / universal)
+    assert_resolved(expected_target_specificity=1.0, supported_tag_count=2, artifact_ranks=[1])
+    assert_resolved(expected_target_specificity=0.0, supported_tag_count=2, artifact_ranks=[2])
+
+    # For tag ranks of 1, 2, 3, 2 lands in the middle and should be 50% target specific.
+    assert_resolved(expected_target_specificity=0.5, supported_tag_count=3, artifact_ranks=[2])

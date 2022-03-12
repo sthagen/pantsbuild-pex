@@ -1,6 +1,30 @@
 Release Notes
 =============
 
+2.1.71
+------
+
+This release fixes the instability introduced in 2.1.68 by switching to
+a more robust means of determining venv layouts. Along the way it
+upgrades Pex internals to cache all artifacts with strong hashes (
+previously sha1 was used). It's strongly recommended to upgrade or use
+the exclude ``!=2.1.68,!=2.1.69,!=2.1.70`` when depending on an open
+ended Pex version range.
+
+* Switch Pex installed wheels to ``--prefix`` scheme. (#1661)
+  `PR #1661 <https://github.com/pantsbuild/pex/pull/1661>`_
+
+2.1.70
+------
+
+This is another hotfix release for 2.1.68 that fixes a bug in
+``*.data/*`` file handling for installed wheels which is outlined in
+`PEP 427
+<https://www.python.org/dev/peps/pep-0427/#installing-a-wheel-distribution-1-0-py32-none-any-whl>`_
+
+* Handle ``*.data/*`` RECORD entries not existing. (#1644)
+  `PR #1644 <https://github.com/pantsbuild/pex/pull/1644>`_
+
 2.1.69
 ------
 

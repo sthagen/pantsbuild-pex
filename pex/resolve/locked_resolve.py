@@ -1,7 +1,7 @@
 # Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 
 import itertools
 import os
@@ -294,6 +294,7 @@ class Resolved(object):
     @classmethod
     def create(
         cls,
+        target,  # type: Target
         direct_requirements,  # type: Iterable[Requirement]
         downloadable_requirements,  # type: Iterable[_ResolvedArtifact]
     ):
@@ -307,7 +308,14 @@ class Resolved(object):
                 requirement
             )
 
+        # N.B.: Lowest rank means highest rank value. I.E.: The 1st tag is the most specific and
+        # the 765th tag is the least specific.
+        largest_rank_value = target.supported_tags.lowest_rank.value
+        smallest_rank_value = TagRank.highest_natural().value
+        rank_span = largest_rank_value - smallest_rank_value
+
         downloadable_artifacts = []
+        target_specificities = []
         for downloadable_requirement in downloadable_requirements:
             pin = downloadable_requirement.locked_requirement.pin
             downloadable_artifacts.append(
@@ -319,11 +327,20 @@ class Resolved(object):
                     ],
                 )
             )
+            target_specificities.append(
+                (
+                    rank_span
+                    - (downloadable_requirement.ranked_artifact.rank.value - smallest_rank_value)
+                )
+                / rank_span
+            )
 
         return cls(
+            target_specificity=sum(target_specificities) / len(target_specificities),
             downloadable_artifacts=tuple(downloadable_artifacts),
         )
 
+    target_specificity = attr.ib()  # type: float
     downloadable_artifacts = attr.ib()  # type: Tuple[DownloadableArtifact, ...]
 
 
@@ -436,6 +453,7 @@ class LockedResolve(object):
         self,
         target,  # type: Target
         requirements,  # type: Iterable[Requirement]
+        constraints=(),  # type: Iterable[Requirement]
         source=None,  # type: Optional[str]
         transitive=True,  # type: bool
         build=True,  # type: bool
@@ -492,6 +510,9 @@ class LockedResolve(object):
                 request_resolve(resolve_request.request_dependencies(locked_requirement))
 
         # 2. Select either the best fit artifact for each requirement or collect an error.
+        constraints_by_project_name = {
+            ProjectName(constraint.project_name): constraint for constraint in constraints
+        }
         resolved_artifacts = []
         errors = []
         for project_name, resolve_requests in required.items():
@@ -542,6 +563,14 @@ class LockedResolve(object):
                                 via=resolve_request.render_via(),
                             )
                         )
+                constraint = constraints_by_project_name.get(locked_requirement.pin.project_name)
+                if (
+                    constraint is not None
+                    and str(locked_requirement.pin.version) not in constraint.specifier
+                ):
+                    version_mismatches.append(
+                        "{specifier} (via: constraint)".format(specifier=constraint.specifier)
+                    )
                 if version_mismatches:
                     reasons.append(
                         "{pin} does not satisfy the following requirements:\n{mismatches}".format(
@@ -600,7 +629,7 @@ class LockedResolve(object):
                     )
                 else:
                     errors.append(
-                        "Dependency on {project_name} not satisfied, no candiates found:\n"
+                        "Dependency on {project_name} not satisfied, no candidates found:\n"
                         "    requirers:\n"
                         "    {vias}".format(
                             project_name=project_name,
@@ -630,6 +659,7 @@ class LockedResolve(object):
             )
 
         return Resolved.create(
+            target=target,
             direct_requirements=requirements,
             downloadable_requirements=resolved_artifacts,
         )
