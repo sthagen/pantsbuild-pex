@@ -5,19 +5,24 @@ import glob
 import hashlib
 import os
 import re
+import shutil
 import subprocess
+from textwrap import dedent
 
+import colors
 import pytest
 
 from pex import dist_metadata
 from pex.cli.testing import run_pex3
+from pex.common import safe_open
+from pex.dist_metadata import ProjectNameAndVersion
 from pex.interpreter import PythonInterpreter
 from pex.pep_440 import Version
 from pex.pep_503 import ProjectName
 from pex.pex_info import PexInfo
 from pex.resolve import lockfile
 from pex.resolve.locked_resolve import LockedRequirement
-from pex.testing import make_env, run_pex_command
+from pex.testing import built_wheel, make_env, run_pex_command
 from pex.typing import TYPE_CHECKING
 from pex.util import CacheHelper
 
@@ -318,3 +323,197 @@ def test_multiplatform(
     check_command = [pex_file, "-c", "import requests"]
     py37.execute(check_command)
     py310.execute(check_command)
+
+
+def test_issue_1413_portable_find_links(tmpdir):
+    # type: (Any) -> None
+
+    # Set up a lockfile with contents both from PyPI and a local find-links repo that uses
+    # --path-mapping for lock file portability.
+    src = os.path.join(str(tmpdir), "src")
+    with safe_open(os.path.join(src, "app.py"), "w") as fp:
+        fp.write(
+            dedent(
+                """\
+                import colors
+                
+                
+                print(colors.blue("Relocatable!"))
+                """
+            )
+        )
+
+    repository_pex = os.path.join(str(tmpdir), "my-app-not-on-pypi.pex")
+    run_pex_command(
+        args=["-D", src, "ansicolors==1.1.8", "-m", "app", "--include-tools", "-o", repository_pex]
+    ).assert_success()
+    assert (
+        colors.blue("Relocatable!")
+        == subprocess.check_output(args=[repository_pex]).decode("utf-8").strip()
+    )
+
+    original_find_links = os.path.join(str(tmpdir), "find-links", "original")
+    subprocess.check_call(
+        args=[repository_pex, "repository", "extract", "--sources", "-f", original_find_links],
+        env=make_env(PEX_TOOLS=1),
+    )
+
+    # We should have only the sdist of the src/app.py source code available in the find-links repo.
+    os.unlink(os.path.join(original_find_links, "ansicolors-1.1.8-py2.py3-none-any.whl"))
+    assert 1 == len(os.listdir(original_find_links))
+    assert 1 == len(
+        glob.glob(os.path.join(original_find_links, "my-app-not-on-pypi-0.0.0*.tar.gz"))
+    )
+
+    lock = os.path.join(str(tmpdir), "lock")
+    run_pex3(
+        "lock",
+        "create",
+        "ansicolors==1.1.8",
+        "my-app-not-on-pypi",
+        "-f",
+        original_find_links,
+        "--path-mapping",
+        "FOO|{path}|Our local neighborhood find-links repo.".format(path=original_find_links),
+        "-o",
+        lock,
+    ).assert_success()
+
+    # Now simulate using the portable lock file on another machine where the find-links repo is
+    # mounted at a different absolute path than it was when creating the lock.
+    moved_find_links = os.path.join(str(tmpdir), "find-links", "moved")
+    os.rename(original_find_links, moved_find_links)
+    assert not os.path.exists(original_find_links)
+
+    result = run_pex_command(
+        args=["--lock", lock, "--path-mapping", "FOO|{path}".format(path=moved_find_links), "-mapp"]
+    )
+    result.assert_success()
+    assert colors.blue("Relocatable!") == result.output.strip()
+
+
+def test_issue_1717_transitive_extras(
+    tmpdir,  # type: Any
+):
+    # type: (...) -> None
+
+    find_links = os.path.join(str(tmpdir), "find-links")
+    # The dep graph where a naive depth first resolve not accounting for extras would grab:
+    #   [root, middle_man_with_extras, A, B, C]
+    # Instead of the expected:
+    #   [root, middle_man_with_extras, A, extra1, B, extra2, C]
+    #
+    # root ->
+    #     middle_man_with_extras
+    #     A ->
+    #         middle_man_with_extras[E1] ->
+    #             extra1
+    #         B ->
+    #             middle_man_with_extras[E1,E2] ->
+    #                 extra1
+    #                 extra2
+    #             C ->
+    #                 middle_man_with_extras[E2] ->
+    #                     extra2
+
+    with built_wheel(
+        name="root",
+        install_reqs=["middle_man_with_extras", "A"],
+    ) as root, built_wheel(
+        name="A",
+        install_reqs=["middle_man_with_extras[E1]", "B"],
+    ) as A, built_wheel(
+        name="B",
+        install_reqs=["middle_man_with_extras[E1,E2]", "C"],
+    ) as B, built_wheel(
+        name="C",
+        install_reqs=["middle_man_with_extras[E2]"],
+    ) as C, built_wheel(
+        name="middle_man_with_extras",
+        extras_require={"E1": ["extra1"], "E2": ["extra2"]},
+    ) as middle_man_with_extras, built_wheel(
+        name="extra1",
+    ) as extra1, built_wheel(
+        name="extra2",
+    ) as extra2:
+        os.mkdir(find_links)
+        for wheel in root, A, B, C, middle_man_with_extras, extra1, extra2:
+            shutil.move(wheel, find_links)
+
+    lock = os.path.join(str(tmpdir), "lock")
+    run_pex3(
+        "lock",
+        "create",
+        "--resolver-version",
+        "pip-2020-resolver",
+        "--no-pypi",
+        "-f",
+        find_links,
+        "root",
+        "-o",
+        lock,
+    ).assert_success()
+
+    pex = os.path.join(str(tmpdir), "pex")
+    pex_root = os.path.join(str(tmpdir), "pex_root")
+    create_pex_args = [
+        "--lock",
+        lock,
+        "-o",
+        pex,
+        "--pex-root",
+        pex_root,
+        "--runtime-pex-root",
+        pex_root,
+    ]
+    test_pex_args = [pex, "-c", "import root"]
+
+    def assert_requirements(pex_info):
+        # type: (PexInfo) -> None
+        assert ["root"] == list(pex_info.requirements)
+
+    def assert_dists(
+        pex_info,  # type: PexInfo
+        *expected_project_names  # type: str
+    ):
+        # type: (...) -> None
+        assert set(expected_project_names) == {
+            ProjectNameAndVersion.from_filename(d).project_name for d in pex_info.distributions
+        }
+
+    run_pex_command(args=["pex==2.1.78", "-cpex", "--"] + create_pex_args).assert_success()
+    pex_info = PexInfo.from_pex(pex)
+    assert_requirements(pex_info)
+    assert_dists(pex_info, "root", "middle_man_with_extras", "A", "B", "C")
+
+    process = subprocess.Popen(args=test_pex_args, stderr=subprocess.PIPE)
+    _, stderr = process.communicate()
+    assert 0 != process.returncode
+
+    assert (
+        re.search(
+            r"ResolveError: Failed to resolve requirements from PEX environment @ {pex_root}.*\n"
+            # Interpreter platform string wildcarded:
+            r"Needed [a-z0-9_-]+ compatible dependencies for:\n"
+            r' 1: extra1; extra == "e1"\n'
+            r"    Required by:\n"
+            r"      FingerprintedDistribution\(distribution=middle-man-with-extras .*\)\n"
+            # Python 2 unicode literal wildcarded:
+            r"    But this pex had no u?'extra1' distributions.\n"
+            r' 2: extra2; extra == "e2"\n'
+            r"    Required by:\n"
+            r"      FingerprintedDistribution\(distribution=middle-man-with-extras .*\)\n"
+            # Python 2 unicode literal wildcarded:
+            r"    But this pex had no u?'extra2' distributions.\n".format(
+                pex_root=re.escape(pex_root)
+            ),
+            stderr.decode("utf-8"),
+        )
+        is not None
+    )
+
+    run_pex_command(args=create_pex_args).assert_success()
+    pex_info = PexInfo.from_pex(pex)
+    assert_requirements(pex_info)
+    assert_dists(pex_info, "root", "middle_man_with_extras", "A", "extra1", "B", "extra2", "C")
+    subprocess.check_call(args=test_pex_args)

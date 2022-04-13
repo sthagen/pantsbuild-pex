@@ -8,7 +8,7 @@ import os
 from collections import OrderedDict, defaultdict, deque
 
 from pex.common import pluralize
-from pex.compatibility import urlparse
+from pex.compatibility import unquote, urlparse
 from pex.dist_metadata import DistMetadata
 from pex.enum import Enum
 from pex.fetcher import URLFetcher
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         Callable,
         DefaultDict,
         Deque,
+        Dict,
         Iterable,
         Iterator,
         List,
@@ -105,7 +106,7 @@ class Artifact(object):
                 url=url, fingerprint=fingerprint, verified=verified, vcs=parsed_scheme.vcs
             )
         else:
-            filename = os.path.basename(url_info.path)
+            filename = os.path.basename(unquote(url_info.path))
             return FileArtifact(
                 url=url, fingerprint=fingerprint, verified=verified, filename=filename
             )
@@ -541,16 +542,24 @@ class LockedResolve(object):
                 if target.requirement_applies(request.requirement, extras=request.extras)
             )
 
-        visited = set()  # type: Set[ProjectName]
+        resolved = {}  # type: Dict[ProjectName, Set[str]]
         request_resolve(_ResolveRequest.root(requirement) for requirement in requirements)
         while to_be_resolved:
             resolve_request = to_be_resolved.popleft()
             project_name = resolve_request.project_name
             required.setdefault(project_name, []).append(resolve_request)
 
-            if not transitive or project_name in visited:
+            if not transitive:
                 continue
-            visited.add(project_name)
+
+            required_extras = set(resolve_request.requirement.extras)
+            if project_name not in resolved:
+                resolved[project_name] = required_extras
+            else:
+                resolved_extras = resolved[project_name]
+                if required_extras.issubset(resolved_extras):
+                    continue
+                resolved_extras.update(required_extras)
 
             for locked_requirement in repository[project_name]:
                 request_resolve(resolve_request.request_dependencies(locked_requirement))
