@@ -839,7 +839,7 @@ class BuildAndInstallRequest(object):
                     )
                 else:
                     installed_dist = installed_requirement_dist.distribution
-                    if installed_dist not in requirement:
+                    if not requirement.specifier.contains(installed_dist.version, prereleases=True):
                         unsatisfied.append(
                             "{dist} requires {requirement} but {resolved_dist} was resolved".format(
                                 dist=dist.as_requirement(),

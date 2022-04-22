@@ -1,6 +1,40 @@
 Release Notes
 =============
 
+2.1.82
+------
+
+This is a hotfix release for a regression in prerelease version handling
+introduced in the 2.1.81 release by #1727.
+
+* Fix prerelease handling when checking resolves. (#1732)
+  `PR #1732 <https://github.com/pantsbuild/pex/pull/1732>`_
+
+2.1.81
+------
+
+This release brings a fix to Pex resolve checking for distributions
+built by setuptools whose ``Requires-Dist`` metadata does not match a
+distibutions project name exactly (i.e.: no PEP-503 ``[._-]``
+normalization was performed).
+
+* Fix Pex resolve checking. (#1727)
+  `PR #1727 <https://github.com/pantsbuild/pex/pull/1727>`_
+
+2.1.80
+------
+
+This release brings another fix for pathologically slow cases of lock
+creation as well as a new ``--sh-boot`` feature for creating PEXes that
+boot via ``/bin/sh`` for more resilience across systems with differing
+Python installations as well as offering lower boot latency.
+
+* Support booting via ``/bin/sh`` with ``--sh-boot``. (#1721)
+  `PR #1721 <https://github.com/pantsbuild/pex/pull/1721>`_
+
+* Fix more pathologic lock creation slowness. (#1723)
+  `PR #1723 <https://github.com/pantsbuild/pex/pull/1723>`_
+
 2.1.79
 ------
 
