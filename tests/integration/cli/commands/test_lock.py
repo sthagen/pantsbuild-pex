@@ -1,7 +1,6 @@
 # Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-import hashlib
 import os
 import re
 import subprocess
@@ -39,7 +38,7 @@ from pex.util import CacheHelper
 from pex.version import __version__
 
 if TYPE_CHECKING:
-    from typing import Any, Optional
+    from typing import Any
 
     import attr  # vendor:skip
 else:
@@ -175,30 +174,40 @@ def test_create_local_unsupported(pex_project_dir):
     ) == result.error
 
 
-def test_create_vcs(tmpdir):
-    # type: (Any) -> None
+def test_create_vcs(
+    tmpdir,  # type: Any
+    py310,  # type: str
+):
+    # type: (...) -> None
+
+    # N.B.: The VCS Pex below only works on Python 3.10 and older.
+    python = py310 if PY_VER > (3, 10) else sys.executable
 
     lock = os.path.join(str(tmpdir), "lock")
     run_pex3(
         "lock",
         "create",
+        "--python",
+        python,
         "pex @ git+https://github.com/pantsbuild/pex@473c6ac7",
         "git+https://github.com/VaasuDevanS/cowsay-python@v3.0#egg=cowsay",
         "-o",
         lock,
     ).assert_success()
     pex_file = os.path.join(str(tmpdir), "pip-pex.pex")
-    run_pex_command(args=["--lock", lock, "-o", pex_file]).assert_success()
+    run_pex_command(args=["--lock", lock, "-o", pex_file], python=python).assert_success()
 
-    assert (
-        "3.0"
-        == subprocess.check_output(args=[pex_file, "--version"], env=make_env(PEX_SCRIPT="cowsay"))
+    version_output = (
+        subprocess.check_output(
+            args=[python, pex_file, "--version"], env=make_env(PEX_SCRIPT="cowsay")
+        )
         .decode("utf-8")
         .strip()
     )
+    assert "3.0" == version_output, version_output
 
     process = subprocess.Popen(
-        args=[pex_file, "-V"],
+        args=[python, pex_file, "-V"],
         env=make_env(PEX_SCRIPT="pex"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1410,12 +1419,12 @@ def test_universal_lock(
 
     py39 = None
     for interp in PythonInterpreter.iter():
-        if (3, 9) == interp.version[:2]:
+        if interp.identity.matches("CPython==3.9.*"):
             py39 = interp
             break
 
     if py39 is None:
-        pytest.skip("A Python 3.9 interpreter must be discoverable for this test.")
+        pytest.skip("A CPython 3.9 interpreter must be discoverable for this test.")
         return
 
     constraints_file = os.path.join(str(tmpdir), "constraints.txt")
