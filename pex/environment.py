@@ -11,23 +11,23 @@ from collections import OrderedDict, defaultdict
 
 from pex import dist_metadata, pex_warnings, targets
 from pex.common import pluralize
+from pex.dist_metadata import Distribution, Requirement
 from pex.fingerprinted_distribution import FingerprintedDistribution
 from pex.inherit_path import InheritPath
 from pex.layout import maybe_install
 from pex.orderedset import OrderedSet
 from pex.pep_425 import CompatibilityTags, TagRank
-from pex.pep_503 import ProjectName, distribution_satisfies_requirement
+from pex.pep_503 import ProjectName
 from pex.pex_info import PexInfo
 from pex.targets import Target
-from pex.third_party.packaging import specifiers, tags
-from pex.third_party.pkg_resources import Distribution, Requirement
+from pex.third_party.packaging import specifiers
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
-from pex.util import DistributionHelper
 
 if TYPE_CHECKING:
     from typing import (
         DefaultDict,
+        Dict,
         FrozenSet,
         Iterable,
         Iterator,
@@ -98,7 +98,7 @@ class _RankedDistribution(object):
 
     def satisfies(self, requirement):
         # type: (Requirement) -> bool
-        return distribution_satisfies_requirement(self.distribution, requirement)
+        return self.distribution in requirement
 
 
 @attr.s(frozen=True)
@@ -137,11 +137,12 @@ class _TagMismatch(_UnrankedDistribution):
         # type: (Target) -> str
         return (
             "The wheel tags for {dist} are {wheel_tags} which do not match the supported tags of "
-            "{target}:\n{supported_tags}".format(
+            "{target}:\n{tag}\n... {count} more ...".format(
                 dist=self.dist,
                 wheel_tags=", ".join(map(str, self.wheel_tags)),
                 target=target,
-                supported_tags="\n".join(map(str, target.supported_tags)),
+                tag=target.supported_tags[0],
+                count=len(target.supported_tags) - 1,
             )
         )
 
@@ -187,7 +188,7 @@ class _RequirementKey(ProjectName):
     @classmethod
     def create(cls, requirement):
         # type: (Requirement) -> _RequirementKey
-        return cls(requirement, frozenset(requirement.extras))
+        return cls(requirement.name, frozenset(requirement.extras))
 
     extras = attr.ib()  # type: FrozenSet[str]
 
@@ -204,10 +205,12 @@ class _RequirementKey(ProjectName):
         items = list(self.extras)
         for size in range(len(items) + 1):
             for combination_of_size in itertools.combinations(items, size):
-                yield _RequirementKey(self.project_name, frozenset(combination_of_size))
+                yield _RequirementKey(self.raw, frozenset(combination_of_size))
 
 
 class PEXEnvironment(object):
+    _CACHE = {}  # type: Dict[Tuple[str, str, Target], PEXEnvironment]
+
     @classmethod
     def mount(
         cls,
@@ -216,18 +219,24 @@ class PEXEnvironment(object):
         target=None,  # type: Optional[Target]
     ):
         # type: (...) -> PEXEnvironment
+        pex_file = os.path.realpath(pex)
         if not pex_info:
-            pex_info = PexInfo.from_pex(pex)
+            pex_info = PexInfo.from_pex(pex_file)
             pex_info.update(PexInfo.from_env())
         pex_hash = pex_info.pex_hash
         if pex_hash is None:
             raise AssertionError(
                 "There was no pex_hash stored in {} for {}.".format(PexInfo.PATH, pex)
             )
-        pex_root = pex_info.pex_root
-        pex = maybe_install(pex=pex, pex_root=pex_root, pex_hash=pex_hash) or pex
         target = target or targets.current()
-        return cls(pex=pex, pex_info=pex_info, target=target)
+        key = (pex_file, pex_hash, target)
+        mounted = cls._CACHE.get(key)
+        if mounted is None:
+            pex_root = pex_info.pex_root
+            pex = maybe_install(pex=pex, pex_root=pex_root, pex_hash=pex_hash) or pex
+            mounted = cls(pex=pex, pex_info=pex_info, target=target)
+            cls._CACHE[key] = mounted
+        return mounted
 
     def __init__(
         self,
@@ -261,7 +270,7 @@ class PEXEnvironment(object):
             for distribution_name, fingerprint in self._pex_info.distributions.items():
                 dist_path = os.path.join(internal_cache, distribution_name)
                 yield FingerprintedDistribution(
-                    distribution=DistributionHelper.distribution_from_path(dist_path),
+                    distribution=Distribution.load(dist_path),
                     fingerprint=fingerprint,
                 )
 
@@ -315,7 +324,7 @@ class PEXEnvironment(object):
     def _evaluate_marker(
         self,
         requirement,  # type: Requirement
-        extras=None,  # type: Optional[Tuple[str, ...]]
+        extras=(),  # type: Iterable[str]
     ):
         # type: (...) -> bool
         applies = self._target.requirement_applies(requirement, extras=extras)
@@ -343,7 +352,7 @@ class PEXEnvironment(object):
         available_distributions = [
             ranked_dist
             for ranked_dist in self._available_ranked_dists_by_project_name[
-                ProjectName(requirement)
+                requirement.project_name
             ]
             if ranked_dist.satisfies(requirement)
         ]
@@ -394,7 +403,7 @@ class PEXEnvironment(object):
                 dep_requirement,
                 resolved_dists_by_key,
                 required,
-                required_by=resolved_distribution,
+                required_by=resolved_distribution.distribution,
             ):
                 yield not_found
 
@@ -419,7 +428,7 @@ class PEXEnvironment(object):
             required = self._evaluate_marker(req)
             if not required:
                 continue
-            project_name = ProjectName(req)
+            project_name = req.project_name
             requirements = qualified_reqs_by_project_name.get(project_name)
             if requirements is None:
                 qualified_reqs_by_project_name[project_name] = requirements = []
@@ -434,13 +443,14 @@ class PEXEnvironment(object):
                 # We've winnowed down reqs_by_key to just those requirements whose environment
                 # markers apply; so, we should always have an available distribution.
                 message = (
-                    "A distribution for {project_name} could not be resolved in this "
-                    "environment.".format(project_name=project_name)
+                    "A distribution for {project_name} could not be resolved for {target}.".format(
+                        project_name=project_name, target=self._target
+                    )
                 )
                 unavailable_dists = self._unavailable_dists_by_project_name.get(project_name)
                 if unavailable_dists:
                     message += (
-                        "Found {count} {distributions} for {project_name} that do not apply:\n"
+                        "\nFound {count} {distributions} for {project_name} that do not apply:\n"
                         "{unavailable_dists}".format(
                             count=len(unavailable_dists),
                             distributions=pluralize(unavailable_dists, "distribution"),
@@ -547,7 +557,7 @@ class PEXEnvironment(object):
                             requirers="\n      ".join(map(str, requirers))
                         )
                     contains = self._available_ranked_dists_by_project_name[
-                        ProjectName(requirement)
+                        requirement.project_name
                     ]
                     if contains:
                         rendered_contains = (

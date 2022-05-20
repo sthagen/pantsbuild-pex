@@ -7,6 +7,7 @@ from collections import defaultdict
 import pytest
 
 from pex.common import safe_mkdtemp
+from pex.dist_metadata import Requirement
 from pex.interpreter import PythonInterpreter
 from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
@@ -16,7 +17,6 @@ from pex.resolve.resolvers import Unsatisfiable
 from pex.resolver import resolve
 from pex.targets import Targets
 from pex.testing import IS_LINUX, PY27, PY310, ensure_python_interpreter
-from pex.third_party.pkg_resources import Requirement
 from pex.typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -186,7 +186,7 @@ def test_resolve_from_pex_subset(
     )
 
     assert {"cffi", "pycparser"} == {
-        installed_distribution.distribution.key
+        installed_distribution.distribution.project_name
         for installed_distribution in result.installed_distributions
     }
 
@@ -205,9 +205,9 @@ def test_resolve_from_pex_not_found(
                 interpreters=(py310,),
             ),
         )
-    assert "A distribution for pex could not be resolved in this environment." in str(
-        exec_info.value
-    )
+    assert "A distribution for pex could not be resolved for {py310_exe}.".format(
+        py310_exe=py310.binary
+    ) in str(exec_info.value)
 
     with pytest.raises(Unsatisfiable) as exec_info:
         resolve_from_pex(
@@ -305,7 +305,7 @@ def test_resolve_from_pex_ignore_errors(
         ignore_errors=True,
     )
     installed_distributions_by_key = {
-        installed_distribution.distribution.key: installed_distribution.distribution.as_requirement()
+        installed_distribution.distribution.project_name: installed_distribution.distribution.as_requirement()
         for installed_distribution in result.installed_distributions
     }
     assert (
