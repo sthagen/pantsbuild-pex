@@ -32,7 +32,7 @@ def test_lock_create_sdist_requires_python_different_from_current(
         "--interpreter-constraint",
         "CPython<3.11,>=3.8",
         "--python-path",
-        ":".join(interp.binary for interp in (py27, py37, py310)),
+        os.pathsep.join(interp.binary for interp in (py27, py37, py310)),
         "aioconsole==0.4.1",
         "-o",
         lock,
@@ -51,11 +51,13 @@ def test_lock_create_sdist_requires_python_different_from_current(
         "ERROR: Package 'aioconsole' requires a different Python: {pyver} not in '>=3.7'".format(
             pyver=py27.identity.version_str
         )
-        == result.error.splitlines()[0]
+        in result.error.splitlines()
     )
 
     # Now show it currently works.
-    subprocess.check_call(args=[py27.binary, "-m", "pex.cli"] + create_lock_args)
+    subprocess.check_call(
+        args=[py27.binary, "-m", "pex.cli"] + create_lock_args + ["--pip-version", "20.3.4-patched"]
+    )
     run_pex_command(
         args=["--lock", lock, "--", "-c", "import aioconsole"],
         python=py310.binary,
@@ -80,7 +82,7 @@ def test_lock_create_universal_interpreter_constraint_unsatisfiable(
         "--interpreter-constraint",
         "CPython<3.11,>=3.8",
         "--python-path",
-        ":".join(interp.binary for interp in (py27, py37)),
+        os.pathsep.join(interp.binary for interp in (py27, py37)),
         "aioconsole==0.4.1",
         "-o",
         lock,
