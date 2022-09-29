@@ -10,28 +10,32 @@ import pytest
 from pex.interpreter import PythonInterpreter
 from pex.resolve.lockfile import json_codec
 from pex.targets import LocalInterpreter, Target
-from pex.testing import PY27, PY37, IntegResults, ensure_python_interpreter, run_pex_command
+from pex.testing import (
+    PY38,
+    IntegResults,
+    ensure_python_interpreter,
+    run_pex_command,
+    skip_unless_python27,
+)
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Any
 
 
-def create_target(python_version):
+def create_target(python):
     # type: (str) -> Target
-    return LocalInterpreter.create(
-        PythonInterpreter.from_binary(ensure_python_interpreter(python_version))
-    )
+    return LocalInterpreter.create(PythonInterpreter.from_binary(python))
 
 
 @pytest.fixture
 def py27():
-    return create_target(PY27)
+    return create_target(skip_unless_python27())
 
 
 @pytest.fixture
-def py37():
-    return create_target(PY37)
+def py38():
+    return create_target(ensure_python_interpreter(PY38))
 
 
 LOCK_STYLE_SOURCES = json_codec.loads(
@@ -91,7 +95,7 @@ LOCK_STYLE_SOURCES = json_codec.loads(
 
 def test_lockfile_style_sources(
     py27,  # type: Target
-    py37,  # type: Target
+    py38,  # type: Target
     tmpdir,  # type: Any
 ):
     # type: (...) -> None
@@ -107,7 +111,7 @@ def test_lockfile_style_sources(
             python=target.get_interpreter().binary,
         )
 
-    use_lock(py37).assert_success()
+    use_lock(py38).assert_success()
 
     # N.B.: We created a lock above that falsely advertises there is a solution for Python 2.7.
     # This is the devil's bargain with non-strict lock styles and the lock will fail only some time

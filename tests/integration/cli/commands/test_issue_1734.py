@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 import os
+import re
 import subprocess
 
 from pex.cli.testing import run_pex3
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 def test_lock_create_sdist_requires_python_different_from_current(
     tmpdir,  # type: Any
     py27,  # type: PythonInterpreter
-    py37,  # type: PythonInterpreter
+    py38,  # type: PythonInterpreter
     py310,  # type: PythonInterpreter
 ):
     # type: (...) -> None
@@ -32,7 +33,7 @@ def test_lock_create_sdist_requires_python_different_from_current(
         "--interpreter-constraint",
         "CPython<3.11,>=3.8",
         "--python-path",
-        os.pathsep.join(interp.binary for interp in (py27, py37, py310)),
+        os.pathsep.join(interp.binary for interp in (py27, py38, py310)),
         "aioconsole==0.4.1",
         "-o",
         lock,
@@ -67,7 +68,7 @@ def test_lock_create_sdist_requires_python_different_from_current(
 def test_lock_create_universal_interpreter_constraint_unsatisfiable(
     tmpdir,  # type: Any
     py27,  # type: PythonInterpreter
-    py37,  # type: PythonInterpreter
+    py38,  # type: PythonInterpreter
 ):
     # type: (...) -> None
 
@@ -80,9 +81,9 @@ def test_lock_create_universal_interpreter_constraint_unsatisfiable(
         "--style",
         "universal",
         "--interpreter-constraint",
-        "CPython<3.11,>=3.8",
+        "CPython<3.11,>=3.9",
         "--python-path",
-        os.pathsep.join(interp.binary for interp in (py27, py37)),
+        os.pathsep.join(interp.binary for interp in (py27, py38)),
         "aioconsole==0.4.1",
         "-o",
         lock,
@@ -90,21 +91,22 @@ def test_lock_create_universal_interpreter_constraint_unsatisfiable(
         "2",
     )
     result.assert_failure()
-    assert (
-        "When creating a universal lock with an --interpreter-constraint, an interpreter matching "
-        "the constraint must be found on the local system but none was: Could not find a "
-        "compatible interpreter.\n"
-        "\n"
-        "Examined the following interpreters:\n"
-        "1.) {py27_path} {py27_req}\n"
-        "2.) {py37_path} {py37_req}\n"
-        "\n"
-        "No interpreter compatible with the requested constraints was found:\n"
-        "\n"
-        "  Version matches CPython<3.11,>=3.8\n".format(
+    assert re.match(
+        r"^When creating a universal lock with an --interpreter-constraint, an interpreter "
+        r"matching the constraint must be found on the local system but none was: Could not find a "
+        r"compatible interpreter\.\n"
+        r"\n"
+        r"Examined the following interpreters:\n"
+        r"1\.\)\s+{py27_path} {py27_req}\n"
+        r"2\.\)\s+{py38_path} {py38_req}\n"
+        r"\n"
+        r"No interpreter compatible with the requested constraints was found:\n"
+        r"\n"
+        r"  Version matches CPython<3\.11,>=3\.9\n".format(
             py27_path=py27.binary,
             py27_req=py27.identity.requirement,
-            py37_path=py37.binary,
-            py37_req=py37.identity.requirement,
-        )
-    ) == result.error
+            py38_path=py38.binary,
+            py38_req=py38.identity.requirement,
+        ),
+        result.error,
+    )

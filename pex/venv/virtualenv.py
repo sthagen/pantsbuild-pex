@@ -7,23 +7,25 @@ import logging
 import os
 import pkgutil
 import re
-from fileinput import FileInput
-
+import shutil
 import sys
 from contextlib import closing
-from pex.common import AtomicDirectory, is_exe, safe_mkdir
-from pex.compatibility import get_stdout_bytes_buffer
-from pex.dist_metadata import find_distributions, Distribution
+from fileinput import FileInput
+
+from pex.common import AtomicDirectory, atomic_directory, is_exe, safe_mkdir, safe_open
+from pex.compatibility import commonpath, get_stdout_bytes_buffer
+from pex.dist_metadata import Distribution, find_distributions
+from pex.executor import Executor
+from pex.fetcher import URLFetcher
 from pex.interpreter import PythonInterpreter
+from pex.orderedset import OrderedSet
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast
 from pex.util import named_temporary_file
+from pex.variables import ENV
 
 if TYPE_CHECKING:
     from typing import Iterator, Optional, Tuple, Union
-
-
-_MIN_PIP_PYTHON_VERSION = (2, 7, 9)
 
 
 logger = logging.getLogger(__name__)
@@ -82,30 +84,34 @@ def find_site_packages_dir(
     interpreter=None,  # type: Optional[PythonInterpreter]
 ):
     # type: (...) -> str
+
+    real_venv_dir = os.path.realpath(venv_dir)
+    site_packages_dirs = OrderedSet()  # type: OrderedSet[str]
+
     interpreter = interpreter or PythonInterpreter.get()
-    if (
-        interpreter.identity.interpreter == "PyPy"
-        and interpreter.version[:2] <= (3, 7)
-    ):
-        site_packages_dir = os.path.join(venv_dir, "site-packages")
-    else:
-        site_packages_dir = os.path.join(
-            venv_dir,
-            "lib",
-            "{python}{major_minor}".format(
-                python="pypy" if interpreter.identity.interpreter == "PyPy" else "python",
-                major_minor=".".join(map(str, interpreter.version[:2]))
-            ),
-            "site-packages",
-        )
-    if not os.path.isdir(site_packages_dir):
+    for entry in interpreter.sys_path:
+        real_entry_path = os.path.realpath(entry)
+        if commonpath((real_venv_dir, real_entry_path)) != real_venv_dir:
+            # This ignores system site packages when the venv is built with --system-site-packages.
+            continue
+        if "site-packages" == os.path.basename(real_entry_path) and os.path.isdir(real_entry_path):
+            site_packages_dirs.add(real_entry_path)
+
+    if not site_packages_dirs:
         raise InvalidVirtualenvError(
-            "The virtualenv at {venv_dir} is not valid. The expected site-packages directory "
-            "at {site_packages_dir} does not exist.".format(
-                venv_dir=venv_dir, site_packages_dir=site_packages_dir
+            "The virtualenv at {venv_dir} is not valid. No site-packages directory was found in "
+            "its sys.path:\n{sys_path}".format(
+                venv_dir=venv_dir, sys_path="\n".join(interpreter.sys_path)
             )
         )
-    return site_packages_dir
+    if len(site_packages_dirs) > 1:
+        raise InvalidVirtualenvError(
+            "The virtualenv at {venv_dir} is not valid. It has more than one site-packages "
+            "directory:\n{site_packages}".format(
+                venv_dir=venv_dir, site_packages="\n".join(site_packages_dirs)
+            )
+        )
+    return site_packages_dirs.pop()
 
 
 class Virtualenv(object):
@@ -131,6 +137,7 @@ class Virtualenv(object):
         interpreter=None,  # type: Optional[PythonInterpreter]
         force=False,  # type: bool
         copies=False,  # type: bool
+        system_site_packages=False,  # type: bool
         prompt=None,  # type: Optional[str]
     ):
         # type: (...) -> Virtualenv
@@ -173,6 +180,8 @@ class Virtualenv(object):
                 args = [fp.name, "--no-pip", "--no-setuptools", "--no-wheel", venv_dir]
                 if copies:
                     args.append("--always-copy")
+                if system_site_packages:
+                    args.append("--system-site-packages")
                 if prompt:
                     args.extend(["--prompt", prompt])
                     custom_prompt = prompt
@@ -181,6 +190,8 @@ class Virtualenv(object):
             args = ["-m", "venv", "--without-pip", venv_dir]
             if copies:
                 args.append("--copies")
+            if system_site_packages:
+                args.append("--system-site-packages")
             if prompt and py_major_minor >= (3, 6):
                 args.extend(["--prompt", prompt])
                 custom_prompt = prompt
@@ -317,9 +328,7 @@ class Virtualenv(object):
             executable for executable in self.iter_executables() if _is_python_script(executable)
         ]
         if python_scripts:
-            with closing(
-                FileInput(files=sorted(python_scripts), inplace=True, mode="rb")
-            ) as fi:
+            with closing(FileInput(files=sorted(python_scripts), inplace=True, mode="rb")) as fi:
                 # N.B.: `FileInput` is strange, but useful: the context manager above monkey-patches
                 # sys.stdout to print to the corresponding original input file, which is has moved
                 # aside.
@@ -339,16 +348,31 @@ class Virtualenv(object):
 
     def install_pip(self):
         # type: () -> str
-        if self._interpreter.version < _MIN_PIP_PYTHON_VERSION:
-            raise PipUnavailableError(
-                (
-                    "Pip can only be installed for Python>={min_version}, but the current "
-                    "interpreter is {interpreter} {version}."
-                ).format(
-                    min_version=".".join(map(str, _MIN_PIP_PYTHON_VERSION)),
-                    interpreter=self._interpreter.identity.interpreter,
-                    version=self._interpreter.identity.version_str,
-                ),
-            )
-        self._interpreter.execute(args=["-m", "ensurepip", "-U", "--default-pip"])
+        try:
+            self._interpreter.execute(args=["-m", "ensurepip", "-U", "--default-pip"])
+        except Executor.NonZeroExit:
+            # Early Python 2.7 versions and some system Pythons do not come with ensurepip
+            # installed. We fall back to get-pip.py which is available in dedicated versions for
+            # Python 2.{6,7} and 3.{2,3,4,5,6} and a single version for anything newer.
+            get_pip_script = "get-pip.py"
+            major, minor = self._interpreter.version[:2]
+            if (major, minor) <= (3, 6):
+                version_dir = "{major}.{minor}".format(major=major, minor=minor)
+                url_rel_path = "{version_dir}/{script}".format(
+                    version_dir=version_dir, script=get_pip_script
+                )
+                dst_rel_path = os.path.join(version_dir, get_pip_script)
+            else:
+                url_rel_path = get_pip_script
+                dst_rel_path = os.path.join("default", get_pip_script)
+            get_pip = os.path.join(ENV.PEX_ROOT, "get-pip", dst_rel_path)
+            with atomic_directory(os.path.dirname(get_pip), exclusive=True) as atomic_dir:
+                if not atomic_dir.is_finalized():
+                    with URLFetcher().get_body_stream(
+                        "https://bootstrap.pypa.io/pip/" + url_rel_path
+                    ) as src_fp, safe_open(
+                        os.path.join(atomic_dir.work_dir, os.path.basename(get_pip)), "wb"
+                    ) as dst_fp:
+                        shutil.copyfileobj(src_fp, dst_fp)
+            self._interpreter.execute(args=[get_pip])
         return self.bin_path("pip")
