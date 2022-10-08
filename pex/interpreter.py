@@ -18,17 +18,14 @@ from textwrap import dedent
 
 from pex import third_party
 from pex.common import is_exe, safe_mkdtemp, safe_rmtree
-from pex.compatibility import string
-from pex.dist_metadata import DistMetadata, Distribution, Requirement, RequirementParseError
 from pex.executor import Executor
 from pex.jobs import Job, Retain, SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
 from pex.pep_425 import CompatibilityTags
-from pex.pep_440 import Version
-from pex.pep_503 import ProjectName
 from pex.pep_508 import MarkerEnvironment
 from pex.platforms import Platform
 from pex.pyenv import Pyenv
+from pex.third_party.packaging import __version__ as packaging_version
 from pex.third_party.packaging import tags
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast, overload
@@ -123,9 +120,13 @@ class PythonIdentity(object):
         )
 
         # Pex identifies interpreters using a bit of Pex code injected via an extraction of that
-        # code under the `PEX_ROOT` adjoined to `sys.path` via `PYTHONPATH`. We ignore such adjoined
-        # `sys.path` entries to discover the true base interpreter `sys.path`.
-        pythonpath = frozenset(os.environ.get("PYTHONPATH", "").split(os.pathsep))
+        # code under the `PEX_ROOT` adjoined to `sys.path` via `PYTHONPATH`. Pex also exposes the
+        # vendored attrs distribution so that its `cache_hash=True` feature can work (see the
+        # bottom of pex/third_party/__init__.py where the vendor importer is installed). We ignore
+        # such adjoined `sys.path` entries to discover the true base interpreter `sys.path`.
+        pythonpath = frozenset(
+            os.environ.get("PYTHONPATH", "").split(os.pathsep) + list(third_party.exposed())
+        )
         sys_path = [item for item in sys.path if item and item not in pythonpath]
 
         return cls(
@@ -139,6 +140,7 @@ class PythonIdentity(object):
                 or cast(str, getattr(sys, "base_prefix", sys.prefix))
             ),
             sys_path=sys_path,
+            packaging_version=packaging_version,
             python_tag=preferred_tag.interpreter,
             abi_tag=preferred_tag.abi,
             platform_tag=preferred_tag.platform,
@@ -152,7 +154,7 @@ class PythonIdentity(object):
     def decode(cls, encoded):
         TRACER.log("creating PythonIdentity from encoded: %s" % encoded, V=9)
         values = json.loads(encoded)
-        if len(values) != 11:
+        if len(values) != 12:
             raise cls.InvalidError("Invalid interpreter identity: %s" % encoded)
 
         supported_tags = values.pop("supported_tags")
@@ -188,6 +190,7 @@ class PythonIdentity(object):
         prefix,  # type: str
         base_prefix,  # type: str
         sys_path,  # type: Iterable[str]
+        packaging_version,  # type: str
         python_tag,  # type: str
         abi_tag,  # type: str
         platform_tag,  # type: str
@@ -205,6 +208,7 @@ class PythonIdentity(object):
         self._prefix = prefix
         self._base_prefix = base_prefix
         self._sys_path = tuple(sys_path)
+        self._packaging_version = packaging_version
         self._python_tag = python_tag
         self._abi_tag = abi_tag
         self._platform_tag = platform_tag
@@ -219,6 +223,7 @@ class PythonIdentity(object):
             prefix=self._prefix,
             base_prefix=self._base_prefix,
             sys_path=self._sys_path,
+            packaging_version=self._packaging_version,
             python_tag=self._python_tag,
             abi_tag=self._abi_tag,
             platform_tag=self._platform_tag,
@@ -295,21 +300,6 @@ class PythonIdentity(object):
     def interpreter(self):
         return self._interpreter_name
 
-    @property
-    def requirement(self):
-        # type: () -> Requirement
-        return self.distribution.as_requirement()
-
-    @property
-    def distribution(self):
-        # type: () -> Distribution
-        return Distribution(
-            location=self.binary,
-            metadata=DistMetadata(
-                project_name=ProjectName(self.interpreter), version=Version(self.version_str)
-            ),
-        )
-
     def iter_supported_platforms(self):
         # type: () -> Iterator[Platform]
         """All platforms supported by the associated interpreter ordered from most specific to
@@ -323,35 +313,6 @@ class PythonIdentity(object):
         )
         for tag in self._supported_tags:
             yield Platform.from_tag(tag)
-
-    @classmethod
-    def parse_requirement(
-        cls,
-        requirement,  # type: Union[Requirement, str]
-        default_interpreter="CPython",  # type: str
-    ):
-        # type: (...) -> Requirement
-        if isinstance(requirement, Requirement):
-            return requirement
-        elif isinstance(requirement, string):
-            try:
-                requirement = Requirement.parse(requirement)
-            except RequirementParseError:
-                try:
-                    requirement = Requirement.parse("%s%s" % (default_interpreter, requirement))
-                except RequirementParseError:
-                    raise ValueError("Unknown requirement string: %s" % requirement)
-            return requirement
-        else:
-            raise ValueError("Unknown requirement type: %r" % (requirement,))
-
-    def matches(self, requirement):
-        """Given a Requirement, check if this interpreter matches."""
-        try:
-            requirement = self.parse_requirement(requirement, self._interpreter_name)
-        except ValueError as e:
-            raise self.UnknownRequirement(str(e))
-        return self.distribution in requirement
 
     def binary_name(self, version_components=2):
         # type: (int) -> str
