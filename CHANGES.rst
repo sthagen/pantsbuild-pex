@@ -1,6 +1,36 @@
 Release Notes
 =============
 
+2.1.112
+-------
+
+This release brings support for the latest Pip release and includes
+some internal changes to help debug intermittent issues some users are
+seeing that implicate what may be file locking related bugs.
+
+* Add support for ``--pip-version 22.3``. (#1953)
+  `PR #1953 <https://github.com/pantsbuild/pex/pull/1953>`_
+
+2.1.111
+-------
+
+This release fixes resolving requirements from a lock using arbitrary
+equality (``===``).
+
+In addition, you can now "inject" runtime environment variables and
+arguments into PEX files such that, when run, the PEX runtime ensures
+those environment variables and command line arguments are passed to
+the PEXed application. See `PEX Recipes
+<https://pex.readthedocs.io/en/latest/recipes.html
+#uvicorn-and-other-customizable-application-servers>`_ for more
+information.
+
+* Fix lock resolution to handle arbitrary equality. (#1951)
+  `PR #1951 <https://github.com/pantsbuild/pex/pull/1951>`_
+
+* Support injecting args and env vars in a PEX. (#1948)
+  `PR #1948 <https://github.com/pantsbuild/pex/pull/1948>`_
+
 2.1.110
 -------
 
