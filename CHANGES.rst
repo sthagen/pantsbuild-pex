@@ -1,6 +1,39 @@
 Release Notes
 =============
 
+2.1.116
+-------
+
+This release fixes a bug in ``--resolve-local-platforms`` when
+``--complete-platform`` was used.
+
+* Check for --complete-platforms match when --resolve-local-platforms (#1991)
+  `PR #1991 <https://github.com/pantsbuild/pex/pull/1991>`_
+
+2.1.115
+-------
+
+This release brings some attention to the ``pex3 lock export``
+subcommand to make it more useful when inter-operating with
+``pip-tools``.
+
+* Sort requirements based on normalized project name when exporting (#1992)
+  `PR #1992 <https://github.com/pantsbuild/pex/pull/1992>`_
+
+* Use raw version when exporting (#1990)
+  `PR #1990 <https://github.com/pantsbuild/pex/pull/1990>`_
+
+2.1.114
+-------
+
+This release brings two fixes for ``--venv`` mode PEXes.
+
+* Only insert "" to head of sys.path if a venv PEX runs in interpreter mode (#1984)
+  `PR #1984 <https://github.com/pantsbuild/pex/pull/1984>`_
+
+* Map pex python path interpreter to realpath when creating venv dir hash. (#1972)
+  `PR #1972 <https://github.com/pantsbuild/pex/pull/1972>`_
+
 2.1.113
 -------
 
