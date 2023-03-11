@@ -1,6 +1,46 @@
 Release Notes
 =============
 
+2.1.129
+-------
+
+This release fixes a bug downloading a VCS requirement from a lock when
+the ambient Python interpreter used to run Pex does not meet the
+``Requires-Python`` constraint of the VCS requirement.
+
+* Fix VCS lock downloads to respect target. (#2094)
+  `PR #2094 <https://github.com/pantsbuild/pex/pull/2094>`_
+
+2.1.128
+-------
+
+This release fixes a regression introduced in Pex 2.1.120 that caused
+``--no-venv-site-packages-copies`` (the default when using ``--venv``)
+to to be ignored for both zipapp PEXes (the default) and
+``--layout packed`` PEXes.
+
+* Fix regression in venv symlinking. (#2090)
+  `PR #2090 <https://github.com/pantsbuild/pex/pull/2090>`_
+
+2.1.127
+-------
+
+This release fixes `--lock` resolve sub-setting for local project
+requirements.
+
+* Fix lock subsetting for local projects. (#2085)
+  `PR #2085 <https://github.com/pantsbuild/pex/pull/2085>`_
+
+2.1.126
+-------
+
+This release fixes a long standing (> 4 years old!) concurrency bug
+when building the same sdist for the 1st time and racing another Pex
+process doing the same sdist build.
+
+* Guard against racing sdist builds. (#2080)
+  `PR #2080 <https://github.com/pantsbuild/pex/pull/2080>`_
+
 2.1.125
 -------
 
