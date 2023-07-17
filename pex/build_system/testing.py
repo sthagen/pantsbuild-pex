@@ -13,7 +13,7 @@ from pex.pep_503 import ProjectName
 from pex.pip.installation import get_pip
 from pex.pip.version import PipVersion
 from pex.resolve.configured_resolver import ConfiguredResolver
-from pex.resolve.resolver_configuration import PipConfiguration
+from pex.resolve.resolver_configuration import PipConfiguration, ResolverVersion
 from pex.result import Error
 from pex.targets import LocalInterpreter
 from pex.typing import TYPE_CHECKING
@@ -37,16 +37,21 @@ def assert_build_sdist(
 
     sdist_dir = os.path.join(str(tmpdir), "sdist_dir")
 
-    # This test utility is used by all versions of Python Pex supports; so we need to use the
-    # vendored Pip which is guaranteed to work with all those Python versions.
-    pip_version = PipVersion.VENDORED
+    # This test utility is used by all versions of Python Pex supports; so we need to use a Pip
+    # setup which is guaranteed to work with the current Python version.
+    pip_version = PipVersion.DEFAULT
+    resolver_version = ResolverVersion.default(pip_version)
 
+    target = LocalInterpreter.create()
+    resolver = ConfiguredResolver(
+        PipConfiguration(version=pip_version, resolver_version=resolver_version)
+    )
     location = build_sdist(
         project_dir,
         sdist_dir,
-        pip_version,
-        LocalInterpreter.create(),
-        ConfiguredResolver(PipConfiguration(version=pip_version)),
+        target,
+        resolver,
+        pip_version=pip_version,
     )
     assert not isinstance(location, Error), location
     assert sdist_dir == os.path.dirname(location)
@@ -56,7 +61,9 @@ def assert_build_sdist(
 
     # Verify the sdist is valid such that we can build a wheel from it.
     wheel_dir = os.path.join(str(tmpdir), "wheel_dir")
-    get_pip().spawn_build_wheels(distributions=[sdist.location], wheel_dir=wheel_dir).wait()
+    get_pip(resolver=resolver).spawn_build_wheels(
+        distributions=[sdist.location], wheel_dir=wheel_dir
+    ).wait()
     wheels = glob.glob(os.path.join(wheel_dir, "*.whl"))
     assert 1 == len(wheels)
     assert_expected_dist(Distribution.load(wheels[0]))

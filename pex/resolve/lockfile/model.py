@@ -7,7 +7,7 @@ import os
 
 from pex.dist_metadata import Requirement
 from pex.orderedset import OrderedSet
-from pex.pip.version import PipVersionValue
+from pex.pip.version import PipVersion, PipVersionValue
 from pex.requirements import LocalProjectRequirement
 from pex.resolve.locked_resolve import LocalProjectArtifact, LockedResolve, LockStyle, TargetSystem
 from pex.resolve.resolved_requirement import Pin
@@ -34,8 +34,6 @@ class Lockfile(object):
         style,  # type: LockStyle.Value
         requires_python,  # type: Iterable[str]
         target_systems,  # type: Iterable[TargetSystem.Value]
-        pip_version,  # type: PipVersionValue
-        resolver_version,  # type: ResolverVersion.Value
         requirements,  # type: Iterable[Union[Requirement, ParsedRequirement]]
         constraints,  # type: Iterable[Requirement]
         allow_prereleases,  # type: bool
@@ -47,6 +45,8 @@ class Lockfile(object):
         transitive,  # type: bool
         locked_resolves,  # type: Iterable[LockedResolve]
         source=None,  # type: Optional[str]
+        pip_version=None,  # type: Optional[PipVersionValue]
+        resolver_version=None,  # type: Optional[ResolverVersion.Value]
     ):
         # type: (...) -> Lockfile
 
@@ -88,13 +88,14 @@ class Lockfile(object):
 
         resolve_requirements = OrderedSet(extract_requirement(req) for req in requirements)
 
+        pip_ver = pip_version or PipVersion.DEFAULT
         return cls(
             pex_version=pex_version,
             style=style,
             requires_python=SortedTuple(requires_python),
             target_systems=SortedTuple(target_systems),
-            pip_version=pip_version,
-            resolver_version=resolver_version,
+            pip_version=pip_ver,
+            resolver_version=resolver_version or ResolverVersion.default(pip_ver),
             requirements=SortedTuple(resolve_requirements, key=str),
             constraints=SortedTuple(constraints, key=str),
             allow_prereleases=allow_prereleases,

@@ -15,7 +15,6 @@ from pex.cli.testing import run_pex3
 from pex.dist_metadata import Requirement
 from pex.pep_440 import Version
 from pex.pep_503 import ProjectName
-from pex.pip.version import PipVersion
 from pex.resolve.configured_resolver import ConfiguredResolver
 from pex.resolve.locked_resolve import LockedRequirement
 from pex.resolve.lockfile import json_codec
@@ -71,7 +70,6 @@ def build_sdist(tmpdir):
             pep_517.build_sdist(
                 project_directory=project_directory,
                 dist_dir=find_links,
-                pip_version=PipVersion.VENDORED,
                 target=LocalInterpreter.create(),
                 resolver=ConfiguredResolver.default(),
             )
@@ -140,7 +138,7 @@ def test_lock_uncompilable_sdist(
         lock,
         env=make_env(
             SETUP_KWARGS_JSON=json.dumps(
-                dict(install_requires=["ansicolors==1.1.8"], python_requires=">=3.5,<3.12")
+                dict(install_requires=["ansicolors==1.1.8"], python_requires=">=3.5")
             )
         ),
     ).assert_success()
@@ -154,7 +152,7 @@ def test_lock_uncompilable_sdist(
     }  # type: Dict[ProjectName, LockedRequirement]
     bad = locked_requirements.pop(ProjectName("pex.tests.bad-c-extension"))
     assert Version("0.1.0+test") == bad.pin.version
-    assert SpecifierSet(">=3.5,<3.12") == bad.requires_python
+    assert SpecifierSet(">=3.5") == bad.requires_python
     assert SortedTuple([Requirement.parse("ansicolors==1.1.8")]) == bad.requires_dists
     assert locked_requirements.pop(ProjectName("ansicolors")) is not None
     assert not locked_requirements
