@@ -71,12 +71,14 @@ class PipVersionValue(Enum.Value):
         # type: () -> Iterable[str]
         return self.requirement, self.setuptools_requirement, self.wheel_requirement
 
-    def requires_python_applies(self, target):
-        # type: (Target) -> bool
+    def requires_python_applies(self, target=None):
+        # type: (Optional[Target]) -> bool
         if not self.requires_python:
             return True
 
-        return LocalInterpreter.create(target.get_interpreter()).requires_python_applies(
+        return LocalInterpreter.create(
+            interpreter=target.get_interpreter() if target else None
+        ).requires_python_applies(
             requires_python=self.requires_python,
             source=Requirement.parse(self.requirement),
         )
@@ -202,12 +204,10 @@ class PipVersion(Enum["PipVersionValue"]):
     )
 
     v23_2 = PipVersionValue(
-        version="23.2.dev0+ea727e4d",
-        requirement="pip @ git+https://github.com/pypa/pip@ea727e4d6ab598f34f97c50a22350febc1214a97",
+        version="23.2",
         setuptools_version="68.0.0",
         wheel_version="0.40.0",
         requires_python=">=3.7",
-        hidden=True,
     )
 
     VENDORED = v20_3_4_patched
