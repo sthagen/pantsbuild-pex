@@ -42,6 +42,13 @@ if TYPE_CHECKING:
     from typing import Dict, Optional
 
 
+# N.B.: __file__ will be relative when this module is loaded from a "" `sys.path` entry under
+# Python 2.7. This can occur in test scenarios; so we ensure the __file__ is resolved to an absolute
+# path here at import time before any cd'ing occurs in test code that might interfere with our
+# attempts to locate Pex files later below.
+_ABS_PEX_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 class CopyMode(Enum["CopyMode.Value"]):
     class Value(Enum.Value):
         pass
@@ -555,45 +562,48 @@ class PEXBuilder(object):
     def _prepare_bootstrap(self):
         from . import vendor
 
-        vendor.vendor_runtime(
-            chroot=self._chroot,
-            dest_basedir=self._pex_info.bootstrap,
-            label="bootstrap",
-            # NB: We use pip here in the builder, but that's only at buildtime and
-            # although we don't use pyparsing directly, packaging.markers, which we
-            # do use at runtime, does.
-            root_module_names=["attr", "packaging", "pkg_resources", "pyparsing"],
-        )
+        # NB: We use pip here in the builder, but that's only at build time, and
+        # although we don't use pyparsing directly, packaging.markers, which we
+        # do use at runtime, does.
+        root_module_names = ["attr", "packaging", "pkg_resources", "pyparsing"]
+        include_dist_info = set()
         if self._pex_info.includes_tools:
             # The `repository extract` tool needs setuptools and wheel to build sdists and wheels
             # and distutils needs .dist-info to discover setuptools (and wheel).
-            vendor.vendor_runtime(
-                chroot=self._chroot,
-                dest_basedir=self._pex_info.bootstrap,
-                label="bootstrap",
-                root_module_names=["setuptools", "wheel"],
-                include_dist_info=True,
-            )
+            for project in "setuptools", "wheel":
+                root_module_names.append(project)
+                include_dist_info.add(project)
+
+        prepared_sources = vendor.vendor_runtime(
+            chroot=self._chroot,
+            dest_basedir=self._pex_info.bootstrap,
+            label="bootstrap",
+            root_module_names=root_module_names,
+            include_dist_info=include_dist_info,
+        )
 
         bootstrap_digest = hashlib.sha1()
         bootstrap_packages = ["third_party", "venv"]
         if self._pex_info.includes_tools:
             bootstrap_packages.extend(["commands", "tools"])
-        package_root = os.path.dirname(__file__)
-        for root, dirs, files in os.walk(package_root):
-            if root == package_root:
+        for root, dirs, files in os.walk(_ABS_PEX_PACKAGE_DIR):
+            if root == _ABS_PEX_PACKAGE_DIR:
                 dirs[:] = bootstrap_packages
 
             for f in filter_pyc_files(files):
-                if f.endswith("testing.py"):
-                    continue
                 abs_src = os.path.join(root, f)
+                # N.B.: Some of the `pex.*` package files (__init__.py) will already have been
+                # prepared when vendoring the runtime above; so we skip them here.
+                if abs_src in prepared_sources:
+                    continue
                 with open(abs_src, "rb") as fp:
                     data = fp.read()
                 self._chroot.write(
                     data,
                     dst=os.path.join(
-                        self._pex_info.bootstrap, "pex", os.path.relpath(abs_src, package_root)
+                        self._pex_info.bootstrap,
+                        "pex",
+                        os.path.relpath(abs_src, _ABS_PEX_PACKAGE_DIR),
                     ),
                     label="bootstrap",
                 )
