@@ -60,8 +60,8 @@ jobs:
           - py311-pip20
           - py311-pip22_3_1
           - py311-pip23_1_2
-          - py312-pip23_3_2
-          - py313-pip24_0
+          - py312-pip24_0
+          - py313-pip24_0_patched
           - pypy310-pip20
           - pypy310-pip22_3_1
           - pypy310-pip23_1_2
@@ -71,12 +71,24 @@ jobs:
           - py311-pip20-integration
           - py311-pip22_3_1-integration
           - py311-pip23_1_2-integration
-          - py312-pip23_3_2-integration
-          - py313-pip24_0-integration
+          - py312-pip24_0-integration
+          - py313-pip24_0_patched-integration
           - pypy310-pip20-integration
           - pypy310-pip22_3_1-integration
           - pypy310-pip23_1_2-integration
     steps:
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true # ~14GB
+          dotnet: true # ~2GB
+          tool-cache: true # ~12GB
+
+          # Too little space savings or too slow.
+          haskell: false
+          large-packages: false
+          docker-images: false
+          swap-storage: false
       - name: Checkout Pex
         uses: actions/checkout@v3
         with:
@@ -104,10 +116,10 @@ jobs:
       matrix:
         include:
           - python-version: [ 3, 12 ]
-            tox-env: py312-pip23_3_2
+            tox-env: py312-pip24_0
             tox-env-python: python3.11
           - python-version: [ 3, 12 ]
-            tox-env: py312-pip23_3_2-integration
+            tox-env: py312-pip24_0-integration
             tox-env-python: python3.11
     steps:
       - name: Calculate Pythons to Expose
