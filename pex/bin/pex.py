@@ -27,6 +27,7 @@ from pex.common import die, is_pyc_dir, is_pyc_file, safe_mkdtemp
 from pex.dependency_manager import DependencyManager
 from pex.docs.command import serve_html_docs
 from pex.enum import Enum
+from pex.exclude_configuration import ExcludeConfiguration
 from pex.inherit_path import InheritPath
 from pex.interpreter_constraints import InterpreterConstraints
 from pex.layout import Layout, ensure_installed
@@ -513,6 +514,18 @@ def configure_clp_pex_entry_points(parser):
             self.default.extend(shlex.split(value))
 
     group.add_argument(
+        "--inject-python-args",
+        dest="inject_python_args",
+        default=[],
+        action=InjectArgAction,
+        help=(
+            "Command line arguments to the Python interpreter to freeze in. For example, `-u` to "
+            "disable buffering of `sys.stdout` and `sys.stderr` or `-W <arg>` to control Python "
+            "warnings."
+        ),
+    )
+
+    group.add_argument(
         "--inject-args",
         dest="inject_args",
         default=[],
@@ -867,6 +880,7 @@ def build_pex(
             seen.add((src, dst))
 
     pex_info = pex_builder.info
+    pex_info.inject_python_args = options.inject_python_args
     pex_info.inject_env = dict(options.inject_env)
     pex_info.inject_args = options.inject_args
     pex_info.venv = bool(options.venv)
@@ -897,6 +911,7 @@ def build_pex(
             )
             excluded.extend(requirements_pex_info.excluded)
 
+    exclude_configuration = ExcludeConfiguration.create(excluded)
     with TRACER.timed(
         "Resolving distributions for requirements: {}".format(
             " ".join(
@@ -922,13 +937,14 @@ def build_pex(
                         if options.pre_install_wheels
                         else InstallableType.WHEEL_FILE
                     ),
-                )
+                    exclude_configuration=exclude_configuration,
+                ),
             )
         except Unsatisfiable as e:
             die(str(e))
 
     with TRACER.timed("Configuring PEX dependencies"):
-        dependency_manager.configure(pex_builder, excluded=excluded)
+        dependency_manager.configure(pex_builder, exclude_configuration=exclude_configuration)
 
     if options.entry_point:
         pex_builder.set_entry_point(options.entry_point)
