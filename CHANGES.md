@@ -1,5 +1,26 @@
 # Release Notes
 
+## 2.6.2
+
+There are no changes to Pex code or released artifacts over 2.6.1, just
+a fix to the GitHub Releases release process which #2442 broke.
+
+* Fix GitHub Releases deployment. (#2444)
+
+## 2.6.1
+
+> [!NOTE]
+> Although 2.6.1 successfully released to [PyPI](
+> https://pypi.org/project/pex/2.6.1/), it failed to release to GitHub
+> Releases (neither the Pex PEX nor the pex.pdf were published.) You
+> can use Pex 2.6.2 instead which has no Pex code changes.
+
+This release improves error messages when attempting to read invalid
+metadata from distributions such that the problematic distribution is
+always identified.
+
+* Improve errors for invalid distribution metadata. (#2443)
+
 ## 2.6.0
 
 This release adds support for [PEP-723](
@@ -9,7 +30,7 @@ requirements, running the script is as simple as
 `pex --exe <script> -- <script args>` and building a PEX encapsulating
 it as simple as `pex --exe <script> --output <PEX file>`.
 
-*  Add support for PEP-723 script metadata to `--exe`. (#2436)
+* Add support for PEP-723 script metadata to `--exe`. (#2436)
 
 ## 2.5.0
 
