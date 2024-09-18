@@ -490,16 +490,14 @@ def run_simple_pex_test(
 
 def bootstrap_python_installer(dest):
     # type: (str) -> None
-    for _ in range(3):
+    for index in range(3):
         try:
-            subprocess.check_call(["git", "clone", "https://github.com/pyenv/pyenv.git", dest])
+            subprocess.check_call(args=["git", "clone", "https://github.com/pyenv/pyenv", dest])
+            return
         except subprocess.CalledProcessError as e:
-            print("caught exception: %r" % e)
+            print("Error cloning pyenv on attempt", index + 1, "of 3:", e, file=sys.stderr)
             continue
-        else:
-            break
-    else:
-        raise RuntimeError("Helper method could not clone pyenv from git after 3 tries")
+    raise RuntimeError("Could not clone pyenv from git after 3 tries.")
 
 
 # NB: We keep the pool of bootstrapped interpreters as small as possible to avoid timeouts in CI
@@ -508,7 +506,7 @@ def bootstrap_python_installer(dest):
 # minutes for a shard.
 # N.B.: Make sure to stick to versions that have binary releases for all supported platforms to
 # support use of pyenv-win which does not build from source, just running released installers
-# robotically instead.
+# instead.
 PY27 = "2.7.18"
 PY38 = "3.8.10"
 PY39 = "3.9.13"
@@ -539,22 +537,15 @@ def ensure_python_distribution(version):
 
     pip = os.path.join(interpreter_location, "bin", "pip")
 
-    with atomic_directory(target_dir=pyenv_root) as target_dir:
-        if not target_dir.is_finalized():
-            bootstrap_python_installer(target_dir.work_dir)
+    with atomic_directory(target_dir=pyenv_root) as pyenv_root_atomic_dir:
+        if not pyenv_root_atomic_dir.is_finalized():
+            bootstrap_python_installer(pyenv_root_atomic_dir.work_dir)
 
     with atomic_directory(target_dir=interpreter_location) as interpreter_target_dir:
         if not interpreter_target_dir.is_finalized():
-            subprocess.check_call(
-                [
-                    "git",
-                    "--git-dir={}".format(os.path.join(pyenv_root, ".git")),
-                    "--work-tree={}".format(pyenv_root),
-                    "reset",
-                    "--hard",
-                    "v2.3.8",
-                ]
-            )
+            with pyenv_root_atomic_dir.locked():
+                subprocess.check_call(args=["git", "pull", "--ff-only"], cwd=pyenv_root)
+
             env = pyenv_env.copy()
             if sys.platform.lower().startswith("linux"):
                 env["CONFIGURE_OPTS"] = "--enable-shared"
