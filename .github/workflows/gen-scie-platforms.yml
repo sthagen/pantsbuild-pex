@@ -2,10 +2,6 @@ name: Generate Pex Scie Complete Platforms
 on:
   workflow_dispatch:
     inputs:
-      dest-dir:
-        description: The directory to generate the complete platform files in.
-        default: package/complete-platforms
-        required: false
       pbs-release:
         description: The PBS release to use.
         required: true
@@ -42,7 +38,11 @@ jobs:
       - name: Checkout Pex
         uses: actions/checkout@v4
       - name: Generate Generate Script
+        id: generate
         run: |
+          dest_dir="$(mktemp -d)"
+          echo "dest-dir=${dest_dir}" >> "${GITHUB_OUTPUT}"
+
           cat << EOF > ./gen-scie-platform.sh
           #!/usr/bin/env bash
           python -m venv .venv
@@ -52,7 +52,7 @@ jobs:
           python -V
 
           tox -e gen-scie-platform -- \
-            -d "${{ github.event.inputs.dest-dir }}" \
+            -d "${dest_dir}" \
             --pbs-release ${{ github.event.inputs.pbs-release }} \
             --python-version ${{ github.event.inputs.python-version }}
           EOF
@@ -67,6 +67,7 @@ jobs:
         run: |
           docker run \
             --rm \
+            -v "${{ steps.generate.outputs.dest-dir }}:${{ steps.generate.outputs.dest-dir }}" \
             -v $PWD:/code \
             -w /code \
             --platform linux/${{ matrix.docker-arch }} \
@@ -83,4 +84,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: complete-platform-${{ matrix.artifact-name }}
-          path: ${{ github.event.inputs.dest-dir }}/*
+          path: ${{ steps.generate.outputs.dest-dir }}/*
