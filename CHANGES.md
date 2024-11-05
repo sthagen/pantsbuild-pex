@@ -1,5 +1,27 @@
 # Release Notes
 
+## 2.24.1
+
+This release fixes `pex3 cache prune` handling of cached Pips.
+Previously, performing a `pex3 cache prune` would bump the last access
+time of all un-pruned cached Pips artificially. If you ran
+`pex3 cache prune` in a daily or weekly cron job, this would mean Pips
+would never be pruned.
+
+* Fix `pex3 cache prune` handling of cached Pips. (#2589)
+
+## 2.24.0
+
+This release adds `pex3 cache prune` as a likely more useful Pex cache
+management command than the existing `pex3 cache purge`. By default
+`pex3 cache prune` prunes any cached items not used for the last 2
+weeks and is likely suitable for use as a daily cron job to keep Pex
+cache sizes down. The default age of 2 weeks can be overridden by
+specifying `--older-than "1 week"` or `--last-access-before 14/3/2024`,
+etc. See `pex3 cache prune --help` for more details.
+
+* Support `pex3 cache prune --older-than ...`. (#2586)
+
 ## 2.23.0
 
 This release adds support for drawing requirements from
