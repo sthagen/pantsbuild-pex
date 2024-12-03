@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2.24.3
+
+This release fixes a long-standing bug in resolve checking. Previously,
+only resolve dependency chains where checked, but not the resolved
+distributions that satisfied the input root requirements.
+
+In addition, the 2.24.2 release included a wheel with no compression
+(~11MB instead of ~3.5MB). The Pex wheel is now fixed to be compressed.
+
+* Fix resolve check to cover dists satisfying root reqs. (#2610)
+* Fix build process to produce a compressed `.whl`. (#2609)
+
+## 2.24.2
+
+This release fixes a long-standing bug in "YOLO-mode" foreign platform
+speculative wheel builds. Previously if the speculatively built wheel
+had tags that did not match the foreign platform, the process errored
+pre-emptively. This was correct for complete foreign platforms, where 
+all tag information is known, but not for all cases of abbreviated
+platforms, where the failure was overly aggressive in some cases. Now
+foreign abbreviated platform speculative builds are only rejected when
+there is enough information to be sure the speculatively built wheel
+definitely cannot work on the foreign abbreviated platform.
+
+* Accept more foreign `--platform` "YOLO-mode" wheels. (#2607)
+
 ## 2.24.1
 
 This release fixes `pex3 cache prune` handling of cached Pips.
