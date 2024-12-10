@@ -1,5 +1,21 @@
 # Release Notes
 
+## 2.25.1
+
+This is a hotfix release that fixes a bug in the implementation of the
+`--elide-unused-requires-dist` lock option introduced in Pex 2.25.0.
+
+* Fix `--elide-unused-requires-dist` for unactivated deps. (#2615)
+## 2.25.0
+
+This release adds support for
+`pex3 lock {create,sync} --elide-unused-requires-dist`. This new lock
+option causes any dependencies of a locked requirement that can never
+be activated to be elided from the lock file. This leads to no material
+difference in lock file use, but it does cut down on the lock file size.
+
+* Add `--elide-unused-requires-dist` lock option. (#2613)
+
 ## 2.24.3
 
 This release fixes a long-standing bug in resolve checking. Previously,
