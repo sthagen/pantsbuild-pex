@@ -3,7 +3,6 @@
 
 import os
 import shutil
-import subprocess
 import sys
 from textwrap import dedent
 
@@ -25,7 +24,7 @@ from pex.pex_bootstrapper import (
 from pex.pex_builder import PEXBuilder
 from pex.typing import TYPE_CHECKING
 from pex.variables import ENV
-from testing import PY38, PY39, PY310, ensure_python_interpreter
+from testing import PY38, PY39, PY310, ensure_python_interpreter, subprocess
 
 if TYPE_CHECKING:
     from typing import Any, Iterable, List, Optional
@@ -278,7 +277,7 @@ def test_pp_exact_on_ppp():
 
     with ENV.patch(
         PEX_PYTHON=py310,
-        PEX_PYTHON_PATH=":".join(os.path.dirname(py) for py in (py38, py39, py310)),
+        PEX_PYTHON_PATH=os.pathsep.join(os.path.dirname(py) for py in (py38, py39, py310)),
     ):
         assert PythonInterpreter.from_binary(py310) == find_compatible_interpreter()
 
@@ -325,7 +324,8 @@ def test_pp_exact_not_on_ppp():
     py310 = ensure_python_interpreter(PY310)
 
     with ENV.patch(
-        PEX_PYTHON=py310, PEX_PYTHON_PATH=":".join(os.path.dirname(py) for py in (py38, py39))
+        PEX_PYTHON=py310,
+        PEX_PYTHON_PATH=os.pathsep.join(os.path.dirname(py) for py in (py38, py39)),
     ):
         with pytest.raises(
             UnsatisfiableInterpreterConstraintsError,

@@ -3,14 +3,13 @@
 
 import json
 import os
-import subprocess
 from textwrap import dedent
 
 import pytest
 
 from pex.common import safe_open
 from pex.typing import TYPE_CHECKING
-from testing import make_env, run_pex_command
+from testing import make_env, run_pex_command, subprocess
 
 if TYPE_CHECKING:
     from typing import Any, List
@@ -36,6 +35,7 @@ def test_venv_pex_script_non_hermetic(
             dedent(
                 """\
                 import os
+                import subprocess
                 import sys
 
                 def run():
@@ -45,7 +45,7 @@ def test_venv_pex_script_non_hermetic(
                         pythonpath.extend(existing_pythonpath.split(os.pathsep))
                     os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath)
 
-                    os.execv(sys.argv[1], sys.argv[1:])
+                    sys.exit(subprocess.call(sys.argv[1:]))
                 """
             )
         )
