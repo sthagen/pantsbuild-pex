@@ -1,5 +1,27 @@
 # Release Notes
 
+## 2.42.0
+
+This release expands `--platform` support to Windows. Windows is still not officially
+supported though!
+
+* Add `--platform` support for Windows. (#2794)
+
+## 2.41.1
+
+This release fixes `pex3 download` to require a `-d` / `--dest-dir` be set.
+
+* Require `--dest-dir` is set for `pex3 download`. (#2793)
+
+## 2.41.0
+
+This release adds support for `pex3 download [ --lock | --pylock ] [requirements args] ...`. This
+allows downloading distributions that satisfy a resolve directly or through a lock. Foreign targets
+via `--platform` and `--complete-platform` are supported as well as sub-setting when a lock is
+used.
+
+* Add `pex3 download`. (#2791)
+
 ## 2.40.3
 
 This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2025.6.15.
