@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2.46.2
+
+This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2025.7.14 and
+fixes the default scie base when `--runtime-pex-root` is used to be a `pex3 cache` managed
+directory.
+
+* Update vendored Pip's CA cert bundle. (#2831)
+* Re-organize default `--runtime-pex-root` scie base. (#2830)
+
+## 2.46.1
+
+This release follows up on 2.45.3 to ensure `--venv` PEXes also participate in temporary `PEX_ROOT`
+cleanup. Previously these leaked the temporary `PEX_ROOT`.
+
+* Fix `--venv` PEXes to clean fallback `PEX_ROOT`. (#2826)
+
+## 2.46.0
+
+This release adds support for setting a custom `--scie-base` when building PEX scies. The default
+scie base is the same as used by the scie-jump natively; e.g. `~/.cache/nce` on Linux. When
+specifying a custom `--runtime-pex-root`, the scie base now will live under it in the `scie-base`
+directory. To specify a custom scie base, `--scie-base` can be used, and it will trump all these
+defaults.
+
+* Add `--scie-base` to control the PEX scie cache dir. (#2828)
+
 ## 2.45.3
 
 This release fixes a bug introduced in 2.45.2 by #2820 that would cause a temporary `PEX_ROOT` (
