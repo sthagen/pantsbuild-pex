@@ -1,5 +1,32 @@
 # Release Notes
 
+## 2.48.2
+
+This release brings a fix for Pex entry-point parsing. Previously, entry-points specifying an extra
+like `blackd = blackd:patched_main [d]` would be parsed as having the extra as part of the module or
+object reference leading to errors when executing the entry point.
+
+* Fix Pex entry-point parsing. (#2846)
+
+## 2.48.1
+
+This release fixes the failure mode of `pex3 run --locked require`. Previously, subsequent runs
+with `--locked auto` would not fall back to using no lock, but instead error with a malformed venv
+from the failed run prior.
+
+* Fix `pex3 run --locked require` failure mode. (#2843)
+
+## 2.48.0
+
+This release adds support for `pex3 run` akin to `pipx run` and `uvx`. By default,
+`pex3 run <tool>` will look for an embedded [PEP-751 `pylock.toml`][PEP-751] in the wheel or sdist
+`<tool>` is resolved from and, if found, use that lock to create the tool venv from. More
+information is available in the `pex3 run --help` output for the `--locked` option. See the thread
+here for the embedded lock idea and ongoing discussion:
+https://discuss.python.org/t/pre-pep-add-ability-to-install-a-package-with-reproducible-dependencies
+
+* Add `pex3 run`. (#2841)
+
 ## 2.47.0
 
 Support for Python PI. Pex started testing against Python 3.14 on October 26th, 2024 and now

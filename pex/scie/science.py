@@ -66,7 +66,7 @@ class Manifest(object):
 
 
 SCIENCE_RELEASES_URL = "https://github.com/a-scie/lift/releases"
-MIN_SCIENCE_VERSION = Version("0.12.4")
+MIN_SCIENCE_VERSION = Version("0.12.8")
 SCIENCE_REQUIREMENT = SpecifierSet("~={min_version}".format(min_version=MIN_SCIENCE_VERSION))
 
 
@@ -125,7 +125,9 @@ def create_manifests(
         # type: (SysPlatform.Value) -> Iterator[Dict[str, Any]]
         entrypoints = configuration.options.busybox_entrypoints
         if entrypoints:
-            pex_entry_point = parse_entry_point(pex_info.entry_point)
+            pex_entry_point = (
+                parse_entry_point(pex_info.entry_point) if pex_info.entry_point else None
+            )
 
             def default_env(named_entry_point):
                 # type: (...) -> Dict[str, str]
