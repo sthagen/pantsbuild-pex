@@ -1,5 +1,26 @@
 # Release Notes
 
+## 2.50.1
+
+This release fixes `pex3 run` handling of local project directory requirements. For example, you
+can now `pex3 run . -V` in the Pex project directory successfully.
+
+* Fix `pex3 run` for local projects. (#2854)
+
+## 2.50.0
+
+This release introduces the `pex.build_backend.wrap` build backend useable for embedding console
+script locks in your project distributions for use by tools like `pex3 run` (see: #2841). Pex
+dogfoods this backend to embed its own console script lock for its extras.
+
+* Introduce `pex.build_backend.wrap` build backend. (#2850)
+
+## 2.49.0
+
+This release adds support for `--pip-version 25.2`
+
+* Add support for `--pip-version 25.2`. (#2849)
+
 ## 2.48.2
 
 This release brings a fix for Pex entry-point parsing. Previously, entry-points specifying an extra
