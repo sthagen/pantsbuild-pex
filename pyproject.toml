@@ -2,7 +2,7 @@
 # N.B.: We use `setup.cfg` for declarative metadata instead of `[project]` here since support for
 # pyproject.toml projects was introduced in setuptools 61.0.0 which only supports Python>=3.7. We
 # need to also support 2.7, 3.5 and 3.6.
-requires = ["setuptools"]
+requires = ["setuptools", "uv"]
 backend-path = ["build-backend", ""]
 build-backend = "pex_build.setuptools.build"
 
@@ -272,8 +272,11 @@ dependency-group = "gen-scie-platform"
 hidden = true
 [tool.dev-cmd.commands.gen-scie-platform.env]
 PYTHONPATH = "."
-# Used to get wheels for armv7l.
-PIP_EXTRA_INDEX_URL = "https://www.piwheels.org/simple"
+# Used to get wheels for armv7l and riscv64.
+PIP_EXTRA_INDEX_URL = """\
+    https://www.piwheels.org/simple \
+    https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple \
+"""
 
 [tool.dev-cmd.commands.lint]
 description = "Currently removes unused imports and code."
@@ -390,7 +393,7 @@ default = "checks"
 exit-style = "immediate"
 
 [[tool.dev-cmd.python]]
-when = "python_version >= '3.7' and python_version < '3.15' and platform_machine != 'armv7l'"
+when = "python_version >= '3.7' and python_version < '3.15' and platform_machine != 'armv7l' and platform_machine != 'riscv64'"
 
 # Suppress pyproject cache keys since uv.lock is enough to uniquely determine venv content.
 pyproject-cache-keys = []
@@ -411,7 +414,7 @@ extra-requirements = [
 ]
 
 [[tool.dev-cmd.python]]
-when = "python_version < '3.7' and platform_machine != 'armv7l'"
+when = "python_version < '3.7' and platform_machine != 'armv7l' and platform_machine != 'riscv64'"
 
 extra-requirements = [
   "attrs @ git+https://github.com/python-attrs/attrs@947bfb542104209a587280701d8cb389c813459d",
@@ -421,13 +424,14 @@ extra-requirements = [
 finalize-command = ["{venv-python}", "scripts/dev-cmd-fix-egg-link.py", "{venv-site-packages}"]
 
 [[tool.dev-cmd.python]]
-when = "platform_machine == 'armv7l'"
+when = "platform_machine == 'armv7l' or platform_machine == 'riscv64'"
 
 3rdparty-export-command = [
   "uv", "export", "-q",
   "--no-emit-project",
-  # We get some wheels from https://www.piwheels.org/simple but uv does not have hashes for those;
-  # so we just accept the pins.
+  # We get some wheels from https://www.piwheels.org/simple and
+  # https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple
+  # but uv does not have hashes for those; so we just accept the pins.
   "--no-hashes",
   "--only-group", "{dependency-group:dev}",
   "-o", "{requirements.txt}"

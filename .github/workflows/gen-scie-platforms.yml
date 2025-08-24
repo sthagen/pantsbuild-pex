@@ -28,6 +28,10 @@ jobs:
             os: ubuntu-24.04
             docker-arch: arm/v7
             artifact-name: linux-armv7l
+          - platform: Linux riscv64
+            os: ubuntu-24.04
+            docker-arch: riscv64
+            artifact-name: linux-riscv64
           - platform: macOS x86_64
             os: macos-x86_64
             artifact-name: macos-x86_64
@@ -48,15 +52,28 @@ jobs:
           #!/usr/bin/env bash
           python -m venv .venv
           source .venv/bin/activate
+          python -V
           pip install -U pip
 
           if [[ "arm/v7" == "${{ matrix.docker-arch }}" ]]; then
             export PIP_EXTRA_INDEX_URL=https://www.piwheels.org/simple
+          elif [[ "riscv64" == "${{ matrix.docker-arch }}" ]]; then
+            export PIP_EXTRA_INDEX_URL=https://__pat_na__:${{ secrets.GITLAB_READ_PASS }}@gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple
           fi
-          pip install uv dev-cmd[old-pythons]
-          python -V
+          pip install uv
+          if ! uv python find 3.11; then
+            uv python install 3.11
+          fi
 
-          dev-cmd --py 311 gen-scie-platform -- \
+          # N.B.: We install Pex 1st from sources to ensure the current local Pex code powers
+          # dev-cmd[old-pythons].
+          pip install .
+
+          # N.B.: We install and run dev-cmd directly in order to be able to resolve from the
+          # custom indexes above and avoid wheel builds.
+          pip install dev-cmd[old-pythons]
+
+          dev-cmd --py "\$(uv python find 3.11)" gen-scie-platform -- \
             -d "${dest_dir}" \
             --no-sync-lock \
             --encoded-scie-config ${{ github.event.inputs.encoded-scie-config }}
@@ -64,11 +81,11 @@ jobs:
           chmod +x ./gen-scie-platform.sh
       - name: Setup Docker QEMU Emulation
         uses: docker/setup-qemu-action@v3
-        if: ${{ matrix.docker-arch }}
+        if: matrix.docker-arch != ''
         with:
           platforms: linux/${{ matrix.docker-arch }}
       - name: Generate Complete Platform
-        if: ${{ matrix.docker-arch }}
+        if: matrix.docker-arch != '' && matrix.docker-arch != 'riscv64'
         run: |
           docker run \
             --rm \
@@ -77,13 +94,36 @@ jobs:
             -w /code \
             --platform linux/${{ matrix.docker-arch }} \
             python:3.11-bookworm bash ./gen-scie-platform.sh
+      - name: Generate Complete Platform
+        if: matrix.docker-arch == 'riscv64'
+        run: |
+          docker run \
+            --rm \
+            -v "${{ steps.generate.outputs.dest-dir }}:${{ steps.generate.outputs.dest-dir }}" \
+            -v $PWD:/code \
+            -w /code \
+            --platform linux/${{ matrix.docker-arch }} \
+            debian:trixie bash -c "
+              apt update && \
+              apt install -y \
+                build-essential \
+                cargo \
+                git \
+                libffi-dev \
+                libssl-dev \
+                pkg-config \
+                python3-dev \
+                python3-venv \
+                python-is-python3 && \
+              ./gen-scie-platform.sh
+            "
       - name: Setup Python 3.11
-        if: ${{ ! matrix.docker-arch }}
+        if: matrix.docker-arch == ''
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Generate Complete Platform
-        if: ${{ ! matrix.docker-arch }}
+        if: matrix.docker-arch == ''
         run: ./gen-scie-platform.sh
       - name: Upload Complete Platform File Artifact
         uses: actions/upload-artifact@v4

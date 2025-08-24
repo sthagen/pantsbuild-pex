@@ -47,6 +47,8 @@ class _CurrentPlatform(object):
                     self._current = SysPlatform.LINUX_ARMV7L
                 elif machine == "ppc64le":
                     self._current = SysPlatform.LINUX_PPC64LE
+                elif machine == "riscv64":
+                    self._current = SysPlatform.LINUX_RISCV64
                 elif machine == "s390x":
                     self._current = SysPlatform.LINUX_S390X
                 elif machine in ("amd64", "x86_64"):
@@ -112,6 +114,7 @@ class SysPlatform(Enum["SysPlatform.Value"]):
     LINUX_AARCH64 = Value(Os.LINUX, "aarch64")
     LINUX_ARMV7L = Value(Os.LINUX, "armv7l")
     LINUX_PPC64LE = Value(Os.LINUX, "powerpc64")
+    LINUX_RISCV64 = Value(Os.LINUX, "riscv64")
     LINUX_S390X = Value(Os.LINUX, "s390x")
     LINUX_X86_64 = Value(Os.LINUX, "x86_64")
     MACOS_AARCH64 = Value(Os.MACOS, "aarch64")
