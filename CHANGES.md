@@ -1,5 +1,20 @@
 # Release Notes
 
+## 2.71.1
+
+This release fixes Pex to allow blanket disallowing builds but making targeted exceptions and
+vice-versa. The underlying Pip machinery has always supported this, but Pex just got in the way for
+no reason.
+
+* Allow exceptions for `--no-wheel` & `--no-build`. (#3023)
+
+## 2.71.0
+
+This release upgrades the floor of `science` to 0.16.0 to pick up support for generating PEX scies
+for musl Linux aarch64.
+
+* Upgrade `science` to 0.16.0. (#3020)
+
 ## 2.70.0
 
 This release adds a feature for Pex developers. If you want to experiment with a new version of Pip
