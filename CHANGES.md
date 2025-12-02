@@ -1,5 +1,33 @@
 # Release Notes
 
+## 2.73.1
+
+This release fixes `--lock` and `--pylock` subsetting of direct reference and VCS requirements.
+Previously, just the project name was matched when subsetting but now the normalized URL is matched.
+The previous behavior could lead to subsets succeeding that should have otherwise failed. The new
+behavior can lead to a subset failing when URLs differ, but both URLs point to the same content.
+Although this too is a bug, it should be a much narrower use case in the wild; so this should be an
+improvement.
+
+* Fix URL requirement `--lock` & `--pylock` subsetting. (#3034)
+
+## 2.73.0
+
+This release upgrades the floor of `science` to 0.17.0 and `scie-jump` to 1.9.1 to pick up support
+for producing PEX scies for Linux aarch64 & x86_64 that link against glibc. Previously the embedded
+interpreter would link against glibc but the `scie-jump` at the PEX scie tip was a musl libc static
+binary and this could cause problems in those areas where glibc and musl diverge.
+
+* Upgrade science to 0.17.0 & scie-jump to 1.9.1. (#3033)
+
+## 2.72.2
+
+This release fixes a regression introduced in the Pex 2.60.0 release when installing wheels with
+`*.data/` entries whose top-level name matches a top-level package in the wheel. This regression
+only affected default `--venv` mode PEXes which populate site-packages using symlinks.
+
+* Fix `--venv` (using symlinks) for some wheels. (#3031)
+
 ## 2.72.1
 
 This release fixes Pex lock resolves (`--lock` and `--pylock`) to allow exceptions for `--no-wheel`
