@@ -19,6 +19,10 @@ function run_dev_cmd() {
   fi
 }
 
+if [[ -f "${ENV_FILE:-}" ]]; then
+  source "${ENV_FILE}"
+fi
+
 export _PEX_TEST_DEV_ROOT="$1"
 echo "Starting ${_PEX_TEST_DEV_ROOT} cache size:"
 du -sh "${_PEX_TEST_DEV_ROOT}"/* 2>/dev/null || echo "Empty."

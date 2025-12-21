@@ -16,8 +16,9 @@ import sys
 from argparse import Action, ArgumentDefaultsHelpFormatter, ArgumentError, ArgumentParser
 from textwrap import TextWrapper
 
-from pex import dependency_configuration, pex_warnings, repl, scie
+from pex import build_properties, dependency_configuration, pex_warnings, repl, scie
 from pex.argparse import HandleBoolAction
+from pex.build_properties import BuildProperties
 from pex.commands.command import (
     GlobalConfigurationError,
     global_environment,
@@ -38,7 +39,7 @@ from pex.orderedset import OrderedSet
 from pex.os import WINDOWS
 from pex.pep_427 import InstallableType
 from pex.pep_723 import ScriptMetadata
-from pex.pex import PEX
+from pex.pex import PEX, validate_entry_point
 from pex.pex_bootstrapper import ensure_venv
 from pex.pex_builder import Check, PEXBuilder
 from pex.pex_info import PexInfo
@@ -166,6 +167,8 @@ def configure_clp_pex_options(parser):
         "PEX output options",
         "Tailor the behavior of the emitted .pex file if -o is specified.",
     )
+
+    build_properties.register_options(group)
 
     group.add_argument(
         "--include-tools",
@@ -1004,6 +1007,7 @@ def build_pex(
     pex_info.interpreter_constraints = interpreter_constraints
     pex_info.deps_are_wheel_files = not options.pre_install_wheels
     pex_info.max_install_jobs = options.max_install_jobs
+    pex_info.build_properties = BuildProperties.from_options(options)
 
     dependency_config = dependency_configuration.configure(options)
     if dependency_config.overridden and isinstance(
@@ -1320,6 +1324,11 @@ def do_main(
     cmdline,  # type: List[str]
     env,  # type: Dict[str, str]
 ):
+    if options.validate_ep and not options.entry_point:
+        raise ValueError(
+            "You requested `--validate-entry-point` but specified no `--entry-point` to validate."
+        )
+
     scie_options = scie.extract_options(options)
     if scie_options and not options.pex_name:
         raise ValueError(
@@ -1355,8 +1364,9 @@ def do_main(
     pex = PEX(
         pex_builder.path(),
         interpreter=interpreter,
-        verify_entry_point=options.validate_ep,
     )
+    if options.validate_ep and options.entry_point:
+        validate_entry_point(pex, options.entry_point)
 
     pex_file = options.pex_name
     if pex_file is not None:

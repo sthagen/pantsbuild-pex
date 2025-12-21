@@ -1,5 +1,39 @@
 # Release Notes
 
+## 2.75.0
+
+This release adds supoort for `--scie-load-dotenv` to enable `.env` file loading in PEX scies.
+
+* Support scie-jump `.env` loading with `--scie-load-dotenv`. (#3046)
+
+## 2.74.3
+
+This release fixes a bug gracefully handling a request for `--validate-entry-point` when no
+`--entry-point` was given.
+
+* Error for missing entry point under `--validate-entry-point`. (#3048)
+
+## 2.74.2
+
+This release fixes building PEXes from direct URL requirements. Previously, the direct URL
+requirement would be recorded incorrectly in PEX-INFO metadata leading to a failure to boot.
+
+* Fix `str(req)` of direct URLs with known versions. (#3043)
+
+## 2.74.1
+
+This release upgrades the floor of `science` to 0.17.1 and `scie-jump` to 1.9.2 to fix a regression
+in the breadth of Linux platforms `--scie {eager,lazy}` PEX scies were compatible with.
+
+* Upgrade science to 0.17.1 & scie-jump to 1.9.2. (#3038)
+
+## 2.74.0
+
+This release adds support for setting custom PEX-INFO `build_properties` metadata via
+`--build-property`, `--build-properties` and `--record-git-state`.
+
+* Support custom PEX-INFO `build_properties`. (#3036)
+
 ## 2.73.1
 
 This release fixes `--lock` and `--pylock` subsetting of direct reference and VCS requirements.
