@@ -1,5 +1,35 @@
 # Release Notes
 
+## 2.76.1
+
+This release fixes bootstrapping of Pips specified via `--pip-version` to respect Pex Pip
+configuration options (like custom indexes) under Python 3.12 and newer.
+
+* Fix Pip bootstrap to respect Pip config for Python >= 3.12. (#3054)
+
+## 2.76.0
+
+This release adds support for `--no-scie-pex-entrypoint-env-passthrough` to trigger direct execution
+of `--venv` PEX scie script entrypoints. This performance optimization mirrors the existing default
+`--no-scie-busybox-pex-entrypoint-env-passthrough` for busybox scies, but must be selected by 
+passing `--no-scie-pex-entrypoint-env-passthrough` explicitly. In addition, the `VIRTUAL_ENV` env
+var is now guaranteed to be set for all `--venv` PEX scies.
+
+* Add scie support for direct exec of venv scripts. (#3053)
+
+## 2.75.2
+
+This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2025.11.12.
+
+* Update vendored Pip's CA cert bundle. (#3052)
+
+## 2.75.1
+
+This release fixes Pex handling of wheels with bad RECORDs that record files that do not exist in
+the `.whl` file.
+
+* Warn when non-existent files in RECORD, but proceed. (#3051)
+
 ## 2.75.0
 
 This release adds supoort for `--scie-load-dotenv` to enable `.env` file loading in PEX scies.
