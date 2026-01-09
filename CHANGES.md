@@ -1,11 +1,24 @@
 # Release Notes
 
+## 2.77.3
+
+This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2026.1.4.
+
+* Update vendored Pip's CA cert bundle. (#3065)
+
+## 2.77.2
+
+This release fixes venv creation from PEXes to avoid declaring false collisions in `__init__.py`
+files when the venv uses Python 3.9 or greater.
+
+* Compare ASTs of colliding venv `__init__.py`. (#3063)
+
 ## 2.77.1
 
 This release fixes a very old bug where the Pex PEX (or any other PEX created with
 `--no-strip-pex-env`) would, in fact, strip `PEX_PYTHON` and `PEX_PYTHON_PATH`.
 
-* Fix `PEX_PYTHON{,_PATH}` stripping on Pex re-exec. (#3063)
+* Fix `PEX_PYTHON{,_PATH}` stripping on Pex re-exec. (#3062)
 
 ## 2.77.0
 
