@@ -1,5 +1,22 @@
 # Release Notes
 
+## 2.79.0
+
+This release adds the `CPython[free-threaded]` alias for `CPython+t` and the `CPython[gil]` alias
+fo `CPython-t` when writing interpreter constraints.
+
+* Add `CPython[{free-threaded,gil}]` aliases for `CPython{+,-}t`. #(3068)
+
+## 2.78.0
+
+This release adds support for the `CPython+t` implementation name in interpreter constraints to
+allow constraining selected interpreters to CPython interpreters built with free-threading support.
+The existing `CPython` implementation selects from either classic GIL enabled `CPython` interpreters
+or CPython free-threaded interpreters as was the case previously. The `CPython-t` implementation
+name can be used to require classic GIL-only CPython interpreters.
+-
+* Support `CPython+t` in ICs to select free-threaded CPython. (#3067)
+
 ## 2.77.3
 
 This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2026.1.4.
