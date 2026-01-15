@@ -1,5 +1,29 @@
 # Release Notes
 
+## 2.82.0
+
+This release adds support for resource path bindings to plain PEXes as a follow-on to adding
+resource binding support for PEX scies in the 2.81.0 release. Resource paths are bound to
+environment variables with `--bind-resource-path`. Additionally, the existing `--inject-args` option
+now supports replacement of `{pex.env.<env var name>}` placeholders with the corresponding
+environment variable value. Notably, the combination of these features allows passing the paths of
+files contained in a PEX to third party scripts without extra shim code.
+
+* Support passing PEX file paths to 3rd party scripts.  (#3074)
+
+## 2.81.0
+
+This release adds the ability to set a custom scie entrypoint for PEX scies using `--scie-exe`,
+`--scie-args` and `--scie-env`, as well as bind resource paths to environment variables using
+`--scie-bind-resource-path`. The combination of these new features allows broad flexibility
+defining a PEX scie's boot command.
+
+Additionally, the `pex3 scie create` command gains the ability to use a URL for the PEX to convert
+to a scie and optionally specify a size (via `#size=<expected size>`) and / or fingerprint (via
+`#<algorithm>=<expected fingerprint>`) to verify the download against.
+
+* Support converting existing Pants PEXes to performant scies. (#3072)
+
 ## 2.80.0
 
 This release adds the `pex3 scie create` tool for creating scies from existing PEX files. This
