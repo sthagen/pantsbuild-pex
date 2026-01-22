@@ -16,7 +16,6 @@ from pex.common import safe_open
 from pex.dist_metadata import Requirement
 from pex.resolve import project
 from pex.typing import cast
-from testing import pushd
 from testing.pytest_utils.tmp import Tempdir
 
 
@@ -78,10 +77,9 @@ def parse_args(
     cwd=None,  # type: Optional[str]
 ):
     # type: (...) -> Namespace
-    with pushd(cwd or os.getcwd()):
-        parser = ArgumentParser()
-        project.register_options(parser, project_help="test")
-        return parser.parse_args(args=args)
+    parser = ArgumentParser()
+    project.register_options(parser, project_help="test", cwd=cwd)
+    return parser.parse_args(args=args)
 
 
 def parse_groups(
@@ -177,8 +175,8 @@ def test_invalid_group_bad_req(project_dir1):
         ValueError,
         match=re.escape(
             "Invalid [dependency-group] entry 'bad-req'.\n"
-            "Item 1: 'meaning-of-life=42', is an invalid dependency specifier: Expected end or "
-            "semicolon (after name and no valid version specifier)\n"
+            "Item 1: 'meaning-of-life=42', is an invalid dependency specifier: Expected semicolon "
+            "(after name with no version specifier) or end\n"
             "    meaning-of-life=42\n"
             "                   ^"
         ),

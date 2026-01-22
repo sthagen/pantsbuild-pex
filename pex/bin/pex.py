@@ -1015,6 +1015,7 @@ def build_pex(
     pex_info.pex_root = options.runtime_pex_root
     pex_info.strip_pex_env = options.strip_pex_env
     pex_info.interpreter_constraints = interpreter_constraints
+    pex_info.interpreter_selection_strategy = options.interpreter_selection_strategy
     pex_info.deps_are_wheel_files = not options.pre_install_wheels
     pex_info.max_install_jobs = options.max_install_jobs
     pex_info.build_properties = BuildProperties.from_options(options)
@@ -1447,7 +1448,7 @@ def do_main(
                 verbose=options.seed == Seed.VERBOSE,
             )
             print(seed_info)
-        else:
+        elif not scie_configuration or not scie_configuration.options.scie_only:
             print(pex_file)
 
         if scie_configuration:
@@ -1471,8 +1472,11 @@ def do_main(
                         pex_file
                     ) != os.path.realpath(scie_info.file):
                         os.unlink(pex_file)
-                    elif options.seed is Seed.NONE:
-                        print(os.path.relpath(scie_info.file))
+                    if options.seed is Seed.NONE:
+                        if os.getcwd() == commonpath((os.getcwd(), scie_info.file)):
+                            print(os.path.relpath(scie_info.file))
+                        else:
+                            print(scie_info.file)
     else:
         if not _compatible_with_current_platform(interpreter, targets.platforms):
             log("WARNING: attempting to run PEX with incompatible platforms!", V=1)
