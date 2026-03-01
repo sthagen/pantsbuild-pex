@@ -198,9 +198,8 @@ class Provenance(object):
         # type: (bool) -> str
 
         shebang_argv = [self.target_python]
-        python_args = _script_python_args(hermetic=hermetic_scripts)
-        if python_args:
-            shebang_argv.append(python_args)
+        if hermetic_scripts:
+            shebang_argv.append(self._target_python.hermetic_args)
         return "#!{shebang}".format(shebang=" ".join(shebang_argv))
 
     def record(self, src_to_dst):
@@ -292,11 +291,6 @@ class Provenance(object):
         if not collisions_ok:
             raise CollisionError(message)
         pex_warnings.warn(message)
-
-
-def _script_python_args(hermetic):
-    # type: (bool) -> Optional[str]
-    return "-sE" if hermetic else None
 
 
 def _populate_flat_deps(
@@ -527,6 +521,7 @@ def _populate_venv_deps(
                 venv=venv,
                 copy_mode=copy_mode,
                 rel_extra_path=rel_extra_path,
+                hermetic_scripts=hermetic_scripts,
             ):
                 yield src, dst
         except InstalledWheel.LoadError:
@@ -566,7 +561,8 @@ def _populate_venv_deps(
 
     # 3. Re-write any (console) scripts to use the venv Python.
     for script in venv.rewrite_scripts(
-        python=venv_python, python_args=_script_python_args(hermetic=hermetic_scripts)
+        python=venv_python,
+        python_args=venv.interpreter.hermetic_args if hermetic_scripts else None,
     ):
         TRACER.log("Re-writing {}".format(script))
 
@@ -682,7 +678,9 @@ def install_pex_main(
                 inject_args=list(pex_info.inject_args),
                 entry_point=pex_info.entry_point,
                 script=pex_info.script,
-                hermetic_re_exec=pex_info.venv_hermetic_scripts,
+                hermetic_re_exec=(
+                    venv.interpreter.hermetic_args if pex_info.venv_hermetic_scripts else None
+                ),
             )
         )
     chmod_plus_x(fp.name)
