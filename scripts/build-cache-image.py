@@ -92,8 +92,11 @@ def build_cache_image(
     image_tag: str,
     pex_repo: str,
     git_ref: str,
+    new: bool,
     seed_image: str | None,
 ) -> None:
+
+    pythons = "new" if new else "old"
 
     seed_args: list[str] = []
     if seed_image:
@@ -113,6 +116,8 @@ def build_cache_image(
             "docker",
             "buildx",
             "build",
+            "--build-arg",
+            f"PYTHONS={pythons}",
             *seed_args,
             "--build-arg",
             f"CACHE_PATH={_CACHE_PATH}",
@@ -132,13 +137,15 @@ def build_cache_image(
     )
 
 
-def list_test_cmds() -> list[str]:
+def list_test_cmds(new: bool) -> list[str]:
+    base_pythons = "new" if new else "old"
     with (Path(".github") / "workflows" / "ci.yml").open() as fp:
         data = yaml.full_load(fp)
     return sorted(
         dict.fromkeys(
             entry["test-cmd"]
             for entry in data["jobs"]["linux-tests"]["strategy"]["matrix"]["include"]
+            if base_pythons == entry.get("base-pythons", "new")
         )
     )
 
@@ -166,6 +173,7 @@ def main() -> Any:
         action="store_true",
         help="Emit the list of test command names that should be cached.",
     )
+    parser.add_argument("--pythons", choices=["old", "new"], default="new")
     parser.add_argument(
         "--tag",
         type=str,
@@ -225,8 +233,9 @@ def main() -> Any:
     )
     options = parser.parse_args()
 
+    new = options.pythons == "new"
     if options.list_test_cmds:
-        for test_cmd in list_test_cmds():
+        for test_cmd in list_test_cmds(new=new):
             print(test_cmd)
         return 0
 
@@ -238,9 +247,10 @@ def main() -> Any:
         logging.root.level, "Logging configured at level {level}.".format(level=options.log_level)
     )
 
+    tag_suffix = f"-{'new' if new else 'old'}"
     sub_image: str | None = None
     if options.build_style is BuildStyle.MERGE:
-        image_tag = create_image_tag(options.tag)
+        image_tag = create_image_tag(f"{options.tag}{tag_suffix}")
         chroot = Path(mkdtemp())
         atexit.register(shutil.rmtree, str(chroot), ignore_errors=True)
 
@@ -270,7 +280,7 @@ def main() -> Any:
         logger.info(f"Importing merged tarball to {image_tag}...")
         subprocess.run(args=["docker", "import", merged_tarball, image_tag], check=True)
     else:
-        all_test_cmds = frozenset(list_test_cmds())
+        all_test_cmds = frozenset(list_test_cmds(new=new))
         selected_test_cmds = (
             frozenset(
                 itertools.chain.from_iterable(
@@ -297,12 +307,12 @@ def main() -> Any:
 
         if options.test_cmds:
             sub_image = (
-                test_cmds[0]
+                test_cmds[0].replace(":", "_").replace("/", "_").replace("@", "_")
                 if len(test_cmds) == 1
                 else hashlib.sha256("|".join(test_cmds).encode("utf-8")).hexdigest()
             )
 
-        image_tag = create_image_tag(options.tag, sub_image=sub_image)
+        image_tag = create_image_tag(f"{options.tag}{tag_suffix}", sub_image=sub_image)
         logger.info(f"Building caches for {len(test_cmds)} test commands.")
         for test_cmd in test_cmds:
             logger.debug(test_cmd)
@@ -313,7 +323,8 @@ def main() -> Any:
             image_tag=image_tag,
             pex_repo=options.pex_repo,
             git_ref=options.git_ref,
-            seed_image=create_image_tag("latest") if options.seed else None,
+            new=new,
+            seed_image=create_image_tag(f"latest{tag_suffix}") if options.seed else None,
         )
 
     if options.post_build_action is PostBuildAction.EXPORT:
