@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import getpass
 import glob
+import grp
 import hashlib
 import itertools
 import json
@@ -25,6 +27,7 @@ import colors
 import yaml
 
 from pex.argparse import HandleBoolAction
+from pex.common import safe_mkdtemp
 
 
 class BuildStyle(Enum):
@@ -45,6 +48,7 @@ class PostBuildAction(Enum):
 
 _CACHE_INPUTS = (
     Path("docker") / "cache",
+    Path("docker") / "user" / "create_docker_image_user.sh",
     Path("testing") / "__init__.py",  # Sets up fixed set of pyenv interpreters for ITs.
     Path("testing") / "devpi.py",
     Path("uv.lock"),
@@ -105,10 +109,12 @@ def build_cache_image(
         seed_args.append("--build-arg")
         seed_args.append(f"SEED_PATH={_CACHE_PATH}")
 
-    cache_context = Path("docker") / "cache"
-    with (cache_context / ".env").open(mode="w") as fp:
+    context = Path(safe_mkdtemp()) / f"pex-duvrc-{pythons}-cache-context"
+    shutil.copytree(os.path.join("docker", "cache"), context)
+    shutil.copy(os.path.join("docker", "user", "create_docker_image_user.sh"), context)
+    with (context / ".env").open(mode="w") as fp:
         for name, value in os.environ.items():
-            if name.startswith(("_PEX_", "SCIENCE_")):
+            if name.startswith(("_PEX_", "SCIENCE_")) or name == "CI":
                 print(f"export {name}={value}", file=fp)
 
     subprocess.run(
@@ -119,6 +125,14 @@ def build_cache_image(
             "--build-arg",
             f"PYTHONS={pythons}",
             *seed_args,
+            "--build-arg",
+            f"USER={getpass.getuser()}",
+            "--build-arg",
+            f"UID={os.getuid()}",
+            "--build-arg",
+            f"GROUP={grp.getgrgid(os.getgid()).gr_name}",
+            "--build-arg",
+            f"GID={os.getgid()}",
             "--build-arg",
             f"CACHE_PATH={_CACHE_PATH}",
             "--build-arg",
@@ -131,7 +145,7 @@ def build_cache_image(
             f"TEST_CMDS={','.join(test_cmds)}",
             "--tag",
             image_tag,
-            str(cache_context),
+            str(context),
         ],
         check=True,
     )
@@ -273,11 +287,13 @@ def main() -> Any:
                             continue
                         tf.extract(tar_info, chroot)
                         extracted.add(tar_info.name)
+                os.unlink(tarball)
 
             logger.info(f"Merging {len(tarballs)} extracted tarballs...")
             merged_tarball = export_tarball_path()
             with tarfile.open(merged_tarball, "w") as tf:
                 tf.add(chroot, arcname="/")
+            shutil.rmtree(chroot, True)
 
         logger.info(f"Importing merged tarball to {image_tag}...")
         subprocess.run(args=["docker", "import", merged_tarball, image_tag], check=True)
