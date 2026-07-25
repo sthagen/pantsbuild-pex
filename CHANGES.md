@@ -1,5 +1,47 @@
 # Release Notes
 
+## 2.98.2
+
+This release fixes generation of foreign platform PEX scies to respect the foreign platform cache
+directory standards.
+
+In addition `--scie only -o <name that does not end in ".pex">` PEX scies can now be split and
+re-packed with:
+```console
+:; SCIE=split <PEX scie> split-dir
+:; cd split-dir
+:; ./scie-jump
+```
+
+Previously splitting always worked, but the scie boot-pack would fail due to a name clash between
+the final scie and the application PEX file.
+
+* All scies honor platform cache conventions & are re-packable. (#3220)
+
+## 2.98.1
+
+This release fixes marker processing in `--style universal` locks to respect `and` binding more
+tightly than `or` in the spec. Previously `and` and `or` were processed left to right without
+regard for precedence rules. Thanks to @notatallshaw for a pre-emptive report of this when surveying
+the ecosystem.
+
+* Add explicit grouping to ensure `and` / `or` precedence. (#3219)
+
+## 2.98.0
+
+This release adds proper support for windowed PEX scies targeting Windows. When you specify at least
+one of `--scie-icon`, `--scie-desktop-file` or `--scie-windowed` and a scie is generated targeting
+Windows, that scie will behave like a proper Windows windowed app and will not launch a background
+console when opened.
+
+* Add support for windowed PEX scies on Windows. (#3212)
+
+## 2.97.3
+
+This release fixes concurrent Pex use of artifact downloads.
+
+* Fix concurrent Pex use of artifact downloads. (#3207)
+
 ## 2.97.2
 
 This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2026.6.17.

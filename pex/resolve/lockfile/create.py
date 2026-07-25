@@ -9,8 +9,10 @@ from collections import OrderedDict, defaultdict
 from multiprocessing.pool import ThreadPool
 
 from pex import hashing
+from pex.atomic_directory import atomic_directory
 from pex.auth import PasswordDatabase
 from pex.build_system import pep_517
+from pex.cache.dirs import DownloadDir
 from pex.common import pluralize, safe_mkdtemp
 from pex.dependency_configuration import DependencyConfiguration
 from pex.dist_metadata import DistMetadata, ProjectNameAndVersion, Requirement
@@ -29,7 +31,6 @@ from pex.resolve.configured_resolver import ConfiguredResolver
 from pex.resolve.downloads import ArtifactDownloader
 from pex.resolve.lock_downloader import LockDownloader
 from pex.resolve.locked_resolve import (
-    Artifact,
     DownloadableArtifact,
     FileArtifact,
     LocalProjectArtifact,
@@ -39,7 +40,7 @@ from pex.resolve.locked_resolve import (
     VCSArtifact,
 )
 from pex.resolve.locker import Locker
-from pex.resolve.lockfile.download_manager import DownloadManager
+from pex.resolve.lockfile.download_manager import DownloadedArtifact
 from pex.resolve.lockfile.model import Lockfile
 from pex.resolve.lockfile.targets import DownloadInput, calculate_download_input
 from pex.resolve.package_repository import ReposConfiguration
@@ -70,7 +71,6 @@ if TYPE_CHECKING:
 
     import attr  # vendor:skip
 
-    from pex.hashing import HintedDigest
     from pex.requirements import ParsedRequirement
 
     AnyArtifact = Union[FileArtifact, LocalProjectArtifact, VCSArtifact]
@@ -78,7 +78,7 @@ else:
     from pex.third_party import attr
 
 
-class CreateLockDownloadManager(DownloadManager[Artifact]):
+class DownloadCacheManager(object):
     @classmethod
     def create(
         cls,
@@ -86,7 +86,7 @@ class CreateLockDownloadManager(DownloadManager[Artifact]):
         locked_resolves,  # type: Iterable[LockedResolve]
         pex_root=ENV,  # type: Union[str, Variables]
     ):
-        # type: (...) -> CreateLockDownloadManager
+        # type: (...) -> DownloadCacheManager
 
         file_artifacts_by_filename = defaultdict(
             list
@@ -161,10 +161,10 @@ class CreateLockDownloadManager(DownloadManager[Artifact]):
         pex_root=ENV,  # type: Union[str, Variables]
     ):
         # type: (...) -> None
-        super(CreateLockDownloadManager, self).__init__(pex_root=pex_root)
         self._path_and_version_by_artifact_and_project_name = dict(
             path_and_version_by_artifact_and_project_name
         )
+        self._pex_root = pex_root
 
     def store_all(
         self,
@@ -183,14 +183,26 @@ class CreateLockDownloadManager(DownloadManager[Artifact]):
     ):
         # type: (...) -> None
 
-        downloadable_artifacts = [
-            DownloadableArtifact(project_name=project_name, artifact=artifact, version=version)
-            for (artifact, project_name), (
-                path,
-                version,
-            ) in self._path_and_version_by_artifact_and_project_name.items()
-            if path is None
-        ]
+        path_and_version_by_artifact_and_project_name = (
+            {}
+        )  # type: Dict[Tuple[AnyArtifact, ProjectName], Tuple[str, Optional[Version]]]
+        downloadable_artifacts = []  # type: List[DownloadableArtifact]
+        for (artifact, project_name), (
+            path,
+            version,
+        ) in self._path_and_version_by_artifact_and_project_name.items():
+            if path:
+                path_and_version_by_artifact_and_project_name[(artifact, project_name)] = (
+                    path,
+                    version,
+                )
+            else:
+                downloadable_artifacts.append(
+                    DownloadableArtifact(
+                        project_name=project_name, artifact=artifact, version=version
+                    )
+                )
+
         downloader = LockDownloader.create(
             targets=targets,
             lock_configuration=lock_configuration,
@@ -222,43 +234,44 @@ class CreateLockDownloadManager(DownloadManager[Artifact]):
                 isinstance(artifact, (FileArtifact, LocalProjectArtifact, VCSArtifact))
             )
 
-            self._path_and_version_by_artifact_and_project_name[
+            path_and_version_by_artifact_and_project_name[
                 (artifact, downloadable_artifact.project_name)
             ] = (downloaded_artifact.path, downloadable_artifact.version)
 
-        for artifact, project_name in self._path_and_version_by_artifact_and_project_name:
-            self.store(artifact, project_name)
-
-    def save(
-        self,
-        artifact,  # type: Artifact
-        project_name,  # type: ProjectName
-        dest_dir,  # type: str
-        digest,  # type: HintedDigest
-    ):
-        # type: (...) -> Union[str, Error]
-
-        # N.B.: The input to save comes from self.store in self.store_all above and these inputs
-        # are all AnyArtifacts.
-        artifact_to_store = cast("AnyArtifact", artifact)
-        production_assert(
-            isinstance(artifact_to_store, (FileArtifact, LocalProjectArtifact, VCSArtifact))
-        )
-
-        path, _ = self._path_and_version_by_artifact_and_project_name[
-            (artifact_to_store, project_name)
-        ]
-        # N.B.: We filled out all None paths above in store_all or else failed if downloads failed
-        # there.
-        src = cast(str, path)
-        production_assert(isinstance(src, str))
-
-        filename = os.path.basename(src)
-        dest = os.path.join(dest_dir, filename)
-        shutil.move(src, dest)
-
-        hashing.file_hash(dest, digest=digest)
-        return filename
+        for (artifact, project_name), (
+            artifact_path,
+            version,
+        ) in path_and_version_by_artifact_and_project_name.items():
+            download_dir = DownloadDir.create(
+                file_hash=artifact.fingerprint.hash, pex_root=self._pex_root
+            )  # type: str
+            with atomic_directory(download_dir) as atomic_dir:
+                if not atomic_dir.is_finalized():
+                    TRACER.log(
+                        "Caching download of {project_name_and_version} by Pip at {artifact_path} "
+                        "to {download_dir}".format(
+                            project_name_and_version=(
+                                "{project_name} {version}".format(
+                                    project_name=project_name, version=version
+                                )
+                                if version
+                                else project_name
+                            ),
+                            artifact_path=artifact_path,
+                            download_dir=download_dir,
+                        )
+                    )
+                    filename = os.path.basename(artifact_path)
+                    shutil.move(artifact_path, os.path.join(atomic_dir.work_dir, filename))
+                    DownloadedArtifact.store(
+                        artifact=artifact,
+                        artifact_dir=atomic_dir.work_dir,
+                        filename=filename,
+                        fingerprint=hashing.new_fingerprint(
+                            algorithm=artifact.fingerprint.algorithm,
+                            hexdigest=artifact.fingerprint.hash,
+                        ),
+                    )
 
 
 @attr.s(frozen=True)
@@ -689,11 +702,11 @@ def create(
         )
     )
 
-    with TRACER.timed("Indexing downloads"):
-        create_lock_download_manager = CreateLockDownloadManager.create(
+    with TRACER.timed("Caching Pip downloads"):
+        download_cache_manager = DownloadCacheManager.create(
             download_dir=download_dir, locked_resolves=locked_resolves
         )
-        create_lock_download_manager.store_all(
+        download_cache_manager.store_all(
             targets=OrderedSet(
                 download_request.target for download_request in download_input.download_requests
             ),
