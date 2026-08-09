@@ -198,7 +198,7 @@ class CacheDir(Enum["CacheDir.Value"]):
 
     PLATFORMS = Value(
         "platforms",
-        version=0,
+        version=1,
         name="Abbreviated Platforms",
         description=(
             "Information calculated about abbreviated platforms specified via `--platform`."
@@ -317,7 +317,7 @@ class UnzipDir(AtomicCacheDir):
     def iter_all(cls, pex_root=ENV):
         # type: (Union[str, Variables]) -> Iterator[UnzipDir]
         for unzip_dir in glob.glob(CacheDir.UNZIPPED_PEXES.path("*", pex_root=pex_root)):
-            if os.path.isdir(unzip_dir):
+            if os.path.isdir(unzip_dir) and not unzip_dir.endswith(".work"):
                 pex_hash = os.path.basename(unzip_dir)
                 yield UnzipDir(path=unzip_dir, pex_hash=pex_hash, pex_root=pex_root)
 

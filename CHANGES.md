@@ -1,5 +1,36 @@
 # Release Notes
 
+## 2.100.0
+
+This release adds support for Pip 26.2.1 and updates vendored packaging to 26.3 for Python >= 3.9.
+
+* Add support for Pip 26.2.1 (#3236)
+
+## 2.99.0
+
+This release adds support for Pip 26.2.
+
+* Add support for Pip 26.2. (#3231)
+
+## 2.98.5
+
+This release fixes `pex3 lock create` to better handle authenticated PEP-691 endpoints.
+
+* Fix PEP-691 fingerprinting for authenticated indexes. (#3230)
+
+## 2.98.4
+
+This release updates vendored Pip's vendored certifi's cacert.pem to that from certifi 2026.7.22.
+
+* Update vendored Pip's CA cert bundle. (#3227)
+
+## 2.98.3
+
+This release fixes `--venv` PEX scies robustness to `PEX_ROOT` cache deletion and  also fixes
+`--venv` PEX behavior with regard to accurate `pex3 cache prune` last access time pruning.
+
+* Fix `--venv` PEX cache handling. (#3226)
+
 ## 2.98.2
 
 This release fixes generation of foreign platform PEX scies to respect the foreign platform cache
