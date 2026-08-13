@@ -1,5 +1,34 @@
 # Release Notes
 
+## 2.100.4
+
+This release fixes `pex --venv-repository ...` to respect the `--[no-]system-time` option and its
+default.
+
+* Fix `--venv-repository` to respect `--[no-]system-time`. (#3245)
+
+## 2.100.3
+
+This release fixes `pex --rc --pexrc-platform ...` handling. Previously `--pexrc-platform` was not
+forwarded to `pexrc inject --target ...` leading to the creation of bigger PEXes than need be.
+
+Additionally, this release upgrades pexrc to 0.16.5 to pickup a further fix of `--rc` for Python
+release candidates.
+
+* Pass `pex --rc --pexrc-platform ...` to `pexrc inject --target ...`. (#3243)
+
+## 2.100.2
+
+This release upgrades pexrc to 0.16.4 to fix `--rc` for macOS Python Framework builds.
+
+* Fix `--rc` for Python Framework builds. (#3240)
+
+## 2.100.1
+
+This release upgrades pexrc to 0.16.3 to fix `--rc` for Python release candidates.
+
+* Fix `--rc` for Python release candidates. (#3235)
+
 ## 2.100.0
 
 This release adds support for Pip 26.2.1 and updates vendored packaging to 26.3 for Python >= 3.9.
