@@ -1,5 +1,55 @@
 # Release Notes
 
+## 2.101.3
+
+This release fixes `venv` PEX tool to arrange for the venv `pex` script not to attempt a touch of
+the venv `.last-access` file. This is only needed for venvs under the `PEX_ROOT`.
+
+* Fix PEX tool created venv touch of `.last-access` file. (#3266)
+
+## 2.101.2
+
+This release add diagnostics around cache locks to help debugging in the wild.
+
+* Add `atomic_directory` diagnostics. (#3263)
+
+## 2.101.1
+
+This release has use of `--intransitive` implying `--ignore-errors` since an intransitive resolve
+either is complete by arrangement (or luck) or else intentionally incomplete, requiring externally
+provided dependencies (e.g.: via `PEX_PATH`, `PEX_INHERIT_PATH` or `PEX_EXTRA_SYS_PATH`). If
+complete, there will be no errors. If incomplete, then `--intransitive` already called this shot and
+forcing `--ignore-errors` is just red tape.
+
+* Let `--intransitive` imply `--ignore-errors`in built PEXes. (#3260)
+
+## 2.101.0
+
+Add support for `PEX_MULTIPROCESSING_START_METHOD` to control the multiprocessing start method used
+by Pex when run under Python 3.
+
+* Support `PEX_MULTIPROCESSING_START_METHOD`. (#3257)
+
+## 2.100.7
+
+Finalize improvements of `#!/bin/sh` re-director scripts by ensuring custom script file encodings
+are preserved round trip.
+
+* Preserve file encoding for `#!/bin/sh` re-director scripts. (#3254)
+
+## 2.100.6
+
+Further improve handling of `#!/bin/sh` re-director scripts.
+
+* Beef up `#!/bin/sh` re-director script handling. (#3252)
+
+## 2.100.5
+
+This release fixes handling of `#!/bin/sh` too-long script shebang re-directors created by other
+tools like pip and uv for data scripts when round-tripping installed wheels from venvs.
+
+* Handle foreign too-long Python script shebangs. (#3249)
+
 ## 2.100.4
 
 This release fixes `pex --venv-repository ...` to respect the `--[no-]system-time` option and its

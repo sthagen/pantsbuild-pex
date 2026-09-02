@@ -33,7 +33,7 @@ from pex.dist_metadata import DistMetadata, Distribution, MetadataFiles
 from pex.entry_points_txt import install_scripts
 from pex.enum import Enum
 from pex.exceptions import production_assert, reportable_unexpected_error_msg
-from pex.executables import chmod_plus_x, is_python_script
+from pex.executables import chmod_plus_x, is_python_script, maybe_read_encoding_line
 from pex.installed_wheel import InstalledWheel
 from pex.interpreter import PythonInterpreter
 from pex.pep_376 import InstalledDirectory, InstalledFile, Record, create_installed_file
@@ -1037,10 +1037,7 @@ def install_wheel(
                     if is_entry_point_script(src_path):
                         # This entry point script will be installed afresh below as needed.
                         break
-                    rewrite_script = interpreter is not None and is_python_script(
-                        src_path, check_executable=False
-                    )
-
+                    rewrite_script = is_python_script(src_path, check_executable=False)
                 dst_rel_path = os.path.relpath(src_path, installed_path)
                 dst_components = path_name, dst_rel_path, rewrite_script
                 break
@@ -1072,13 +1069,8 @@ def install_wheel(
                         _, _, shebang_args = first_line.partition(b" ")
                         if hermetic_scripts and not shebang_args:
                             shebang_args = interpreter.hermetic_args.encode("utf-8")
-                        encoding_line = ""
                         next_line = in_fp.readline()
-                        # See: https://peps.python.org/pep-0263/
-                        if next_line and re.match(
-                            br"^[ \t\f]*#.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)", next_line
-                        ):
-                            encoding_line = str(next_line.decode("ascii"))
+                        encoding_line = maybe_read_encoding_line(next_line)
                         out_fp.write(
                             "{shebang}\n".format(
                                 shebang=interpreter.shebang(
@@ -1090,6 +1082,30 @@ def install_wheel(
                             out_fp.write(next_line)
                     shutil.copyfileobj(in_fp, out_fp)
                 chmod_plus_x(out_fp.name)
+
+                # We modified the script shebang; so we need to re-hash / re-size.
+                dst_installed_file = create_dst_installed_file(regenerate_hash=True)
+            elif rewrite_script and interpreter is None:
+                with open(src_file, mode="rb") as in_fp, safe_open(dst_file, "wb") as out_fp:
+                    encoding_line = ""
+                    if b"#!/bin/sh" == in_fp.readline().rstrip():
+                        # This is a too-long-shebang re-director script as identified by
+                        # `is_python_script` above; so we need to discard all lines that make up
+                        # that script - which are enclosed in a python `'''` string also consumable
+                        # by `sh`.
+                        encoding_line = maybe_read_encoding_line(
+                            in_fp.readline()
+                        )  # Initial `'''` line or encoding line
+                        if encoding_line:
+                            in_fp.readline()  # Initial `'''` line
+                        while True:
+                            next_line = in_fp.readline()
+                            if not next_line or next_line.endswith(b"'''\n"):
+                                break
+                    out_fp.write(b"#!python\n")
+                    if encoding_line:
+                        out_fp.write(encoding_line.encode("ascii"))
+                    shutil.copyfileobj(in_fp, out_fp)
 
                 # We modified the script shebang; so we need to re-hash / re-size.
                 dst_installed_file = create_dst_installed_file(regenerate_hash=True)
