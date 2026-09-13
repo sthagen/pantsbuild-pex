@@ -1,5 +1,36 @@
 # Release Notes
 
+## 2.102.0
+
+This release adds support for mixing target platforms specified via --python,
+--interpreter-constraint, --platform and --complete-platform with multiple --venv-repositories,
+selecting the appropriate --venv-repository to resolve from for each specified target platform.
+
+* Support mixing target platforms with multiple `--venv-repository`s. (#3276)
+
+## 2.101.6
+
+This release upgrades `pexrc` to 0.20.0 when using the `--rc` option for better build failure
+diagnostics.
+
+* Upgrade `pexrc` to 0.20.0. (#3274)
+
+## 2.101.5
+
+This release fixes Pex to not fail fast for well known Unix platforms supported by Python; namely
+aix, android, freebsd and ios. Options like `--rc` and `--scie {eager,lazy}` that require native
+platform support binaries will fail fast, but PEX building and execution should work on a best
+effort basis.
+
+* Don't fail fast on AIX, Android, FreeBSD and iOS. (#3272)
+
+## 2.101.4
+
+This release fixes Pex to fail fast when encountering errors walking directories when, for example,
+building zips.
+
+* Raise on Directory Listing Errors in `deterministic_walk` (#3269)
+
 ## 2.101.3
 
 This release fixes `venv` PEX tool to arrange for the venv `pex` script not to attempt a touch of
