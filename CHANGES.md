@@ -1,5 +1,34 @@
 # Release Notes
 
+## 2.103.2
+
+This release fixes `pex3 venv create --link-python` for a foreign platform when the venv is
+installed from a `--pex-repository`. Populating the venv's sources re-resolved the repository PEX
+against a local interpreter, which fails whenever that PEX holds no distributions for it, as is the
+case for a PEX built for the foreign platform alone. The distributions already resolved for the
+target are now used instead.
+
+* Fix `pex3 venv create --link-python` for `--pex-repository`. (#3286)
+
+## 2.103.1
+
+This releases fixes import hygiene in the PEX runtime surrounding use of HTTPS fetches. These only
+occur when creating venvs via `PEX_TOOLS=1` when using a system interpreter without the `ensurepip`
+module. A practical benefit is runtime support for normal PEX use on interpreters without the `ssl`
+module.
+
+* Isolate `URLFetcher` use in the PEX runtime. (#3283)
+
+## 2.103.0
+
+This release adds `pex3 venv create --link-python`, which points the created venv's Python at a
+given path instead of the interpreter that created the venv. Since that path need not exist yet,
+this also unlocks creating a venv for a foreign platform: the venv is laid out by a local
+interpreter that differs from the foreign platform in machine architecture alone and its Python is
+then linked to where the foreign interpreter will live.
+
+* Support creating a venv for a foreign platform. (#3279)
+
 ## 2.102.0
 
 This release adds support for mixing target platforms specified via --python,
